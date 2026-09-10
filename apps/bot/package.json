@@ -6,9 +6,11 @@
   "main": "src/index.js",
   "scripts": {
     "dev": "node --env-file-if-exists=../../.env --watch src/index.js",
-    "start": "node --env-file-if-exists=../../.env src/index.js"
+    "start": "node --env-file-if-exists=../../.env src/index.js",
+    "test": "node --test"
   },
   "dependencies": {
+    "@cos-nostra/shared": "*",
     "discord.js": "^14.27.0"
   }
 }

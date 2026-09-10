@@ -47,7 +47,7 @@ export function createClient(options) {
   const botToken = options.botToken;
 
   /**
-   * @param {'GET' | 'POST' | 'DELETE'} method
+   * @param {'GET' | 'POST' | 'PUT' | 'DELETE'} method
    * @param {string} path
    * @param {{ body?: unknown, auth?: 'user' | 'bot' | 'none' }} [opts]
    */
@@ -110,10 +110,43 @@ export function createClient(options) {
     // Internal (bot, authenticated with botToken)
     /** @param {{ clipId: string, guildId: string, channelId: string, messageId: string }} body @returns {Promise<import('./types.js').Post>} */
     internalPost: (body) => request('POST', '/internal/posts', { body, auth: 'bot' }),
-    /** @param {{ messageId: string, userDiscordId: string, emoji: string, removed: boolean }} body */
+    /**
+     * @deprecated use recordReaction; the backend expects action: 'add' | 'remove'.
+     * @param {{ messageId: string, userDiscordId: string, emoji: string, removed: boolean }} body
+     */
     internalReaction: (body) => request('POST', '/internal/reactions', { body, auth: 'bot' }),
     /** @param {string} id @returns {Promise<import('./types.js').Clip>} */
     internalClip: (id) =>
       request('GET', `/internal/clips/${encodeURIComponent(id)}`, { auth: 'bot' }),
+    /**
+     * One reaction add or remove. Rows are append-only, so "remove" closes the open row
+     * rather than deleting it.
+     * @param {{ messageId: string, userDiscordId: string, emoji: string, action: 'add' | 'remove' }} body
+     * @returns {Promise<{ ok: true, open: number }>}
+     */
+    recordReaction: (body) => request('POST', '/internal/reactions', { body, auth: 'bot' }),
+    /**
+     * The post a Discord message belongs to, with its current open reaction count.
+     * @param {string} messageId
+     * @returns {Promise<import('./types.js').Post & { open: number }>}
+     */
+    getPost: (messageId) =>
+      request('GET', `/internal/posts/${encodeURIComponent(messageId)}`, { auth: 'bot' }),
+    /**
+     * Per-guild bot configuration: clip channel and seed emojis.
+     * @param {string} guildId
+     * @returns {Promise<{ guildId: string, channelId: string | null, seedEmojis: string[] }>}
+     */
+    getGuild: (guildId) =>
+      request('GET', `/internal/guilds/${encodeURIComponent(guildId)}`, { auth: 'bot' }),
+    /**
+     * @param {string} guildId
+     * @param {{ channelId?: string | null, seedEmojis?: string[] }} body
+     * @returns {Promise<{ guildId: string, channelId: string | null, seedEmojis: string[] }>}
+     */
+    putGuild: (guildId, body) =>
+      request('PUT', `/internal/guilds/${encodeURIComponent(guildId)}`, { body, auth: 'bot' }),
+    /** @returns {Promise<{ items: { guildId: string, channelId: string | null, seedEmojis: string[] }[] }>} */
+    listGuilds: () => request('GET', '/internal/guilds', { auth: 'bot' }),
   };
 }

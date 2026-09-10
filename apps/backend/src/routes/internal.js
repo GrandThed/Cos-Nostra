@@ -1,6 +1,8 @@
 // Bot -> backend routes, protected by BOT_SHARED_SECRET. The bot records the Discord
 // message it posted for a clip and every reaction add/remove; reactions are append-only
 // rows closed with removed_at so history survives and rankings only count open rows.
+// It also reads and writes guild_settings, the per-guild channel and seed emojis that
+// `/clips setup` configures.
 //
 // Also registers plugins/bot.js so app.notifyBot exists app-wide (app.js only imports
 // route files; each route file owns the plugins it needs). Both plugins carry
@@ -8,11 +10,11 @@
 // levels down would otherwise never reach the root instance the clips routes see.
 
 import { timingSafeEqual } from 'node:crypto';
-import { and, count, eq, isNull } from 'drizzle-orm';
+import { and, asc, count, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import botPlugin from '../plugins/bot.js';
-import { clips, posts, reactions, users } from '../db/schema.js';
+import { clips, guildSettings, posts, reactions, users } from '../db/schema.js';
 
 const postBody = z.object({
   clipId: z.string().min(1),
@@ -26,6 +28,13 @@ const reactionBody = z.object({
   userDiscordId: z.string().min(1),
   emoji: z.string().min(1),
   action: z.enum(['add', 'remove']),
+});
+
+// channelId is a Discord snowflake, so digits only; the emoji list is what the bot seeds on
+// every post, capped so a setup command cannot make the bot rate-limit itself.
+const guildBody = z.object({
+  channelId: z.string().regex(/^[0-9]+$/),
+  seedEmojis: z.array(z.string().min(1)).min(1).max(5).optional(),
 });
 
 /**
@@ -53,6 +62,28 @@ async function countOpen(app, postId) {
     .from(reactions)
     .where(and(eq(reactions.postId, postId), isNull(reactions.removedAt)));
   return Number(row?.n ?? 0);
+}
+
+/**
+ * Wire shape for a guild_settings row: seed_emojis is stored as a JSON array string and the
+ * bot only ever sees the parsed array.
+ * @param {typeof guildSettings.$inferSelect} row
+ */
+function guildToJson(row) {
+  let seedEmojis = [];
+  try {
+    const parsed = JSON.parse(row.seedEmojis);
+    if (Array.isArray(parsed)) seedEmojis = parsed;
+  } catch {
+    // Only this route writes the column, so unparsable text means someone edited the row
+    // by hand. Degrade to no seed reactions rather than 500 the listing the bot needs to
+    // post anything at all.
+  }
+  return {
+    guildId: row.guildId,
+    channelId: row.channelId,
+    seedEmojis,
+  };
 }
 
 /** @type {import('fastify').FastifyPluginAsync} */
@@ -162,6 +193,50 @@ async function internalRoutes(app) {
         page: `${base}/c/${id}`,
       },
     };
+  });
+
+  // ---- guild settings -----------------------------------------------------------------
+
+  app.get('/internal/guilds', opts, async () => {
+    const rows = await app.db.select().from(guildSettings).orderBy(asc(guildSettings.guildId));
+    return { items: rows.map(guildToJson) };
+  });
+
+  app.get('/internal/guilds/:guildId', opts, async (req, reply) => {
+    const [row] = await app.db
+      .select()
+      .from(guildSettings)
+      .where(eq(guildSettings.guildId, req.params.guildId));
+    if (!row) return reply.code(404).send({ error: 'unknown_guild' });
+    return guildToJson(row);
+  });
+
+  app.put('/internal/guilds/:guildId', opts, async (req, reply) => {
+    const parsed = guildBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'bad_request', issues: parsed.error.issues });
+    }
+    const { guildId } = req.params;
+    // The bot always passes interaction.guildId, so anything else is a bug or a stray
+    // call; refuse it rather than writing a row no guild can ever read back.
+    if (!/^[0-9]+$/.test(guildId)) {
+      return reply.code(400).send({ error: 'bad_request', issues: [{ path: ['guildId'], message: 'must be a snowflake' }] });
+    }
+    const { channelId, seedEmojis } = parsed.data;
+    // Omitting seedEmojis means "leave it alone": a new row falls back to the column
+    // default, an existing row keeps whatever the guild configured earlier.
+    const values = { guildId, channelId, updatedAt: new Date() };
+    const set = { channelId, updatedAt: new Date() };
+    if (seedEmojis) {
+      values.seedEmojis = JSON.stringify(seedEmojis);
+      set.seedEmojis = values.seedEmojis;
+    }
+    const [row] = await app.db
+      .insert(guildSettings)
+      .values(values)
+      .onConflictDoUpdate({ target: guildSettings.guildId, set })
+      .returning();
+    return guildToJson(row);
   });
 }
 

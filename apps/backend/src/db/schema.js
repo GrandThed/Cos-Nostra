@@ -132,3 +132,13 @@ export const events = pgTable(
   },
   (t) => [uniqueIndex('events_guild_year_idx').on(t.guildId, t.year)],
 );
+
+// Per-guild configuration written by `/clips setup` in the bot: where clips get posted and
+// which emojis the bot seeds on each post. `seed_emojis` is a JSON array string so the
+// column stays plain text (the routes parse it before it reaches the wire).
+export const guildSettings = pgTable('guild_settings', {
+  guildId: text('guild_id').primaryKey(),
+  channelId: text('channel_id').notNull(),
+  seedEmojis: text('seed_emojis').notNull().default('["🔥","😂","💀"]'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});

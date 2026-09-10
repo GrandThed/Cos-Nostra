@@ -183,3 +183,82 @@ test('a custom fetch is used when provided', async () => {
   assert.equal(calls[0].url, 'https://example.test/auth/me');
   assert.equal(received.length, 0);
 });
+
+test('recordReaction posts an add or remove with the bot token', async () => {
+  answer = { status: 200, body: { ok: true, open: 3 } };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  const out = await api.recordReaction({
+    messageId: 'm1',
+    userDiscordId: 'u1',
+    emoji: 'fire',
+    action: 'add',
+  });
+  assert.equal(out.open, 3);
+  assert.equal(last().method, 'POST');
+  assert.equal(last().url, '/internal/reactions');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret');
+  assert.deepEqual(JSON.parse(last().body), {
+    messageId: 'm1',
+    userDiscordId: 'u1',
+    emoji: 'fire',
+    action: 'add',
+  });
+
+  await api.recordReaction({ messageId: 'm1', userDiscordId: 'u1', emoji: 'fire', action: 'remove' });
+  assert.equal(JSON.parse(last().body).action, 'remove');
+});
+
+test('getPost encodes the message id and uses the bot token', async () => {
+  answer = { status: 200, body: { clipId: 'c1', guildId: 'g', channelId: 'ch', messageId: 'm/1', open: 2 } };
+  const api = createClient({ baseUrl, botToken: 'bot-secret' });
+  const out = await api.getPost('m/1');
+  assert.equal(out.clipId, 'c1');
+  assert.equal(last().method, 'GET');
+  assert.equal(last().url, '/internal/posts/m%2F1');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret');
+});
+
+test('getPost surfaces a 404 as ApiError so the bot can ignore foreign messages', async () => {
+  answer = { status: 404, body: { error: 'unknown_message' } };
+  const api = createClient({ baseUrl, botToken: 'bot-secret' });
+  await assert.rejects(api.getPost('nope'), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 404);
+    return true;
+  });
+});
+
+test('guild config methods hit /internal/guilds with the bot token', async () => {
+  answer = { status: 200, body: { guildId: 'g1', channelId: 'ch1', seedEmojis: ['fire'] } };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+
+  const guild = await api.getGuild('g1');
+  assert.equal(guild.channelId, 'ch1');
+  assert.equal(last().method, 'GET');
+  assert.equal(last().url, '/internal/guilds/g1');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret');
+
+  await api.putGuild('g 1', { channelId: 'ch2', seedEmojis: ['fire', 'skull'] });
+  assert.equal(last().method, 'PUT');
+  assert.equal(last().url, '/internal/guilds/g%201');
+  assert.equal(last().headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(last().body), { channelId: 'ch2', seedEmojis: ['fire', 'skull'] });
+
+  // GET /internal/guilds wraps the rows in { items }, like the other listings.
+  answer = { status: 200, body: { items: [{ guildId: 'g1', channelId: 'ch1', seedEmojis: [] }] } };
+  const guilds = await api.listGuilds();
+  assert.equal(guilds.items.length, 1);
+  assert.equal(guilds.items[0].guildId, 'g1');
+  assert.equal(last().method, 'GET');
+  assert.equal(last().url, '/internal/guilds');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret');
+});
+
+test('a guild with no config yet is a 404 the caller can map to null', async () => {
+  answer = { status: 404, body: { error: 'unknown_guild' } };
+  const api = createClient({ baseUrl, botToken: 'bot-secret' });
+  await assert.rejects(api.getGuild('g-nope'), (err) => {
+    assert.equal(err.status, 404);
+    return true;
+  });
+});
