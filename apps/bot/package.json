@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "node --env-file-if-exists=../../.env --watch src/index.js",
     "start": "node --env-file-if-exists=../../.env src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "deploy-commands": "node --env-file-if-exists=../../.env src/deploy-commands.js"
   },
   "dependencies": {
     "@cos-nostra/shared": "*",

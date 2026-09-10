@@ -41,12 +41,12 @@ Root directory stays `/` on both. The Dockerfiles need the repo root as build co
 |---|---|---|
 | Custom Start Command | `npm start -w apps/backend` | `npm start -w apps/bot` |
 | Pre-deploy step | `npm run migrate -w apps/backend` | none, never run migrations from the bot |
-| Healthcheck Path | `/health` | **empty** until phase 4 |
+| Healthcheck Path | `/health` | `/health` (phase 4; empty before that) |
 | Restart Policy | On Failure, max 5 | On Failure, max 5 |
 
 The start command duplicates the Dockerfile `CMD` and can be left blank. The pre-deploy step is the collapsed `+ Add pre-deploy step` link directly under Custom Start Command, easy to miss.
 
-Setting a healthcheck on the bot **fails every bot deploy**: `apps/bot/src/index.js` serves no HTTP at all yet, so Railway waits for a response that never comes.
+This changed in phase 4: the bot now serves `GET /health` and `POST /post` on `BOT_PORT`, so it takes a healthcheck like the backend. Set the bot's Healthcheck Path to `/health` **and give it a target port of `BOT_PORT`**, because the bot does not read Railway's injected `PORT`. Before phase 4 a healthcheck failed every bot deploy, since nothing answered.
 
 ## Why Dockerfiles with the repo root as context
 
@@ -60,7 +60,13 @@ One application at discord.com/developers/applications provides both the OAuth c
 - **OAuth2 → General**: client id → `DISCORD_CLIENT_ID` (both services), client secret → `DISCORD_CLIENT_SECRET` (backend only).
 - **Bot → Token**: Reset Token, shown once → `DISCORD_TOKEN` (bot service only).
 - **Bot → Privileged Gateway Intents**: leave all off. The bot requests `Guilds`, `GuildMessages`, `GuildMessageReactions`, none of which are privileged. Message Content is only needed if a later phase reads message text.
-- **Install link**: scopes `bot` + `applications.commands`; permissions View Channels, Send Messages, Embed Links, Attach Files, Add Reactions, Read Message History.
+- **Install link**: scopes `bot` + `applications.commands`; permissions View Channels, Send Messages, Embed Links, Attach Files, Add Reactions, Read Message History. Those six add up to **117824**, so the link is:
+
+  ```
+  https://discord.com/oauth2/authorize?client_id=<DISCORD_CLIENT_ID>&scope=bot%20applications.commands&permissions=117824
+  ```
+
+  **A bot that was never invited anywhere fails command registration with `Missing Access` (code 50001)**, which reads like a permissions bug but is not one. Check with `GET https://discord.com/api/v10/users/@me/guilds` and a `Bot <token>` header: an empty array means it is in no guild, and no amount of permission fiddling will help until someone opens the install link. Guild-scoped registration also needs the guild id to be one the bot is actually in, so confirm it against that listing rather than trusting `DISCORD_DEV_GUILD_ID`.
 
 ## Environment variables
 
@@ -142,7 +148,8 @@ Drizzle SQL migrations are committed under `apps/backend/drizzle/` (generate wit
 6. **Bucket**: + New → Storage Bucket. Note the real service name. Its Variables tab shows `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`.
 7. **Deploy the backend** and read the logs in order: Dockerfile stages → pre-deploy `migrations applied (pg)` → `object storage ready` → `Server listening at http://0.0.0.0:8080`. Then `https://cosnostra.benja.ar/health` answers `{"ok":true,"driver":"pg"}`.
 8. **bot service**: + New → GitHub Repo → same repo. Root directory `/`, its own `RAILWAY_DOCKERFILE_PATH`, the bot variables, start command, **no healthcheck**, no domain. Success looks like `Logged in as <name>` in the deploy log.
-9. **Phase 4**: add `BOT_PORT=3001` and the bot's `/health` healthcheck, and set `BOT_INTERNAL_URL` on the backend to the bot's real internal hostname.
+9. **Phase 4**: add `BOT_PORT=3001` and the bot's `/health` healthcheck, and set `BOT_INTERNAL_URL` on the backend to `http://<bot internal hostname>:3001`. Until that variable is set the backend logs `BOT_INTERNAL_URL unset, not notifying bot` and clips upload without ever reaching Discord; the bot's `POST /post` can still be driven by hand to test the rest.
+10. **Register the slash commands**: `npm run deploy-commands -w apps/bot`, which registers to `DISCORD_DEV_GUILD_ID` when set (instant) and globally otherwise (up to an hour). It is a separate step from deploying, and it must be re-run whenever a command's name, options or description change.
 
 Watch paths used to come from `railway.json`; without it every push to `main` redeploys both services, including desktop-only commits. Set Watch Paths by hand in Settings if that becomes annoying: `apps/backend/**`, `packages/shared/**`, `package.json`, `package-lock.json` (and the `apps/bot/**` equivalent).
 

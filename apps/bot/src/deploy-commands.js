@@ -75,10 +75,13 @@ async function main() {
 
 try {
   await main();
-  process.exit(0);
 } catch (err) {
   // A Discord REST error carries the useful part in err.rawError.
   console.error(`Command registration failed: ${err?.message ?? err}`);
   if (err?.rawError) console.error(JSON.stringify(err.rawError, null, 2));
-  process.exit(1);
+  process.exitCode = 1;
 }
+// Deliberately no process.exit(): calling it while @discordjs/rest is still tearing its
+// agent down aborts the process inside libuv on Windows ("Assertion failed:
+// !(handle->flags & UV_HANDLE_CLOSING)"), which turns a readable REST error into a crash
+// and a useless npm exit code. Nothing here keeps the loop alive, so it exits on its own.
