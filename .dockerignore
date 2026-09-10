@@ -1,0 +1,15 @@
+# The Railway Dockerfiles use the repo root as build context; keep it small.
+**/node_modules
+**/target
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.github
+.claude
+apps/desktop
+docs
+text-freetype2
+clips
+**/*.log

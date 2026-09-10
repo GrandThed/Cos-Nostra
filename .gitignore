@@ -15,3 +15,6 @@ clips/
 rtmp-services/
 win-capture/
 apps/desktop/src-tauri/binaries/
+
+# Local PGlite database for the backend
+apps/backend/data/

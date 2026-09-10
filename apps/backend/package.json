@@ -4,11 +4,31 @@
   "private": true,
   "type": "module",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "dev": "node --env-file-if-exists=../../.env --watch src/index.js",
+    "start": "node --env-file-if-exists=../../.env src/index.js",
+    "migrate": "node --env-file-if-exists=../../.env src/db/migrate.js",
+    "generate": "drizzle-kit generate",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "dependencies": {
-    "fastify": "^5.12.3"
+    "@aws-sdk/client-s3": "^3.1129.0",
+    "@aws-sdk/s3-request-presigner": "^3.1129.0",
+    "@electric-sql/pglite": "^0.5.8",
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/cors": "^11.3.0",
+    "@fastify/jwt": "^10.2.2",
+    "@fastify/rate-limit": "^11.2.0",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.12.3",
+    "pg": "^8.23.0",
+    "zod": "^4.6.1"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.10",
+    "pino-pretty": "^13.1.3"
   }
 }

@@ -1,8 +1,16 @@
-import Fastify from 'fastify';
+import { buildApp } from './app.js';
 
-const app = Fastify({ logger: true });
+const app = await buildApp();
+try {
+  await app.listen({ port: app.config.PORT, host: '0.0.0.0' });
+} catch (e) {
+  app.log.error(e);
+  process.exit(1);
+}
 
-app.get('/health', async () => ({ ok: true }));
-
-const port = Number(process.env.PORT ?? 3000);
-await app.listen({ port, host: '0.0.0.0' });
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, async () => {
+    await app.close();
+    process.exit(0);
+  });
+}

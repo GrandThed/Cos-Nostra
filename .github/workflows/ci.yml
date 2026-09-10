@@ -1,0 +1,49 @@
+# Runs on every push and pull request. Two jobs:
+#   node     npm ci + npm test for every workspace with a test script (backend on PGlite, shared)
+#   desktop  cargo check of the Tauri app on Windows. tauri-build's build.rs needs the ffmpeg
+#            sidecars under src-tauri/binaries even for a type check, so ensure-ffmpeg runs first
+#            (downloads ~100 MB on a cold runner; cached by the script's hash afterwards).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - run: npm ci
+      - name: Cache ffmpeg sidecars
+        uses: actions/cache@v4
+        with:
+          path: apps/desktop/src-tauri/binaries
+          key: ffmpeg-sidecars-${{ runner.os }}-${{ hashFiles('apps/desktop/scripts/ensure-ffmpeg.ps1') }}
+      - run: npm run ensure-ffmpeg -w apps/desktop
+      - run: cargo check
+        working-directory: apps/desktop/src-tauri
