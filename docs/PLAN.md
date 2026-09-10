@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-10. Status of milestone 1: done and verified on an AMD RX 9060 XT.
+Last updated 2026-09-10. Phases 1, 2 and 3 are done and verified on an AMD RX 9060 XT; the backend is live at https://cosnostra.benja.ar. Phase 4 is next.
 
 ## 1. What we are building
 
@@ -15,7 +15,7 @@ Three parts that share one idea: a clip is a short video with an owner, a game, 
 Guiding decisions, already made:
 
 - Capture and encoding happen on the player's GPU. Railway never touches video bytes.
-- Videos live in object storage with an S3 API. Cloudflare R2 is the default because egress is free. Railway volumes are not used for video.
+- Videos live in object storage with an S3 API. A Railway Storage Bucket is the default; nothing outside `plugins/storage.js` knows which provider it is. Railway volumes are not used for video.
 - Final format is AV1 in MP4 with Opus audio, hardware encoded when the card supports it, SVT-AV1 otherwise. Every clip also keeps an H.264 copy for Discord embeds and old phones until we measure that nobody needs it.
 - Identity is Discord. Every user of the desktop app logs in with Discord OAuth, which is what lets the bot tie reactions to clip owners.
 - The desktop app is GPL-3.0. Backend and bot live in the same public monorepo.
@@ -117,24 +117,42 @@ Tasks:
 
 Acceptance: ten clips saved in a row during gameplay all end up encoded within a few minutes of leaving the game, with no dropped frames in the game while encoding runs at low process priority.
 
-### Phase 3. Backend. Code done 2026-09-10, deployment pending.
+### Phase 3. Backend. Done 2026-09-10, deployed and verified against production.
 
 Goal: a deployed API with Discord login, presigned uploads, clip records and a player page.
+
+Live at `https://cosnostra.benja.ar`, with Railway Postgres and a Railway Storage Bucket attached.
 
 What changed from the plan and why:
 
 - Object storage is a Railway Storage Bucket instead of R2, still only through the S3 API. Railway buckets have no public read, so objects are never public: `GET /clips/:id/{av1,h264,thumb}` are the stable URLs and redirect to one-hour presigned GETs. The player page, Discord embeds and the bot use those.
 - Local development and tests run on PGlite (Postgres in WASM) through the same Drizzle schema and migrations; `DATABASE_URL=pglite://memory` or `pglite://./data/dev`. Production uses `pg`.
-- Railway services build from Dockerfiles with the repo root as context, because the npm lockfile lives at the root; each service points at its `railway.json`. Details in the railway-deploy skill.
+- Railway services build from Dockerfiles with the repo root as context, because the npm lockfile lives at the root. The `railway.json` files are dead weight: Railway deprecated Config as Code, so the builder is selected with a `RAILWAY_DOCKERFILE_PATH` service variable and every other setting is set by hand in the dashboard. Details in the railway-deploy skill.
 - Device tokens are opaque random strings stored hashed; the JWT only signs the OAuth `state`.
 - Backend and bot load the repo-root `.env` locally (`node --env-file-if-exists`), and the root `.env.example` is the single local reference.
 - `device_logins` rows are deleted when the desktop collects the token, which is how "consumed" is represented.
+- `@aws-sdk/client-s3` signs `x-amz-checksum-crc32` for an *empty* body into every presigned PUT URL. Railway's bucket ignores it and real uploads succeed (verified at 50 KB, 20 MB and 38 MB). A provider that enforced it would reject every upload, so this is a portability landmine worth remembering rather than a bug to fix now.
+- The desktop app's default `backend_url` is production, so a fresh install talks to Railway with no configuration.
+
+Acceptance, run end to end against production on 2026-09-10: the desktop app's own "Link Discord"
+button started a device login, the browser completed the Discord OAuth round trip with no clicks
+(the account had already authorized the application) and the app logged in as `granthed`. Five
+clips uploaded straight to the bucket through presigned PUTs at roughly 4 MB/s, each in 13-18 s,
+and `POST /clips/:id/complete` verified all three objects with HEADs. The player page at
+`/c/cKKTMjWyCu5D` was checked in headless Edge over the DevTools protocol at 390x844 mobile and
+1280x900: no horizontal overflow at either size, and the AV1 source actually decoded and played
+(`readyState` 4, 77 frames in 1.5 s). `DELETE /clips/:id` removed objects and rows for the test
+clips, and `DELETE /auth/device` revoked the probe token, which then answered 401.
+
+Deferred: a real iOS Safari check, because there is no Apple device here. The page keeps the
+H.264 `<source>` for exactly that case and Edge reports `probably` for both codecs, but "works on
+a phone" has only been proven with a phone-sized Chromium viewport.
 
 Stack details:
 
 - Fastify with `@fastify/jwt`, `@fastify/cors`, `@fastify/rate-limit`.
 - Postgres through `drizzle-orm` with migrations checked in.
-- `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner` for R2.
+- `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner` for the bucket.
 - `pino` logging, `/health` for Railway.
 
 Data model:
@@ -171,13 +189,9 @@ Endpoints:
 | POST /internal/reactions | Bot records a reaction add or remove |
 | GET /rankings?guild=&year= | Top clips by reactions, used by the bot and the recap |
 
-Storage layout in the bucket: `clips/<user_id>/<clip_id>/av1.mp4`, `h264.mp4`, `thumb.jpg`. Objects are public read behind the R2 custom domain. Deletion removes all three.
+Storage layout in the bucket: `clips/<user_id>/<clip_id>/av1.mp4`, `h264.mp4`, `thumb.jpg`. Objects are never public: every read is a presigned GET the backend redirects to. Deletion removes all three.
 
-Deployment:
-
-- Railway service `backend` with root directory `apps/backend`, Nixpacks or a small Dockerfile, `npm start`.
-- Env vars: `DATABASE_URL`, `S3_*`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `JWT_SECRET`, `BOT_SHARED_SECRET`, `PUBLIC_URL`.
-- Migrations run on deploy through a release command.
+Deployment: one Railway service built from `apps/backend/Dockerfile` with the repo root as context, root directory `/`, migrations in a pre-deploy step, healthcheck `/health`, custom domain `cosnostra.benja.ar`. The per-service variable list lives in the railway-deploy skill so there is one copy of it.
 
 Acceptance: from a clean install, a user logs in through Discord, a clip uploaded from the desktop app opens in the browser at its player URL on desktop and on a phone.
 
@@ -225,7 +239,7 @@ Acceptance: run the recap against last year's test data and get a watchable vide
 - CI: on every push run `cargo check` and `cargo clippy` for the desktop, `npm test` for the JavaScript packages. On tags, run `tauri build` on a Windows runner and attach the installer to a GitHub release.
 - Observability: Railway logs for both services, a `/health` endpoint each, and an alert if the bot disconnects for more than a few minutes.
 - Backups: Railway Postgres daily backups. The bucket is the source of truth for video, so versioning is enabled on it.
-- Cost: R2 gives 10 GB free and then about 15 dollars per terabyte per month with no egress. A community producing 200 clips a month at 30 MB each is 6 GB a month, so storage cost stays trivial for the first year.
+- Cost: a community producing 200 clips a month at 30 MB each stores 6 GB a month, so stored bytes stay cheap on any provider. Railway bills egress as well, unlike R2, so watch bandwidth once people actually watch clips; the S3-only surface means moving the bucket elsewhere is a variable change.
 
 ## 6. Risks and mitigations
 

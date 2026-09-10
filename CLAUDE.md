@@ -31,7 +31,7 @@ Toolchain on the dev machine: Rust stable MSVC, Node 24, ffmpeg 9 (`ffmpeg`/`ffp
 - Embedded libobs, not obs-websocket. Do not suggest requiring OBS Studio.
 - Final format is AV1 (hardware when available, SVT-AV1 fallback) plus an H.264 copy for Discord attachments and old devices.
 - Discord OAuth is the only identity. Desktop links a device through a device-code flow, no local HTTP listener.
-- Object storage is Cloudflare R2 by default, addressed only through the S3 API so it stays swappable.
+- Object storage is a Railway Storage Bucket, addressed only through the S3 API so it stays swappable. Railway buckets have no public read, so nothing is ever a public object URL: the backend redirects `GET /clips/:id/{av1,h264,thumb}` to one-hour presigned GETs.
 - License is GPL-3.0 for the whole repo because the desktop app links libobs through GPL-3.0 crates. Do not add dependencies with GPL-incompatible licenses.
 - OBS runtime binaries are downloaded at first launch from the signed `libobs-rs/libobs-builds` releases and are never rebuilt or patched, so anti-cheat allowlisting of the game hook keeps working.
 
@@ -58,6 +58,7 @@ Toolchain on the dev machine: Rust stable MSVC, Node 24, ffmpeg 9 (`ffmpeg`/`ffp
 - Clip metadata lives in `%APPDATA%\Cos Nostra\clips.db` (SQLite, WAL). Delete it together with the `*.av1.mp4`, `*.h264.mp4` and `*.jpg` files next to the clips to start over.
 - Never create or drop a `reqwest::blocking` client inside an `async` Tauri command: tokio panics ("Cannot drop a runtime in a context where blocking is not allowed") and the poisoned mutexes take the app down. Wrap the body in `tauri::async_runtime::spawn_blocking` or use a plain thread, as `start_login` and `logout` do.
 - The backend runs locally without Postgres: `DATABASE_URL=pglite://./data/dev`. Point the desktop at it through the Backend URL field in Settings (`http://localhost:3000`), and register `http://localhost:3000/auth/discord/callback` as a redirect in the Discord app if you want the login to complete locally.
+- A dev build uploads to **production**: `settings.rs` defaults `backend_url` to `https://cosnostra.benja.ar`, and `auto_upload` defaults on, so linking Discord in `tauri dev` sends every already-encoded clip in the queue to the real bucket, oldest first. Before testing the queue, either uncheck "Upload clips automatically" in Settings or point Backend URL at `http://localhost:3000`. Clips that got up by accident come down with `DELETE /clips/:id` using the device token.
 - The exe links `obs.dll` at load time. The installer ships the bootstrapper's dummy from `src-tauri/resources/obs-dummy.dll` and installs per user into `%LOCALAPPDATA%\Cos Nostra` because the real runtime is extracted next to the exe on first launch.
 
 ## Skills

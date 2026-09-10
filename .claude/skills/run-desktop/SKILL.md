@@ -72,10 +72,31 @@ $g = [System.Drawing.Graphics]::FromImage($bmp); $dc = $g.GetHdc()
 [N.W]::PrintWindow($p.MainWindowHandle, $dc, 2) | Out-Null; $g.ReleaseHdc($dc); $bmp.Save("shot.png")
 ```
 
-Clicks: `SetCursorPos` to window-relative coordinates from the screenshot, then `mouse_event(2)` and
-`mouse_event(4)`. Keyboard: `WScript.Shell.SendKeys`. Injected keys arrive in the webview with an
-empty `KeyboardEvent.code`; the hotkey capture falls back to `key`, so `SendKeys("%{F9}")` binds
-Alt+F9 correctly.
+**Drive the UI with the keyboard, not the mouse.** In an automated session `SetCursorPos` +
+`mouse_event` did nothing: the cursor never moved (reading it back showed the physical mouse
+position), so clicks landed wherever the real pointer happened to be and the UI silently did not
+change. Keyboard injection works reliably:
+
+```powershell
+$p = Get-Process cos-nostra-desktop | ? { $_.MainWindowHandle -ne 0 } | select -First 1
+$sh = New-Object -ComObject WScript.Shell
+$sh.AppActivate($p.Id)          # must return True; the webview ignores keys unless activated
+Start-Sleep -Milliseconds 400
+$sh.SendKeys("{TAB}")           # +{TAB} = Shift+Tab, " " = Space, {ENTER} = Enter
+```
+
+`AppActivate` brings the window forward even when VS Code has focus, which `SetForegroundWindow`
+does not. Focus order is DOM order in `index.html`, and elements inside a `hidden` section are
+skipped. From a freshly loaded window three Tabs reach the Settings tab button and Enter switches
+the panel; the settings controls then follow markup order (hotkey bind, buffer length, bitrate,
+clip folder, Browse, the four checkboxes, the account button, Backend URL, auto-upload, Save
+settings). Screenshot every few keys and read the focus ring out of the `PrintWindow` capture
+instead of counting Tabs blind, because the panel scrolls and the account block changes shape
+once a device is linked.
+
+Injected keys arrive in the webview with an empty `KeyboardEvent.code`; the hotkey capture falls
+back to `key`, so `SendKeys("%{F9}")` binds Alt+F9 correctly. The global save hotkey is registered
+with the OS, so `SendKeys("%{F10}")` saves a clip no matter which window is active.
 
 ## Test the installer
 
