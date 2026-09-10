@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "ensure-ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-ffmpeg.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -15,7 +16,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-		"vite": "^8.0.16",
+    "vite": "^8.0.16",
     "typescript": "~6.0.3"
   }
 }

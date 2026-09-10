@@ -1,10 +1,15 @@
 mod capture;
 mod settings;
+mod ffmpeg;
+mod games;
+mod queue;
+mod win;
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::Serialize;
@@ -15,8 +20,12 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt as _;
+use tauri_plugin_opener::OpenerExt as _;
 
 use capture::{CaptureConflict, HookCallback, HookedGame, Recorder};
+use ffmpeg::{Binaries, Encoders, Trim};
+use games::DetectedGame;
+use queue::{ClipRow, Gate, NewClip, OnChange, Outputs, Processor, Queue, Worker};
 use settings::Settings;
 
 struct AppState {
@@ -29,6 +38,25 @@ struct AppState {
     hooked_game: Mutex<Option<HookedGame>>,
     /// Bumped on every (re)start so a slow start that got superseded discards its result.
     generation: AtomicU64,
+    /// ffmpeg/ffprobe, once located at startup. `None` means encoding is unavailable.
+    ffmpeg: Mutex<Option<Binaries>>,
+    /// Why ffmpeg is unavailable, shown in the Status tab.
+    ffmpeg_error: Mutex<Option<String>>,
+    /// Clip queue; `None` until the database opened (or forever if it could not).
+    queue: Mutex<Option<Arc<Queue>>>,
+    worker: Mutex<Option<Worker>>,
+}
+
+impl AppState {
+    fn queue(&self) -> Option<Arc<Queue>> {
+        self.queue.lock().unwrap().clone()
+    }
+
+    fn wake_worker(&self) {
+        if let Some(w) = self.worker.lock().unwrap().as_ref() {
+            w.wake();
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -42,11 +70,22 @@ struct Status {
     hotkey_error: Option<String>,
     hooked_game: Option<HookedGame>,
     conflict: Option<CaptureConflict>,
+    encoders: Option<Encoders>,
+    ffmpeg_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 struct ClipSaved {
     path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ClipsChanged {
+    id: Option<i64>,
+}
+
+fn emit_clips_changed(app: &AppHandle, id: Option<i64>) {
+    let _ = app.emit("clips-changed", ClipsChanged { id });
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +120,8 @@ fn get_status(state: State<AppState>) -> Status {
         hotkey_error: state.hotkey_error.lock().unwrap().clone(),
         hooked_game,
         conflict,
+        encoders: settings.encoders.clone(),
+        ffmpeg_error: state.ffmpeg_error.lock().unwrap().clone(),
     }
 }
 
@@ -120,6 +161,395 @@ fn retry_recorder(app: AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Clip list commands
+
+fn queue_or_err(state: &AppState) -> Result<Arc<Queue>, String> {
+    state
+        .queue()
+        .ok_or_else(|| "clip queue is not available".to_string())
+}
+
+#[tauri::command]
+fn list_clips(state: State<AppState>) -> Result<Vec<ClipRow>, String> {
+    queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))
+}
+
+/// Removes the row and every file we know about for it. Missing files are fine.
+#[tauri::command]
+async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let row = queue_or_err(&state)?
+        .delete(id)
+        .map_err(|e| format!("{e:#}"))?;
+    if let Some(row) = row {
+        for p in clip_files(&row) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => log::info!("deleted {p}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("could not delete {p}: {e}"),
+            }
+        }
+    }
+    emit_clips_changed(&app, Some(id));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_clip_game(app: AppHandle, id: i64, game: Option<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let game = game.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+    queue_or_err(&state)?
+        .set_game(id, game.as_deref())
+        .map_err(|e| format!("{e:#}"))?;
+    emit_clips_changed(&app, Some(id));
+    Ok(())
+}
+
+#[tauri::command]
+fn retry_clip(app: AppHandle, id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    queue_or_err(&state)?
+        .retry(id)
+        .map_err(|e| format!("{e:#}"))?;
+    state.wake_worker();
+    emit_clips_changed(&app, Some(id));
+    Ok(())
+}
+
+/// Reveals the best file we have for the clip in Explorer: the AV1 output when encoded,
+/// otherwise the source recording.
+#[tauri::command]
+fn open_clip_folder(app: AppHandle, id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let row = queue_or_err(&state)?
+        .get(id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("clip {id} not found"))?;
+    let candidates = [
+        row.av1_path.as_deref(),
+        row.h264_path.as_deref(),
+        Some(row.source_path.as_str()),
+    ];
+    let existing = candidates
+        .into_iter()
+        .flatten()
+        .find(|p| Path::new(p).exists());
+    // Fall back to the source path even if it is gone so at least the folder opens.
+    let target = existing.unwrap_or(row.source_path.as_str());
+    app.opener()
+        .reveal_item_in_dir(target)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The thumbnail as a data URL, so the webview needs no asset protocol scope.
+#[tauri::command]
+fn get_thumbnail(state: State<AppState>, id: i64) -> Result<Option<String>, String> {
+    let row = queue_or_err(&state)?
+        .get(id)
+        .map_err(|e| format!("{e:#}"))?;
+    let Some(thumb) = row.and_then(|r| r.thumb_path) else {
+        return Ok(None);
+    };
+    match std::fs::read(&thumb) {
+        Ok(bytes) => Ok(Some(format!("data:image/jpeg;base64,{}", base64_encode(&bytes)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("reading {thumb}: {e}")),
+    }
+}
+
+#[tauri::command]
+fn get_encoders(state: State<AppState>) -> Option<Encoders> {
+    state.settings.lock().unwrap().encoders.clone()
+}
+
+/// Re-runs the (slow) encoder probe and stores the result in settings.
+#[tauri::command]
+async fn reprobe_encoders(app: AppHandle) -> Result<Encoders, String> {
+    let state = app.state::<AppState>();
+    let bins = state
+        .ffmpeg
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "ffmpeg is not available".to_string())?;
+    let encoders = ffmpeg::probe_encoders(&bins);
+    log::info!("encoders probed: av1={} h264={}", encoders.av1, encoders.h264);
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.encoders = Some(encoders.clone());
+        if let Err(e) = s.save() {
+            log::warn!("saving probed encoders: {e:#}");
+        }
+    }
+    let _ = app.emit("status-changed", ());
+    Ok(encoders)
+}
+
+/// Standard base64 with padding. Small enough to not be worth a dependency.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Every file a clip row may own, for deletion.
+fn clip_files(row: &ClipRow) -> Vec<String> {
+    let mut files = vec![row.source_path.clone()];
+    for p in [&row.av1_path, &row.h264_path, &row.thumb_path] {
+        if let Some(p) = p {
+            files.push(p.clone());
+        }
+    }
+    // Rows that never reached the processor have no output paths recorded; also try the
+    // conventional names so a failed clip does not leave partial outputs behind.
+    let (av1, h264, thumb) = output_paths(Path::new(&row.source_path));
+    for p in [av1, h264, thumb] {
+        let p = p.display().to_string();
+        if !files.contains(&p) {
+            files.push(p);
+        }
+    }
+    files
+}
+
+// ---------------------------------------------------------------------------
+// Encoding pipeline
+
+/// Outputs live next to the source: `<stem>.av1.mp4`, `<stem>.h264.mp4`, `<stem>.jpg`.
+fn output_paths(source: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "clip".to_string());
+    let dir = source.parent().map(Path::to_path_buf).unwrap_or_default();
+    (
+        dir.join(format!("{stem}.av1.mp4")),
+        dir.join(format!("{stem}.h264.mp4")),
+        dir.join(format!("{stem}.jpg")),
+    )
+}
+
+fn file_size(path: &Path) -> anyhow::Result<i64> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(meta.len() as i64)
+}
+
+/// The worker's job for one clip: thumbnail, AV1, then H.264. Runs on the worker thread.
+fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
+    let state = app.state::<AppState>();
+    let bins = state
+        .ffmpeg
+        .lock()
+        .unwrap()
+        .clone()
+        .context("ffmpeg is not available")?;
+    let encoders = state
+        .settings
+        .lock()
+        .unwrap()
+        .encoders
+        .clone()
+        .context("encoders have not been probed yet")?;
+
+    let source = Path::new(&row.source_path);
+    let (av1, h264, thumb) = output_paths(source);
+    log::info!("encoding clip {} ({})", row.id, source.display());
+
+    let t = Instant::now();
+    let at_ms = row.duration_ms / 4;
+    ffmpeg::thumbnail(&bins, source, &thumb, at_ms)
+        .with_context(|| format!("thumbnail for {}", source.display()))?;
+    log::info!("clip {}: thumbnail in {:.1?}", row.id, t.elapsed());
+
+    let t = Instant::now();
+    ffmpeg::encode_av1(&bins, &encoders.av1, source, &av1, Trim::default())
+        .with_context(|| format!("AV1 encode with {}", encoders.av1))?;
+    let size_av1 = file_size(&av1)?;
+    log::info!(
+        "clip {}: AV1 ({}) in {:.1?}, {} bytes",
+        row.id,
+        encoders.av1,
+        t.elapsed(),
+        size_av1
+    );
+
+    let t = Instant::now();
+    ffmpeg::encode_h264(&bins, &encoders.h264, source, &h264, Trim::default())
+        .with_context(|| format!("H.264 encode with {}", encoders.h264))?;
+    let size_h264 = file_size(&h264)?;
+    log::info!(
+        "clip {}: H.264 ({}) in {:.1?}, {} bytes",
+        row.id,
+        encoders.h264,
+        t.elapsed(),
+        size_h264
+    );
+
+    Ok(Outputs {
+        av1_path: av1.display().to_string(),
+        h264_path: h264.display().to_string(),
+        thumb_path: thumb.display().to_string(),
+        size_av1,
+        size_h264,
+    })
+}
+
+/// True when the worker may encode: the user opted in, or nothing game-like is running.
+fn encode_allowed(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    if state.settings.lock().unwrap().encode_while_gaming {
+        return true;
+    }
+    if state.hooked_game.lock().unwrap().is_some() {
+        return false;
+    }
+    games::detect_foreground().is_none()
+}
+
+/// Locates ffmpeg, probes encoders if needed, opens the queue and starts the worker.
+/// Blocking (the probe takes seconds); runs on a background thread at startup.
+fn start_pipeline(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let bins = match ffmpeg::locate() {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error!("ffmpeg not available: {msg}");
+            *state.ffmpeg_error.lock().unwrap() = Some(msg);
+            let _ = app.emit("status-changed", ());
+            return;
+        }
+    };
+    log::info!("ffmpeg: {}", bins.ffmpeg.display());
+    *state.ffmpeg.lock().unwrap() = Some(bins.clone());
+
+    let needs_probe = state.settings.lock().unwrap().encoders.is_none();
+    if needs_probe {
+        let t = Instant::now();
+        let encoders = ffmpeg::probe_encoders(&bins);
+        log::info!(
+            "encoders probed in {:.1?}: av1={} h264={}",
+            t.elapsed(),
+            encoders.av1,
+            encoders.h264
+        );
+        let mut s = state.settings.lock().unwrap();
+        s.encoders = Some(encoders);
+        if let Err(e) = s.save() {
+            log::warn!("saving probed encoders: {e:#}");
+        }
+    }
+    let _ = app.emit("status-changed", ());
+
+    let db = match settings::data_dir() {
+        Some(d) => d.join("clips.db"),
+        None => {
+            log::error!("APPDATA is not set; clip queue disabled");
+            return;
+        }
+    };
+    if let Some(parent) = db.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::error!("creating {}: {e}", parent.display());
+        }
+    }
+    let queue = match Queue::open(&db) {
+        Ok(q) => Arc::new(q),
+        Err(e) => {
+            log::error!("opening clip queue {}: {e:#}", db.display());
+            return;
+        }
+    };
+
+    let proc_app = app.clone();
+    let processor: Processor = Arc::new(move |row| process_clip(&proc_app, row));
+    let gate_app = app.clone();
+    let gate: Gate = Arc::new(move || encode_allowed(&gate_app));
+    let change_app = app.clone();
+    let on_change: OnChange = Arc::new(move |id| emit_clips_changed(&change_app, Some(id)));
+
+    let worker = queue::start_worker(queue.clone(), processor, gate, on_change);
+    *state.queue.lock().unwrap() = Some(queue);
+    *state.worker.lock().unwrap() = Some(worker);
+    log::info!("clip queue ready at {}", db.display());
+    emit_clips_changed(app, None);
+}
+
+/// Probes the freshly written file and enqueues it. libobs may still be flushing the MP4
+/// when the replay buffer returns, so the probe is retried for about three seconds.
+fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedGame>) {
+    let state = app.state::<AppState>();
+    let Some(queue) = state.queue() else {
+        log::warn!("clip queue unavailable; {} will not be encoded", path.display());
+        return;
+    };
+    let bins = state.ffmpeg.lock().unwrap().clone();
+    let Some(bins) = bins else {
+        log::warn!("ffmpeg unavailable; {} will not be encoded", path.display());
+        return;
+    };
+
+    let mut info = None;
+    let mut last_err = None;
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ffmpeg::probe(&bins, &path) {
+            Ok(i) if i.duration_ms > 0 => {
+                info = Some(i);
+                break;
+            }
+            Ok(i) => last_err = Some(format!("probe reported duration {} ms", i.duration_ms)),
+            Err(e) => last_err = Some(format!("{e:#}")),
+        }
+    }
+    let Some(info) = info else {
+        log::error!(
+            "could not probe {}: {}",
+            path.display(),
+            last_err.unwrap_or_default()
+        );
+        return;
+    };
+
+    let clip = NewClip {
+        source_path: path.display().to_string(),
+        game: detected.as_ref().map(|d| d.game.clone()),
+        title: detected.as_ref().map(|d| d.title.clone()),
+        recorded_at: chrono::Local::now().to_rfc3339(),
+        duration_ms: info.duration_ms,
+        width: info.width,
+        height: info.height,
+        size_source: info.size as i64,
+    };
+    match queue.enqueue(clip) {
+        Ok(id) => {
+            log::info!(
+                "queued clip {id}: {} ({} ms, {}x{})",
+                path.display(),
+                info.duration_ms,
+                info.width,
+                info.height
+            );
+            state.wake_worker();
+            emit_clips_changed(app, Some(id));
+        }
+        Err(e) => log::error!("enqueue {} failed: {e:#}", path.display()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Saving
 
 fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
@@ -138,6 +568,15 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
     match &result {
         Ok(path) => {
             log::info!("clip saved: {}", path.display());
+            // The game is still focused right now; look before the toast steals attention.
+            let detected = games::detect_foreground();
+            match &detected {
+                Some(d) => log::info!("foreground game: {} ({})", d.game, d.executable),
+                None => log::info!("no game in the foreground"),
+            }
+            let queue_app = app.clone();
+            let queue_path = path.clone();
+            std::thread::spawn(move || enqueue_saved_clip(&queue_app, queue_path, detected));
             let _ = app.emit(
                 "clip-saved",
                 ClipSaved {
@@ -492,6 +931,10 @@ pub fn run() {
             hotkey_error: Mutex::new(None),
             hooked_game: Mutex::new(None),
             generation: AtomicU64::new(0),
+            ffmpeg: Mutex::new(None),
+            ffmpeg_error: Mutex::new(None),
+            queue: Mutex::new(None),
+            worker: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -499,7 +942,15 @@ pub fn run() {
             get_settings,
             save_settings,
             pick_clip_dir,
-            retry_recorder
+            retry_recorder,
+            list_clips,
+            delete_clip,
+            set_clip_game,
+            retry_clip,
+            open_clip_folder,
+            get_thumbnail,
+            get_encoders,
+            reprobe_encoders
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -516,7 +967,11 @@ pub fn run() {
                 log::warn!("{e:#}");
             }
             // libobs startup takes a moment; keep the window responsive.
-            std::thread::spawn(move || start_recorder(&handle));
+            let recorder_handle = handle.clone();
+            std::thread::spawn(move || start_recorder(&recorder_handle));
+            // ffmpeg lookup, encoder probe and queue open. Independent of libobs, so it
+            // runs on its own thread rather than waiting for the recorder.
+            std::thread::spawn(move || start_pipeline(&handle));
             Ok(())
         })
         .on_window_event(|window, event| {

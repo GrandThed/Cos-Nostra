@@ -58,69 +58,23 @@ pub fn capture_conflict() -> Option<CaptureConflict> {
 }
 
 fn foreground_conflict() -> Result<Option<CaptureConflict>> {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-
-    // Safety: plain Win32 queries; the only pointer is the pid out-param below.
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_invalid() {
+    let Some(fg) = crate::win::foreground_window() else {
         return Ok(None);
-    }
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid == 0 || pid == std::process::id() {
-        return Ok(None);
-    }
-
-    let in_use = GameCaptureSourceBuilder::is_window_in_use_by_other_instance(pid)
-        .with_context(|| format!("checking hook pipe for pid {pid}"))?;
+    };
+    let in_use = GameCaptureSourceBuilder::is_window_in_use_by_other_instance(fg.pid)
+        .with_context(|| format!("checking hook pipe for pid {}", fg.pid))?;
     if !in_use {
         return Ok(None);
     }
-
-    let executable = process_executable_name(pid).unwrap_or_else(|e| {
-        log::debug!("executable name for pid {pid} unavailable: {e:#}");
-        String::new()
-    });
-    let title = window_title(hwnd);
-    log::debug!("foreground process {pid} ({executable}) already hooked by another capture tool");
-    Ok(Some(CaptureConflict { executable, title }))
-}
-
-/// File name of the process image, e.g. `game.exe`.
-fn process_executable_name(pid: u32) -> Result<String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    // Safety: the handle is closed on every path; the buffer outlives the call.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-        .context("opening process")?;
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    let queried = unsafe {
-        QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-    };
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    queried.context("querying process image name")?;
-    let full = String::from_utf16_lossy(&buf[..len as usize]);
-    Ok(full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string())
-}
-
-fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
-    let mut buf = [0u16; 512];
-    // Safety: the buffer is valid for the call and Win32 bounds the copy by its length.
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+    log::debug!(
+        "foreground process {} ({}) already hooked by another capture tool",
+        fg.pid,
+        fg.executable
+    );
+    Ok(Some(CaptureConflict {
+        executable: fg.executable,
+        title: fg.title,
+    }))
 }
 
 pub struct Recorder {

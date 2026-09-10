@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.cosnostra.clipper",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run ensure-ffmpeg && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run ensure-ffmpeg && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -51,6 +51,7 @@
         "displayLanguageSelector": false,
         "installerHooks": "installer-hooks.nsh"
       }
-    }
+    },
+    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"]
   }
 }

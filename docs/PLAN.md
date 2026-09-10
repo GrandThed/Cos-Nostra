@@ -78,9 +78,27 @@ What changed from the plan and why:
 
 Acceptance (a friend installs it from the installer, launches a game, presses the hotkey, finds a correct clip in the folder, and the app survives a reboot) was run on the dev machine with ffplay fullscreen standing in for the game.
 
-### Phase 2. Desktop post-processing. Two to three weeks.
+### Phase 2. Desktop post-processing. Done 2026-09-10.
 
 Goal: every saved clip becomes a small AV1 file plus an H.264 fallback and a thumbnail, without the user doing anything.
+
+What exists:
+
+- ffmpeg and ffprobe as Tauri sidecars. `scripts/ensure-ffmpeg.ps1` copies them from PATH or downloads the BtbN GPL build into the gitignored `src-tauri/binaries/`; it runs before every `tauri dev` and `tauri build` because tauri-build refuses to build without them.
+- Encoder probe at startup, cached in settings, re-probe from the UI. AMF was chosen for AV1 and H.264 on the dev GPU.
+- Clip queue in SQLite (`%APPDATA%\Cos Nostra\clips.db`), worker thread, backoff retries up to five attempts, stale `encoding` rows reset at startup.
+- Game detection from the foreground window at hotkey time: a table of about 240 executables, window title cleanup as fallback, a list of programs that are never games.
+- Thumbnail, AV1 and H.264 written next to the source as `<stem>.jpg`, `<stem>.av1.mp4`, `<stem>.h264.mp4`.
+- Clips tab: thumbnail, editable game, date, duration, sizes, status, open folder, retry, delete.
+
+What changed from the plan and why:
+
+- Encoding waits while a game is hooked or the foreground window looks like a game, rather than watching process priority alone. ffmpeg still runs at below-normal priority with half the cores.
+- Trim is plumbed through (`ffmpeg::Trim`) but not exposed in the UI until phase 6.
+- Sizes are far from "small" on synthetic content: AV1 at AMF QP 28 produced files as large as the 20 Mbps source on the ffplay test pattern, while H.264 at 8 Mbps VBR was a third of it. Real gameplay compresses differently; measure on a few real clips and lower the AV1 quality or cap its bitrate before phase 3 uploads make size matter.
+- The installer grows by two 220 MB static ffmpeg binaries (compressed by NSIS). If that hurts, switch to a download at first launch like the OBS runtime.
+
+Acceptance (ten clips saved during gameplay all encoded within a few minutes of leaving the game, at low priority) was run with ffplay fullscreen as the game: eleven clips queued, none encoded while it was focused, all done 143 seconds after closing it, ffmpeg observed at BelowNormal priority.
 
 Tasks:
 

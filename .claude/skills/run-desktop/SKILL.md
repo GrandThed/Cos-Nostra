@@ -49,6 +49,12 @@ ffplay -fs -autoexit -loglevel quiet "<any video file>"
 Expect `game capture hooked ffplay.exe (...)` in the log, the Status tab switching to
 "Recording: ...", and `game capture unhooked` when ffplay closes.
 
+## Test the encoding pipeline
+
+Startup lines to expect after `replay buffer running`: `using sidecar ffmpeg in ...`, `encoders probed in ...: av1=av1_amf h264=h264_amf` (first run only; cached in settings afterwards), `clip queue ready at ...\clips.db`. After a hotkey save: `queued clip N: <path> (<ms>, WxH)`. Encoding waits while a game is hooked or the foreground window looks like a game, then logs `encoding clip N`, `clip N: thumbnail in`, `clip N: AV1 (...) in`, `clip N: H.264 (...) in`. Outputs sit next to the source as `<stem>.jpg`, `<stem>.av1.mp4`, `<stem>.h264.mp4`. `Get-Process ffmpeg | select PriorityClass` should say `BelowNormal` while it runs.
+
+For the ten-clip acceptance run, send the hotkey every three seconds while ffplay is fullscreen, close ffplay, and count `clip N: H.264` lines.
+
 ## Look at the UI and drive it
 
 The window cannot be brought to the front while VS Code has focus (Windows blocks focus stealing),

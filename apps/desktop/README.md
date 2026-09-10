@@ -14,6 +14,16 @@ Windows clipper built with Tauri. Capture and encoding run on embedded libobs.
   `%USERPROFILE%\Videos\Cos Nostra`.
 - Settings live in `%APPDATA%\Cos Nostra\settings.json`.
 
+## ffmpeg
+
+`ffmpeg.exe` and `ffprobe.exe` ship as Tauri sidecars (`bundle.externalBin` in `tauri.conf.json`)
+and are copied next to the app exe at build time. `src-tauri/src/ffmpeg.rs` looks there first and
+falls back to `ffmpeg` on PATH. The sidecar files live in `src-tauri/binaries/` as
+`ffmpeg-x86_64-pc-windows-msvc.exe` / `ffprobe-x86_64-pc-windows-msvc.exe`; they are about
+220 MB each and are gitignored. `npm run ensure-ffmpeg` (run automatically before `tauri dev` and
+`tauri build`) creates them from ffmpeg on PATH, the winget `Gyan.FFmpeg` package directory, or
+the pinned BtbN GPL build download, in that order. Delete `src-tauri/binaries/` to refresh them.
+
 ## Develop
 
 ```

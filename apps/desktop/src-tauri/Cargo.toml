@@ -21,6 +21,8 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-autostart = "2"
+# Clip job queue. SQLite is public domain; the crate is MIT.
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Already pulled in by tauri-plugin-autostart; used to quote the Run entry it writes.
 winreg = "0.55"
 serde = { version = "1", features = ["derive"] }

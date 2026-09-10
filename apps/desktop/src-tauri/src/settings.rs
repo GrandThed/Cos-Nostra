@@ -29,6 +29,10 @@ pub struct Settings {
     pub notify_on_save: bool,
     /// Play the system asterisk sound after a successful save.
     pub sound_on_save: bool,
+    /// ffmpeg encoders chosen by the startup probe. `None` until the probe has run.
+    pub encoders: Option<crate::ffmpeg::Encoders>,
+    /// Encode even while a game is in the foreground. Off by default to protect frame rate.
+    pub encode_while_gaming: bool,
 }
 
 impl Default for Settings {
@@ -46,14 +50,21 @@ impl Default for Settings {
             start_with_windows: false,
             notify_on_save: true,
             sound_on_save: true,
+            encoders: None,
+            encode_while_gaming: false,
         }
     }
 }
 
+/// Per-user data directory (`%APPDATA%\Cos Nostra`): settings, the clip queue database.
+/// `None` when APPDATA is not set, which only happens in odd service contexts.
+pub fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Cos Nostra"))
+}
+
 impl Settings {
     fn path() -> Option<PathBuf> {
-        std::env::var_os("APPDATA")
-            .map(|p| PathBuf::from(p).join("Cos Nostra").join("settings.json"))
+        data_dir().map(|d| d.join("settings.json"))
     }
 
     /// Loads the saved settings. A missing file is normal; an unreadable one is logged and

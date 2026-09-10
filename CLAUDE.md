@@ -54,6 +54,8 @@ Toolchain on the dev machine: Rust stable MSVC, Node 24, ffmpeg 9 (`ffmpeg`/`ffp
 - OBS plugins write `rtmp-services/` and `win-capture/` next to the exe at runtime (in `src-tauri/` during dev). Both are gitignored; never commit them.
 - `settings.json` must be UTF-8 without BOM. PowerShell's `Set-Content -Encoding utf8` writes a BOM; the loader strips it, but other tools reading the file may not.
 - The dev build and the installed build share the single-instance id, so launching one while the other runs only focuses the running one. Stop the dev app before testing an installer.
+- ffmpeg and ffprobe are Tauri sidecars in the gitignored `apps/desktop/src-tauri/binaries/`. `npm run ensure-ffmpeg` (run automatically before `tauri dev` and `tauri build`) fills it from PATH or a download. A build that fails with a missing `ffmpeg-x86_64-pc-windows-msvc.exe` means that script did not run.
+- Clip metadata lives in `%APPDATA%\Cos Nostra\clips.db` (SQLite, WAL). Delete it together with the `*.av1.mp4`, `*.h264.mp4` and `*.jpg` files next to the clips to start over.
 - The exe links `obs.dll` at load time. The installer ships the bootstrapper's dummy from `src-tauri/resources/obs-dummy.dll` and installs per user into `%LOCALAPPDATA%\Cos Nostra` because the real runtime is extracted next to the exe on first launch.
 
 ## Skills

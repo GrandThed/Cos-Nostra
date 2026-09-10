@@ -19,6 +19,12 @@ ffmpeg -v error -f lavfi -i testsrc2=size=1280x720:rate=60 -t 2 -c:v av1_qsv   -
 
 If all fail, use `libsvtav1`. `ffmpeg -encoders | findstr av1` lists what the build contains. The winget build on the dev machine has all four.
 
+## Where this lives in the app
+
+`apps/desktop/src-tauri/src/ffmpeg.rs` holds every invocation (`probe_encoders`, `probe`, `encode_av1`, `encode_h264`, `thumbnail`); `queue.rs` drives them from the worker thread and `lib.rs::process_clip` chooses output names. `cargo test ffmpeg -- --nocapture` runs a real end-to-end encode on a generated sample and prints the probe result. Measured on the dev machine: probe 1.2 s total (nvenc fails in ~150 ms, amf passes in ~500 ms), a 29 s 1080p60 clip encodes in 7.5 s to AV1 and 6.5 s to H.264 on AMF.
+
+Size warning: on the ffplay `testsrc2` pattern AV1 at AMF QP 28 came out at about 20 Mbps, as big as the source, while H.264 8M VBR came out at about 8 Mbps. Judge presets on real gameplay clips, not on test patterns.
+
 ## Presets
 
 Measured on the dev machine (RX 9060 XT, Ryzen 5 5500) on a 28 s 1080p60 clip: `av1_amf` 7 s, `libsvtav1 -preset 8` 13 s.
