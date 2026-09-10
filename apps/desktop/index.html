@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cos Nostra</title>
+    <script type="module" src="/src/main.ts" defer></script>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 24px; }
+      h1 { font-size: 18px; margin: 0 0 16px; }
+      .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #8884; font-size: 14px; }
+      .row span:last-child { font-family: ui-monospace, monospace; }
+      #error { color: #d33; white-space: pre-wrap; font-size: 12px; margin-top: 12px; }
+      button { margin-top: 16px; padding: 8px 14px; }
+      #last { font-size: 12px; margin-top: 12px; opacity: 0.8; }
+    </style>
+  </head>
+  <body>
+    <h1>Cos Nostra clipper</h1>
+    <div class="row"><span>Buffer</span><span id="recording">starting…</span></div>
+    <div class="row"><span>Encoder</span><span id="encoder">–</span></div>
+    <div class="row"><span>Hotkey</span><span id="hotkey">–</span></div>
+    <div class="row"><span>Length</span><span id="seconds">–</span></div>
+    <div class="row"><span>Folder</span><span id="dir">–</span></div>
+    <button id="save">Save clip now</button>
+    <div id="last"></div>
+    <div id="error"></div>
+  </body>
+</html>

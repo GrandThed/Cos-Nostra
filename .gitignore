@@ -1,0 +1,15 @@
+node_modules/
+dist/
+target/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/obs/
+clips/
+
+# Written by the OBS rtmp-services plugin at runtime during tauri dev
+apps/desktop/src-tauri/rtmp-services/
