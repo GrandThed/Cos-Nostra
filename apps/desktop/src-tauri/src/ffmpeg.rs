@@ -256,9 +256,17 @@ fn input_args(cmd: &mut Command, src: &Path, trim: Trim) {
 }
 
 /// Video encoder settings from the `video-encoding` skill presets.
+///
+/// AMF's quantizer scale is 0-255, not the 0-51 that H.264-style encoders use. `-qp_i 28`
+/// there was asking for near-lossless AV1, which is why AV1 came out roughly twice the size
+/// of the H.264 fallback on real gameplay (53 MB against 27 MB for the same 27 s clip). 95
+/// is the measured point that matches the H.264 preset's quality at about a third less size;
+/// the numbers and the method are in the skill. NVENC's `-cq` and QSV's `-global_quality`
+/// really are 0-51 scales, so 28 is right there and stays; neither could be measured on this
+/// AMD dev machine, and both stay behind `probe_encoders`.
 fn av1_args(encoder: &str) -> Vec<&'static str> {
     match encoder {
-        "av1_amf" => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "28", "-qp_p", "28"],
+        "av1_amf" => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "95", "-qp_p", "95"],
         "av1_nvenc" => vec!["-cq", "28", "-preset", "p5"],
         "av1_qsv" => vec!["-global_quality", "28"],
         _ => vec!["-preset", "8", "-crf", "34", "-svtav1-params", "tune=0"],
@@ -325,8 +333,9 @@ fn part_path(dst: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// AV1 in MP4 with Opus audio. Hardware encoders use constant quality around QP 28,
-/// software uses `libsvtav1 -preset 8 -crf 34`. Keyframe every two seconds.
+/// AV1 in MP4 with Opus audio. Hardware encoders use constant quality (AMF QP 95 on its
+/// 0-255 scale, NVENC/QSV 28 on their 0-51 scales), software uses `libsvtav1 -preset 8
+/// -crf 34`. Keyframe every two seconds.
 pub fn encode_av1(bins: &Binaries, encoder: &str, src: &Path, dst: &Path, trim: Trim) -> Result<()> {
     encode(
         bins,
