@@ -18,6 +18,11 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+# Already pulled in by tauri-plugin-autostart; used to quote the Run entry it writes.
+winreg = "0.55"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -25,6 +30,13 @@ log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 chrono = "0.4"
+# Win32 calls for the foreground window lookup and the save sound. Same version libobs-window-helper uses.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_Media_Audio",
+] }
 
 # Embedded OBS. libobs-bootstrapper downloads the signed OBS runtime on first launch.
 libobs-wrapper = "9"
@@ -35,5 +47,6 @@ libobs-bootstrapper = "0.4"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind so a libobs panic during startup becomes a retryable error instead of an abort.
+panic = "unwind"
 strip = true

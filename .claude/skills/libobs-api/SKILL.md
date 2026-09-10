@@ -56,6 +56,14 @@ use libobs_simple::output::replay::ObsContextReplayExt; // context.replay_buffer
 - Do not reset the OBS context repeatedly; the wrapper documents a small leak per reset. Restart the process instead.
 - The bootstrapper's `install_dummy_dll` default feature places a placeholder `obs.dll` so the exe links before the real runtime is downloaded. Keep that feature on.
 
+## Signals (hooked / unhooked on game capture)
+
+- `add_to_scene` returns `ObsSceneItemRef<GameCaptureSource>`; `inner_source().source_specific_signals()` (trait `ObsHookableSourceTrait` from `libobs_simple::sources::windows`) gives `Arc<ObsHookableSourceSignals>` with `on_hooked()` / `on_unhooked()`, each a `tokio::sync::broadcast::Receiver` of capacity 16.
+- Payload structs are the names from `impl_signal_manager!` in libobs-simple `src/sources/windows/sources/mod.rs`: `HookedSignal { title, class, executable, source }`, `UnhookedSignal`. `title` is the window title, not a product name.
+- Drain the receivers on a dedicated thread with a current-thread tokio runtime; `RecvError::Closed` ends the loop when the source drops.
+- The signal manager's `Drop` runs `run_with_obs!` and unwraps, so any `Arc<ObsHookableSourceSignals>` you keep must be declared before the `ObsContext` field in your struct so it drops first.
+- `libobs_simple::sources::windows` re-exports only `WindowInfo` and `WindowSearchMode` from libobs-window-helper. For the foreground window's exe and title use the `windows` crate (`GetForegroundWindow`, `GetWindowThreadProcessId`, `OpenProcess` + `QueryFullProcessImageNameW`, `GetWindowTextW`). `GameCaptureSourceBuilder::is_window_in_use_by_other_instance(pid)` checks for another tool's `CaptureHook_Pipe<pid>`.
+
 ## OBS setting keys worth knowing
 
 - Replay buffer output (`replay_buffer`): `directory`, `format`, `extension`, `max_time_sec`, `max_size_mb`, `allow_spaces`.

@@ -6,25 +6,89 @@
     <title>Cos Nostra</title>
     <script type="module" src="/src/main.ts" defer></script>
     <style>
-      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-      body { margin: 0; padding: 24px; }
-      h1 { font-size: 18px; margin: 0 0 16px; }
-      .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #8884; font-size: 14px; }
-      .row span:last-child { font-family: ui-monospace, monospace; }
-      #error { color: #d33; white-space: pre-wrap; font-size: 12px; margin-top: 12px; }
-      button { margin-top: 16px; padding: 8px 14px; }
-      #last { font-size: 12px; margin-top: 12px; opacity: 0.8; }
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; font-size: 14px; }
+      html, body { height: 100%; }
+      body { margin: 0; padding: 12px 16px; box-sizing: border-box; overflow-y: auto; }
+      h1 { font-size: 16px; margin: 0; }
+      header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+      nav button { background: none; border: none; padding: 4px 8px; font: inherit; cursor: pointer; opacity: 0.6; border-bottom: 2px solid transparent; }
+      nav button[aria-selected="true"] { opacity: 1; border-bottom-color: currentColor; }
+      section[hidden] { display: none; }
+      .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid #8884; }
+      .row span:last-child { font-family: ui-monospace, monospace; text-align: right; overflow-wrap: anywhere; }
+      .banner { padding: 6px 8px; border-radius: 4px; font-size: 13px; margin: 8px 0; white-space: pre-wrap; }
+      .banner:empty { display: none; }
+      .warn { background: #e9a00033; border: 1px solid #e9a000; }
+      .err { background: #d3333322; border: 1px solid #d33; }
+      .ok { background: #22aa2222; border: 1px solid #2a2; }
+      .actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+      button { padding: 6px 12px; font: inherit; }
+      #last { font-size: 12px; margin-top: 8px; opacity: 0.8; overflow-wrap: anywhere; }
+      form { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }
+      form label { white-space: nowrap; }
+      form .full { grid-column: 1 / -1; }
+      form input[type="number"], form input[type="text"] { width: 100%; box-sizing: border-box; padding: 4px 6px; font: inherit; }
+      .inline { display: flex; gap: 6px; align-items: center; }
+      .inline input[type="text"] { flex: 1; }
+      .check { display: flex; align-items: center; gap: 6px; }
+      #hotkey_display { font-family: ui-monospace, monospace; min-width: 90px; }
+      .hint { font-size: 12px; opacity: 0.7; }
     </style>
   </head>
   <body>
-    <h1>Cos Nostra clipper</h1>
-    <div class="row"><span>Buffer</span><span id="recording">starting…</span></div>
-    <div class="row"><span>Encoder</span><span id="encoder">–</span></div>
-    <div class="row"><span>Hotkey</span><span id="hotkey">–</span></div>
-    <div class="row"><span>Length</span><span id="seconds">–</span></div>
-    <div class="row"><span>Folder</span><span id="dir">–</span></div>
-    <button id="save">Save clip now</button>
-    <div id="last"></div>
-    <div id="error"></div>
+    <header>
+      <h1>Cos Nostra clipper</h1>
+      <nav role="tablist">
+        <button id="tab-status" role="tab" aria-selected="true">Status</button>
+        <button id="tab-settings" role="tab" aria-selected="false">Settings</button>
+      </nav>
+    </header>
+
+    <section id="panel-status">
+      <div class="row"><span>Buffer</span><span id="recording">starting…</span></div>
+      <div class="row"><span>Capture</span><span id="game">–</span></div>
+      <div class="row"><span>Encoder</span><span id="encoder">–</span></div>
+      <div class="row"><span>Hotkey</span><span id="hotkey">–</span></div>
+      <div class="row"><span>Length</span><span id="seconds">–</span></div>
+      <div class="row"><span>Folder</span><span id="dir">–</span></div>
+      <div id="conflict" class="banner warn"></div>
+      <div id="error" class="banner err"></div>
+      <div class="actions">
+        <button id="save">Save clip now</button>
+        <button id="retry" hidden>Retry</button>
+      </div>
+      <div id="last"></div>
+    </section>
+
+    <section id="panel-settings" hidden>
+      <form id="settings-form">
+        <label for="hotkey_display">Hotkey</label>
+        <div class="inline">
+          <span id="hotkey_display">–</span>
+          <button type="button" id="hotkey_bind">Press keys</button>
+        </div>
+
+        <label for="buffer_seconds">Buffer length</label>
+        <div class="inline"><input type="number" id="buffer_seconds" min="5" max="300" step="1" /><span class="hint">s</span></div>
+
+        <label for="video_bitrate_kbps">Video bitrate</label>
+        <div class="inline"><input type="number" id="video_bitrate_kbps" min="2000" max="60000" step="500" /><span class="hint">kbps</span></div>
+
+        <label for="clip_dir">Clip folder</label>
+        <div class="inline">
+          <input type="text" id="clip_dir" readonly />
+          <button type="button" id="pick_dir">Browse…</button>
+        </div>
+
+        <div class="full check"><input type="checkbox" id="start_with_windows" /><label for="start_with_windows">Start with Windows</label></div>
+        <div class="full check"><input type="checkbox" id="notify_on_save" /><label for="notify_on_save">Show a notification when a clip is saved</label></div>
+        <div class="full check"><input type="checkbox" id="sound_on_save" /><label for="sound_on_save">Play a sound when a clip is saved</label></div>
+
+        <div class="full actions">
+          <button type="submit" id="settings_save">Save settings</button>
+          <span id="settings_msg" class="hint"></span>
+        </div>
+      </form>
+    </section>
   </body>
 </html>

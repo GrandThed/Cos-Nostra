@@ -22,3 +22,48 @@ npm run tauri dev
 ```
 
 Requires Rust (MSVC toolchain), Node, and the Visual Studio C++ build tools.
+
+## Build the installer
+
+```
+cd apps/desktop
+npm run tauri build
+```
+
+This runs `tsc && vite build`, a release Cargo build (LTO, several minutes cold) and NSIS.
+The result is `src-tauri/target/release/bundle/nsis/Cos Nostra_<version>_x64-setup.exe`.
+It is unsigned for now, so SmartScreen will warn on first run. `.github/workflows/desktop-release.yml`
+builds the same installer on `windows-latest` for every `v*` tag and attaches it to a draft
+GitHub release.
+
+What the installer does (`src-tauri/tauri.conf.json`, `src-tauri/installer-hooks.nsh`):
+
+- Installs per user (`installMode: currentUser`) into `%LOCALAPPDATA%\Cos Nostra\`
+  with no elevation. The install directory has to stay writable because the OBS runtime is
+  extracted next to the exe at runtime.
+- Ships `resources\obs-dummy.dll`, the 60 KB placeholder from the `libobs-bootstrapper`
+  crate (same bytes its build script drops into `target/<profile>/obs.dll`), and copies it to
+  `obs.dll` next to the exe when no `obs.dll` exists yet. The exe links `obs.dll` at load time
+  and will not start without it. An upgrade keeps the real `obs.dll` so nothing is re-downloaded.
+- The uninstaller removes everything the runtime wrote next to the exe (`obs-plugins\`, `data\`,
+  `obs_new\`, ffmpeg and libobs DLLs, `rtmp-services\`, `win-capture\` and so on) before
+  Tauri removes its own files. Settings in `%APPDATA%\Cos Nostra` are left alone.
+- WebView2 uses `downloadBootstrapper`: it is already present on Windows 10/11, the installer only
+  downloads it if missing.
+
+Silent install and uninstall for testing:
+
+```
+& ".\src-tauri\target\release\bundle\nsis\Cos Nostra_0.1.0_x64-setup.exe" /S
+& "$env:LOCALAPPDATA\Cos Nostra\uninstall.exe" /S
+```
+
+## First launch
+
+The installed app starts with only the placeholder `obs.dll`. `libobs-bootstrapper` downloads
+the signed OBS runtime (about 150 MB) from the `libobs-rs/libobs-builds` GitHub releases,
+extracts it into `obs_new\` next to the exe, writes `%TEMP%\libobs_updater.ps1` and exits. That
+script waits for the process to end, moves `obs_new\` over the install directory and relaunches
+the app with the same arguments. From the second launch on the runtime is found in place and the
+replay buffer starts immediately. To force a fresh download delete `obs.dll`, `obs-plugins\` and
+`data\` from the install directory.

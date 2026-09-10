@@ -11,5 +11,6 @@ apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/obs/
 clips/
 
-# Written by the OBS rtmp-services plugin at runtime during tauri dev
+# Written by OBS plugins (rtmp-services, win-capture) at runtime during tauri dev
 apps/desktop/src-tauri/rtmp-services/
+apps/desktop/src-tauri/win-capture/

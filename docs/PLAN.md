@@ -60,16 +60,23 @@ What exists:
 - Global hotkey Alt+F10 and a tray menu entry save the buffer.
 - Settings file in `%APPDATA%\Cos Nostra\settings.json`.
 
-Remaining polish, one to two weeks:
+Polish, done 2026-09-10:
 
-- Settings screen: hotkey rebinding with live capture of the key combo, buffer length, bitrate, folder, start with Windows.
-- Show which game is hooked. libobs emits hooked and unhooked signals on the game capture source. Surface them as a status line and a tray tooltip.
-- Overlay-free feedback when a clip saves: a Windows toast and a short sound.
-- Guard against a second capture tool holding the game. Detect with the window helper and explain it instead of recording black.
-- Crash resilience: if libobs fails to start, keep the app alive, show the error and a retry button.
-- NSIS installer through `tauri build`, code signing deferred.
+- Settings tab: hotkey rebinding with live key capture, buffer length, bitrate, folder picker, start with Windows, toast and sound toggles. Saving re-registers the hotkey with rollback and restarts the recorder only when a capture setting changed.
+- Hooked game shown on the Status tab and in the tray tooltip, from the libobs `hooked` and `unhooked` signals.
+- Toast and system sound on save, toast with the error on a failed save.
+- Conflict banner when the foreground game already has another tool's capture hook pipe.
+- libobs failure or panic keeps the app alive with the error and a Retry button. The release profile now unwinds instead of aborting so the retry path works there too.
+- NSIS installer, per user, with the placeholder `obs.dll` shipped as a resource and an uninstall hook that removes the downloaded runtime. Code signing deferred. A tag-triggered GitHub workflow builds the installer but has not run yet.
 
-Acceptance: a friend installs it from the installer, launches a game, presses the hotkey, finds a correct clip in the folder, and the app survives a reboot.
+What changed from the plan and why:
+
+- The installer lands in `%LOCALAPPDATA%\Cos Nostra`, not Program Files, because the OBS bootstrapper extracts the runtime next to the exe and needs a writable directory without elevation.
+- The dummy `obs.dll` is committed under `src-tauri/resources/` rather than pulled from `target/`, because tauri-build fails when a listed resource does not exist yet on a clean clone.
+- "Survives a reboot" was checked through the Run registry entry that the autostart plugin writes, not an actual reboot of the dev machine. The plugin writes the path unquoted, so the app rewrites the entry quoted right after enabling it.
+- Conflict detection looks for the `CaptureHook_Pipe<pid>` that any OBS-style hook creates, including our own, so the check is skipped while we have a game hooked. The positive path was exercised through that false positive; there was no second capture tool to test against.
+
+Acceptance (a friend installs it from the installer, launches a game, presses the hotkey, finds a correct clip in the folder, and the app survives a reboot) was run on the dev machine with ffplay fullscreen standing in for the game.
 
 ### Phase 2. Desktop post-processing. Two to three weeks.
 

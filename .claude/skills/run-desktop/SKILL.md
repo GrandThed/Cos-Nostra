@@ -38,6 +38,53 @@ ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,heig
 
 Expect h264 video at the monitor's resolution, 60 fps, aac audio, duration close to the buffer length. Clips go to `%USERPROFILE%\Videos\Cos Nostra` unless settings say otherwise.
 
+## Test the game hook without a game
+
+Any fullscreen Direct3D window gets hooked. ffplay from the ffmpeg install works:
+
+```powershell
+ffplay -fs -autoexit -loglevel quiet "<any video file>"
+```
+
+Expect `game capture hooked ffplay.exe (...)` in the log, the Status tab switching to
+"Recording: ...", and `game capture unhooked` when ffplay closes.
+
+## Look at the UI and drive it
+
+The window cannot be brought to the front while VS Code has focus (Windows blocks focus stealing),
+so capture it with `PrintWindow` instead of a screen grab:
+
+```powershell
+$sig = '[DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+public struct RECT { public int Left, Top, Right, Bottom; }'
+Add-Type -MemberDefinition $sig -Name W -Namespace N; Add-Type -AssemblyName System.Drawing
+$p = Get-Process cos-nostra-desktop | ? { $_.MainWindowHandle -ne 0 } | select -First 1
+$r = New-Object N.W+RECT; [N.W]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+$bmp = New-Object System.Drawing.Bitmap ($r.Right-$r.Left), ($r.Bottom-$r.Top)
+$g = [System.Drawing.Graphics]::FromImage($bmp); $dc = $g.GetHdc()
+[N.W]::PrintWindow($p.MainWindowHandle, $dc, 2) | Out-Null; $g.ReleaseHdc($dc); $bmp.Save("shot.png")
+```
+
+Clicks: `SetCursorPos` to window-relative coordinates from the screenshot, then `mouse_event(2)` and
+`mouse_event(4)`. Keyboard: `WScript.Shell.SendKeys`. Injected keys arrive in the webview with an
+empty `KeyboardEvent.code`; the hotkey capture falls back to `key`, so `SendKeys("%{F9}")` binds
+Alt+F9 correctly.
+
+## Test the installer
+
+Stop the dev app first (same single-instance id). Then:
+
+```powershell
+& "src-tauri\target\release\bundle\nsis\Cos Nostra_0.1.0_x64-setup.exe" /S
+$env:RUST_LOG="info"; & "$env:LOCALAPPDATA\Cos Nostra\cos-nostra-desktop.exe"
+```
+
+The release exe has no console, so its log is not visible; check behaviour through the UI and
+`%USERPROFILE%\Videos\Cos Nostra`. First launch downloads the runtime into `obs_new\`, exits, and
+`%TEMP%\libobs_updater.ps1` swaps the files and relaunches. `Get-Process cos-nostra-desktop`
+disappears for a few seconds during the swap; wait for it to come back.
+
 ## Stop
 
 ```
@@ -57,3 +104,6 @@ Then stop the background tauri dev task. Avoid `taskkill /IM node.exe` unless no
 - Black clip: another app holds the game capture hook, or the game runs with an anti-cheat that blocks it. The monitor layer should still show the desktop; if the clip is fully black the graphics adapter index may be wrong on a multi-GPU machine.
 - Hotkey does nothing: another program registered Alt+F10 first. Change `hotkey` in settings.
 - `recorder is not running` from the UI: the recorder thread has not finished starting, or it failed; check the log.
+- `LNK1123` at the end of the build: stale `resource.lib` from a concurrent build. Delete `src-tauri/target/debug/build/cos-nostra-desktop-*/` and run again.
+- Vite exits with `npm error code 4294967295` and the app shows a blank window: port 1420 was still held by a previous Vite. `Get-NetTCPConnection -LocalPort 1420` finds the owner.
+- Buffer shows `failed` with a red banner and a Retry button: libobs or the clip folder failed. Fix the cause (usually the folder in Settings) and press Retry; the app stays alive.

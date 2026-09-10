@@ -26,12 +26,31 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "Cos Nostra",
+    "copyright": "Copyright (C) Cos Nostra contributors. Licensed under the GNU GPL-3.0.",
+    "shortDescription": "Game clipper for the Cos Nostra Discord",
+    "longDescription": "Records the last minutes of gameplay with an embedded OBS replay buffer, saves clips on a hotkey and shares them with the Cos Nostra Discord community. The OBS runtime is downloaded on first launch.",
+    "licenseFile": "../../../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "resources/obs-dummy.dll": "resources/obs-dummy.dll"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }
