@@ -1,3 +1,4 @@
+mod api;
 mod capture;
 mod settings;
 mod ffmpeg;
@@ -7,7 +8,7 @@ mod win;
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,11 +23,18 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutSt
 use tauri_plugin_notification::NotificationExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
+use api::{Api, DevicePoll, NewClipUpload};
 use capture::{CaptureConflict, HookCallback, HookedGame, Recorder};
 use ffmpeg::{Binaries, Encoders, Trim};
 use games::DetectedGame;
-use queue::{ClipRow, Gate, NewClip, OnChange, Outputs, Processor, Queue, Worker};
-use settings::Settings;
+use queue::{
+    ClipRow, Gate, NewClip, OnChange, Outputs, Processor, Queue, UploadResult, Uploader, Worker,
+};
+use settings::{Account, Settings};
+
+/// How long the device login keeps polling before giving up.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LOGIN_POLL: Duration = Duration::from_secs(2);
 
 struct AppState {
     settings: Mutex<Settings>,
@@ -45,6 +53,14 @@ struct AppState {
     /// Clip queue; `None` until the database opened (or forever if it could not).
     queue: Mutex<Option<Arc<Queue>>>,
     worker: Mutex<Option<Worker>>,
+    /// The device login in progress, if any. Replaced by `start_login`, cleared on finish.
+    login: Mutex<Option<LoginSession>>,
+}
+
+/// A running device login: the poll thread stops when `cancelled` is set.
+struct LoginSession {
+    code: String,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -57,6 +73,22 @@ impl AppState {
             w.wake();
         }
     }
+
+    /// A client for the current backend URL and token. Built per call since both can change.
+    fn api(&self) -> anyhow::Result<Api> {
+        let s = self.settings.lock().unwrap();
+        Api::new(&s.backend_url, s.device_token.clone())
+    }
+
+    fn account(&self) -> Option<Account> {
+        self.settings.lock().unwrap().account.clone()
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct LoginStarted {
+    code: String,
+    verify_url: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -72,6 +104,8 @@ struct Status {
     conflict: Option<CaptureConflict>,
     encoders: Option<Encoders>,
     ffmpeg_error: Option<String>,
+    account: Option<Account>,
+    auto_upload: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -122,6 +156,8 @@ fn get_status(state: State<AppState>) -> Status {
         conflict,
         encoders: settings.encoders.clone(),
         ffmpeg_error: state.ffmpeg_error.lock().unwrap().clone(),
+        account: settings.account.clone(),
+        auto_upload: settings.auto_upload,
     }
 }
 
@@ -158,6 +194,183 @@ async fn pick_clip_dir(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 fn retry_recorder(app: AppHandle) {
     restart_recorder(&app);
+}
+
+// ---------------------------------------------------------------------------
+// Account commands
+
+/// Starts a Discord device login: asks the backend for a code, opens the browser and polls on
+/// a background thread until the token arrives, the user cancels, or ten minutes pass.
+#[tauri::command]
+async fn start_login(app: AppHandle) -> Result<LoginStarted, String> {
+    // The blocking HTTP client must not be created or dropped on a tokio worker thread.
+    tauri::async_runtime::spawn_blocking(move || start_login_inner(&app))
+        .await
+        .map_err(|e| format!("login task failed: {e}"))?
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn cancel_login(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(session) = state.login.lock().unwrap().take() {
+        session.cancelled.store(true, Ordering::SeqCst);
+        log::info!("device login {} cancelled", session.code);
+    }
+    let _ = app.emit("login-changed", ());
+}
+
+/// Forgets the token and account. The backend is told on a best-effort basis.
+#[tauri::command]
+async fn logout(app: AppHandle) -> Result<(), String> {
+    // Same rule as start_login: blocking reqwest only on a plain thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        match state.api() {
+            Ok(api) => {
+                if let Err(e) = api.delete_device() {
+                    log::warn!("revoking device token: {e:#}");
+                }
+            }
+            Err(e) => log::warn!("{e:#}"),
+        }
+        store_account(&app, None, None)
+    })
+    .await
+    .map_err(|e| format!("logout task failed: {e}"))?
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn get_account(state: State<AppState>) -> Option<Account> {
+    state.account()
+}
+
+fn start_login_inner(app: &AppHandle) -> anyhow::Result<LoginStarted> {
+    let state = app.state::<AppState>();
+    // Any earlier attempt is superseded.
+    if let Some(old) = state.login.lock().unwrap().take() {
+        old.cancelled.store(true, Ordering::SeqCst);
+    }
+    let api = state.api()?;
+    let device_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into());
+    let start = api
+        .start_device_login(&device_name)
+        .context("starting device login")?;
+    log::info!("device login {} started, opening {}", start.code, start.verify_url);
+    if let Err(e) = app.opener().open_url(&start.verify_url, None::<&str>) {
+        log::warn!("opening browser: {e}");
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    *state.login.lock().unwrap() = Some(LoginSession {
+        code: start.code.clone(),
+        cancelled: Arc::clone(&cancelled),
+    });
+    let poll_app = app.clone();
+    let code = start.code.clone();
+    std::thread::spawn(move || poll_login(&poll_app, api, &code, cancelled));
+    let _ = app.emit("login-changed", ());
+    Ok(LoginStarted {
+        code: start.code,
+        verify_url: start.verify_url,
+    })
+}
+
+/// Polls the device code until it is ready. Runs on its own thread.
+fn poll_login(app: &AppHandle, api: Api, code: &str, cancelled: Arc<AtomicBool>) {
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    let outcome: Result<(String, Account), String> = loop {
+        std::thread::sleep(LOGIN_POLL);
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        if Instant::now() > deadline {
+            break Err("login timed out; try again".into());
+        }
+        match api.poll_device_login(code) {
+            Ok(Some(DevicePoll::Pending)) => {}
+            Ok(Some(DevicePoll::Ready { token, user })) => break Ok((token, user.into())),
+            Ok(None) => break Err("login code expired; try again".into()),
+            Err(e) => {
+                // Transient network trouble: keep polling until the deadline.
+                log::warn!("polling device login: {e:#}");
+            }
+        }
+    };
+    if cancelled.load(Ordering::SeqCst) {
+        return;
+    }
+    let state = app.state::<AppState>();
+    {
+        let mut login = state.login.lock().unwrap();
+        if login.as_ref().is_some_and(|s| s.code == code) {
+            *login = None;
+        }
+    }
+    match outcome {
+        Ok((token, account)) => {
+            log::info!("logged in as {}", account.username);
+            if let Err(e) = store_account(app, Some(token), Some(account)) {
+                log::error!("saving login: {e:#}");
+                let _ = app.emit("login-failed", format!("{e:#}"));
+            }
+        }
+        Err(msg) => {
+            log::warn!("device login failed: {msg}");
+            let _ = app.emit("login-failed", msg);
+        }
+    }
+    let _ = app.emit("login-changed", ());
+}
+
+/// Persists a token and account (or clears both), tells the UI and wakes the worker so
+/// pending `encoded` rows get uploaded.
+fn store_account(app: &AppHandle, token: Option<String>, account: Option<Account>) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.device_token = token;
+        s.account = account;
+        s.save().context("saving settings")?;
+    }
+    let _ = app.emit("account-changed", state.account());
+    let _ = app.emit("status-changed", ());
+    state.wake_worker();
+    Ok(())
+}
+
+/// Checks a stored token against the backend at startup. A 401 clears it; anything else
+/// (offline, backend down) keeps it and refreshes the account on success.
+fn verify_token(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let api = match state.api() {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!("{e:#}");
+            return;
+        }
+    };
+    match api.me() {
+        Ok(me) => {
+            let account: Account = me.user.into();
+            let changed = state.account().as_ref() != Some(&account);
+            if changed {
+                let token = state.settings.lock().unwrap().device_token.clone();
+                if let Err(e) = store_account(app, token, Some(account)) {
+                    log::warn!("{e:#}");
+                }
+            }
+            log::info!("device token verified");
+        }
+        Err(e) if api::status_of(&e) == Some(401) => {
+            log::warn!("device token rejected, logging out: {e:#}");
+            if let Err(e) = store_account(app, None, None) {
+                log::warn!("{e:#}");
+            }
+        }
+        Err(e) => log::warn!("could not verify device token: {e:#}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +616,67 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     })
 }
 
+/// The worker's upload job for one encoded clip: create the record, PUT the three files,
+/// complete. Any failure is retried by the queue with backoff.
+fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
+    let state = app.state::<AppState>();
+    let api = state.api()?;
+    let av1 = row.av1_path.as_deref().context("clip has no AV1 output")?;
+    let h264 = row.h264_path.as_deref().context("clip has no H.264 output")?;
+    let thumb = row.thumb_path.as_deref().context("clip has no thumbnail")?;
+
+    let t = Instant::now();
+    let created = api
+        .create_clip(&NewClipUpload {
+            game: row.game.clone(),
+            title: row.title.clone(),
+            duration_ms: row.duration_ms,
+            width: row.width,
+            height: row.height,
+            recorded_at: row.recorded_at.clone(),
+            size_av1: row.size_av1.unwrap_or(0),
+            size_h264: row.size_h264.unwrap_or(0),
+        })
+        .map_err(|e| match api::status_of(&e) {
+            Some(503) => e.context("the backend has no storage configured yet"),
+            _ => e,
+        })
+        .context("creating clip record")?;
+    log::info!("clip {}: remote id {}", row.id, created.id);
+
+    for (url, path, content_type) in [
+        (&created.uploads.av1, av1, "video/mp4"),
+        (&created.uploads.h264, h264, "video/mp4"),
+        (&created.uploads.thumb, thumb, "image/jpeg"),
+    ] {
+        api.put_file(url, Path::new(path), content_type)
+            .with_context(|| format!("uploading {path}"))?;
+    }
+
+    let done = api
+        .complete_clip(&created.id)
+        .context("completing upload")?;
+    log::info!(
+        "clip {}: uploaded in {:.1?}, {}",
+        row.id,
+        t.elapsed(),
+        done.urls.page
+    );
+    if state.settings.lock().unwrap().notify_on_save {
+        show_toast(app, "Clip uploaded", &done.urls.page);
+    }
+    Ok(UploadResult {
+        remote_id: done.id,
+        page_url: done.urls.page,
+    })
+}
+
+/// True when the worker may upload: logged in and auto-upload on.
+fn upload_allowed(app: &AppHandle) -> bool {
+    let s = app.state::<AppState>().settings.lock().unwrap().clone();
+    s.logged_in() && s.auto_upload
+}
+
 /// True when the worker may encode: the user opted in, or nothing game-like is running.
 fn encode_allowed(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
@@ -477,8 +751,19 @@ fn start_pipeline(app: &AppHandle) {
     let gate: Gate = Arc::new(move || encode_allowed(&gate_app));
     let change_app = app.clone();
     let on_change: OnChange = Arc::new(move |id| emit_clips_changed(&change_app, Some(id)));
+    let upload_app = app.clone();
+    let uploader: Uploader = Arc::new(move |row| upload_clip(&upload_app, row));
+    let upload_gate_app = app.clone();
+    let upload_gate: Gate = Arc::new(move || upload_allowed(&upload_gate_app));
 
-    let worker = queue::start_worker(queue.clone(), processor, gate, on_change);
+    let worker = queue::start_worker(
+        queue.clone(),
+        processor,
+        gate,
+        on_change,
+        Some(uploader),
+        upload_gate,
+    );
     *state.queue.lock().unwrap() = Some(queue);
     *state.worker.lock().unwrap() = Some(worker);
     log::info!("clip queue ready at {}", db.display());
@@ -796,9 +1081,18 @@ fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()>
         *state.hotkey_error.lock().unwrap() = None;
     }
 
+    // The UI never edits the login; keep whatever the account flow stored meanwhile.
+    {
+        let live = state.settings.lock().unwrap();
+        new.device_token = live.device_token.clone();
+        new.account = live.account.clone();
+    }
     // Persist before touching the recorder so a libobs failure does not lose the change.
     new.save().context("saving settings")?;
     *state.settings.lock().unwrap() = new.clone();
+    if new.auto_upload && !old.auto_upload {
+        state.wake_worker();
+    }
 
     let mut deferred_error: Option<anyhow::Error> = None;
     if new.start_with_windows != old.start_with_windows {
@@ -935,6 +1229,7 @@ pub fn run() {
             ffmpeg_error: Mutex::new(None),
             queue: Mutex::new(None),
             worker: Mutex::new(None),
+            login: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -950,7 +1245,11 @@ pub fn run() {
             open_clip_folder,
             get_thumbnail,
             get_encoders,
-            reprobe_encoders
+            reprobe_encoders,
+            start_login,
+            cancel_login,
+            logout,
+            get_account
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -969,6 +1268,11 @@ pub fn run() {
             // libobs startup takes a moment; keep the window responsive.
             let recorder_handle = handle.clone();
             std::thread::spawn(move || start_recorder(&recorder_handle));
+            // A stored device token is checked against the backend off the main thread.
+            if settings.logged_in() {
+                let verify_handle = handle.clone();
+                std::thread::spawn(move || verify_token(&verify_handle));
+            }
             // ffmpeg lookup, encoder probe and queue open. Independent of libobs, so it
             // runs on its own thread rather than waiting for the recorder.
             std::thread::spawn(move || start_pipeline(&handle));

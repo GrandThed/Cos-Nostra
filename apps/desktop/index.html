@@ -52,6 +52,11 @@
       .badge.uploading { border-color: #38f; background: #3388ff22; }
       .badge.failed { border-color: #d33; background: #d3333322; cursor: help; }
       #clips_empty { opacity: 0.6; padding: 12px 0; }
+      .clip .link { font-family: ui-monospace, monospace; font-size: 11px; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* Account block in Settings. */
+      fieldset { grid-column: 1 / -1; border: 1px solid #8884; border-radius: 4px; padding: 8px 10px; margin: 4px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }
+      legend { font-size: 12px; opacity: 0.7; padding: 0 4px; }
+      #login_code { font-family: ui-monospace, monospace; font-size: 18px; letter-spacing: 2px; }
     </style>
   </head>
   <body>
@@ -72,6 +77,7 @@
       <div class="row"><span>Hotkey</span><span id="hotkey">–</span></div>
       <div class="row"><span>Length</span><span id="seconds">–</span></div>
       <div class="row"><span>Folder</span><span id="dir">–</span></div>
+      <div class="row"><span>Account</span><span id="account">–</span></div>
       <div id="conflict" class="banner warn"></div>
       <div id="error" class="banner err"></div>
       <div class="actions">
@@ -111,6 +117,34 @@
         <div class="full check"><input type="checkbox" id="notify_on_save" /><label for="notify_on_save">Show a notification when a clip is saved</label></div>
         <div class="full check"><input type="checkbox" id="sound_on_save" /><label for="sound_on_save">Play a sound when a clip is saved</label></div>
         <div class="full check"><input type="checkbox" id="encode_while_gaming" /><label for="encode_while_gaming">Encode while a game is running</label></div>
+
+        <fieldset>
+          <legend>Account</legend>
+          <div class="full" id="account_logged_out">
+            <div class="inline">
+              <button type="button" id="login">Link Discord</button>
+              <span class="hint">Opens your browser to log in with Discord.</span>
+            </div>
+          </div>
+          <div class="full" id="account_pending" hidden>
+            <div class="inline">
+              <span id="login_code">–</span>
+              <span class="hint">waiting for the browser…</span>
+              <button type="button" id="login_cancel">Cancel</button>
+            </div>
+          </div>
+          <div class="full" id="account_logged_in" hidden>
+            <div class="inline">
+              <span id="account_name">–</span>
+              <button type="button" id="logout">Log out</button>
+            </div>
+          </div>
+          <div class="full hint" id="login_msg"></div>
+
+          <label for="backend_url">Backend URL</label>
+          <input type="text" id="backend_url" spellcheck="false" />
+          <div class="full check"><input type="checkbox" id="auto_upload" /><label for="auto_upload">Upload clips automatically</label></div>
+        </fieldset>
 
         <div class="full actions">
           <button type="submit" id="settings_save">Save settings</button>

@@ -1,8 +1,9 @@
 //! Clip job queue on SQLite under %APPDATA%\Cos Nostra\clips.db, plus the worker thread that
-//! drains it. States: saved -> encoding -> encoded (-> uploading -> done in phase 3), or failed.
-//! Failed jobs retry with exponential backoff up to `MAX_ATTEMPTS`, after which they wait for
-//! a manual retry. The queue survives restarts: an `encoding` row found at open time is put
-//! back to `saved`.
+//! drains it. States: saved -> encoding -> encoded -> uploading -> done, or failed. The `stage`
+//! column says which step failed so a retry resumes at encode or upload. Failed jobs retry with
+//! exponential backoff up to `MAX_ATTEMPTS`, after which they wait for a manual retry. The queue
+//! survives restarts: an `encoding` row found at open time is put back to `saved`, an
+//! `uploading` one back to `encoded`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -17,7 +18,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_ATTEMPTS: i32 = 5;
 
 /// Current schema, stored in `PRAGMA user_version` so later phases can migrate.
-const SCHEMA_VERSION: i32 = 1;
+/// 1: initial. 2: `stage`, `remote_id`, `page_url` for uploads.
+const SCHEMA_VERSION: i32 = 2;
 
 /// How often the worker polls when nobody calls `wake`.
 #[cfg(not(test))]
@@ -74,6 +76,31 @@ impl ClipStatus {
     }
 }
 
+/// Which step a row is in (or failed at).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Encode,
+    Upload,
+}
+
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::Encode => "encode",
+            Stage::Upload => "upload",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "encode" => Stage::Encode,
+            "upload" => Stage::Upload,
+            _ => return None,
+        })
+    }
+}
+
 /// What the app knows about a clip right after the replay buffer wrote it.
 #[derive(Debug, Clone)]
 pub struct NewClip {
@@ -108,6 +135,11 @@ pub struct ClipRow {
     pub status: ClipStatus,
     pub error: Option<String>,
     pub attempts: i32,
+    pub stage: Stage,
+    /// Backend clip id once uploaded.
+    pub remote_id: Option<String>,
+    /// Public player page once uploaded.
+    pub page_url: Option<String>,
 }
 
 /// Files the processor produced for a clip.
@@ -120,8 +152,17 @@ pub struct Outputs {
     pub size_h264: i64,
 }
 
+/// What the uploader hands back for a finished upload.
+#[derive(Debug, Clone)]
+pub struct UploadResult {
+    pub remote_id: String,
+    pub page_url: String,
+}
+
 /// Does the encoding work for one clip. Runs on the worker thread.
 pub type Processor = Arc<dyn Fn(&ClipRow) -> Result<Outputs> + Send + Sync>;
+/// Uploads one encoded clip. Runs on the worker thread.
+pub type Uploader = Arc<dyn Fn(&ClipRow) -> Result<UploadResult> + Send + Sync>;
 /// Returns true when the worker may encode right now (for example no game in the foreground).
 pub type Gate = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Called with the clip id after every status change so the UI can refresh.
@@ -148,14 +189,25 @@ CREATE TABLE IF NOT EXISTS clips (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT 'encode',
+    remote_id TEXT,
+    page_url TEXT
 );
 CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 ";
 
+/// Columns added in schema version 2, applied with ALTER TABLE to version-1 databases.
+const V2_COLUMNS: [(&str, &str); 3] = [
+    ("stage", "TEXT NOT NULL DEFAULT 'encode'"),
+    ("remote_id", "TEXT"),
+    ("page_url", "TEXT"),
+];
+
 /// Column list shared by every SELECT so `row_from` stays in sync.
 const COLUMNS: &str = "id, source_path, game, title, recorded_at, duration_ms, width, height, \
-    size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts";
+    size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts, \
+    stage, remote_id, page_url";
 
 pub struct Queue {
     conn: Mutex<Connection>,
@@ -184,7 +236,10 @@ impl Queue {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .context("reading schema version")?;
         if version < SCHEMA_VERSION {
-            // Nothing to migrate yet; future versions add ALTERs here keyed on `version`.
+            if version >= 1 {
+                // A version-1 table already exists; the CREATE above did not add the new columns.
+                migrate_to_v2(&conn)?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("writing schema version")?;
         }
@@ -197,6 +252,15 @@ impl Queue {
             .context("resetting interrupted encodes")?;
         if reset > 0 {
             log::warn!("reset {reset} interrupted encoding job(s) to saved");
+        }
+        let reset = conn
+            .execute(
+                "UPDATE clips SET status = 'encoded', updated_at = ?1 WHERE status = 'uploading'",
+                params![now_rfc3339()],
+            )
+            .context("resetting interrupted uploads")?;
+        if reset > 0 {
+            log::warn!("reset {reset} interrupted upload job(s) to encoded");
         }
 
         Ok(Queue {
@@ -274,19 +338,22 @@ impl Queue {
         Ok(())
     }
 
-    /// Puts a `failed` clip back to `saved` with attempts reset.
+    /// Puts a `failed` clip back to the start of the stage it failed in (`saved` for encode,
+    /// `encoded` for upload) with attempts reset.
     pub fn retry(&self, id: i64) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE clips SET status = 'saved', attempts = 0, error = NULL, \
-             next_attempt_at = NULL, updated_at = ?2 WHERE id = ?1 AND status = 'failed'",
+            "UPDATE clips SET \
+             status = CASE WHEN stage = 'upload' THEN 'encoded' ELSE 'saved' END, \
+             attempts = 0, error = NULL, next_attempt_at = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status = 'failed'",
             params![id, now_rfc3339()],
         )
         .with_context(|| format!("retrying clip {id}"))?;
         Ok(())
     }
 
-    /// Atomically picks the oldest runnable job and marks it `encoding`.
+    /// Atomically picks the oldest runnable encode job and marks it `encoding`.
     fn claim_next(&self) -> Result<Option<ClipRow>> {
         let now = now_rfc3339();
         let mut conn = self.lock();
@@ -296,7 +363,7 @@ impl Queue {
                 &format!(
                     "SELECT {COLUMNS} FROM clips WHERE \
                      (status = 'saved' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)) \
-                     OR (status = 'failed' AND attempts < ?2 \
+                     OR (status = 'failed' AND stage = 'encode' AND attempts < ?2 \
                          AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) \
                      ORDER BY id ASC LIMIT 1"
                 ),
@@ -309,14 +376,61 @@ impl Queue {
             return Ok(None);
         };
         tx.execute(
-            "UPDATE clips SET status = 'encoding', next_attempt_at = NULL, updated_at = ?2 \
-             WHERE id = ?1",
+            "UPDATE clips SET status = 'encoding', stage = 'encode', next_attempt_at = NULL, \
+             updated_at = ?2 WHERE id = ?1",
             params![row.id, now],
         )
         .with_context(|| format!("marking clip {} encoding", row.id))?;
         tx.commit().context("committing claim")?;
         row.status = ClipStatus::Encoding;
+        row.stage = Stage::Encode;
         Ok(Some(row))
+    }
+
+    /// The oldest `encoded` row, or an upload failure whose retry time has passed. Does not
+    /// claim it; call `mark_uploading` next.
+    pub fn next_uploadable(&self) -> Result<Option<ClipRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM clips WHERE status = 'encoded' \
+                 OR (status = 'failed' AND stage = 'upload' AND attempts < ?2 \
+                     AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) \
+                 ORDER BY id ASC LIMIT 1"
+            ),
+            params![now_rfc3339(), MAX_ATTEMPTS],
+            row_from,
+        )
+        .optional()
+        .context("selecting next upload")
+    }
+
+    /// Marks a row `uploading`. Attempts restart at zero when the row comes fresh from encode.
+    pub fn mark_uploading(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET status = 'uploading', \
+             attempts = CASE WHEN stage = 'encode' THEN 0 ELSE attempts END, \
+             stage = 'upload', next_attempt_at = NULL, updated_at = ?2 WHERE id = ?1",
+            params![id, now_rfc3339()],
+        )
+        .with_context(|| format!("marking clip {id} uploading"))?;
+        Ok(())
+    }
+
+    pub fn mark_done(&self, id: i64, remote_id: &str, page_url: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET status = 'done', stage = 'upload', error = NULL, \
+             next_attempt_at = NULL, remote_id = ?2, page_url = ?3, updated_at = ?4 WHERE id = ?1",
+            params![id, remote_id, page_url, now_rfc3339()],
+        )
+        .with_context(|| format!("marking clip {id} done"))?;
+        Ok(())
+    }
+
+    pub fn mark_upload_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.mark_failed_in(id, Stage::Upload, error)
     }
 
     fn mark_encoded(&self, id: i64, out: &Outputs) -> Result<()> {
@@ -339,8 +453,12 @@ impl Queue {
         Ok(())
     }
 
-    /// Records a failure, bumps attempts and schedules the next try (or none at the cap).
+    /// Records an encode failure, bumps attempts and schedules the next try (or none at the cap).
     fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.mark_failed_in(id, Stage::Encode, error)
+    }
+
+    fn mark_failed_in(&self, id: i64, stage: Stage, error: &str) -> Result<()> {
         let error: String = error.chars().take(MAX_ERROR_CHARS).collect();
         let now = Utc::now();
         let mut conn = self.lock();
@@ -360,8 +478,8 @@ impl Queue {
         };
         tx.execute(
             "UPDATE clips SET status = 'failed', error = ?2, attempts = ?3, \
-             next_attempt_at = ?4, updated_at = ?5 WHERE id = ?1",
-            params![id, error, attempts, next_attempt_at, format_rfc3339(now)],
+             next_attempt_at = ?4, updated_at = ?5, stage = ?6 WHERE id = ?1",
+            params![id, error, attempts, next_attempt_at, format_rfc3339(now), stage.as_str()],
         )
         .with_context(|| format!("marking clip {id} failed"))?;
         tx.commit().context("committing failure")?;
@@ -377,6 +495,27 @@ impl Queue {
             |r| r.get(0),
         )?)
     }
+}
+
+/// Adds the version-2 columns that are missing. Idempotent, so a half-applied migration
+/// (crash between ALTERs) finishes on the next open.
+fn migrate_to_v2(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(clips)")
+        .context("reading clips columns")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("listing clips columns")?
+        .collect::<rusqlite::Result<_>>()
+        .context("reading clips columns")?;
+    for (name, decl) in V2_COLUMNS {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE clips ADD COLUMN {name} {decl}"), [])
+                .with_context(|| format!("adding column {name}"))?;
+            log::info!("clip queue: added column {name}");
+        }
+    }
+    Ok(())
 }
 
 fn get_in(conn: &Connection, id: i64) -> Result<Option<ClipRow>> {
@@ -398,6 +537,7 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
             format!("unknown clip status {status_text:?}").into(),
         )
     })?;
+    let stage_text: String = r.get(17)?;
     Ok(ClipRow {
         id: r.get(0)?,
         source_path: r.get(1)?,
@@ -416,6 +556,15 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         status,
         error: r.get(15)?,
         attempts: r.get(16)?,
+        stage: Stage::parse(&stage_text).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                17,
+                rusqlite::types::Type::Text,
+                format!("unknown clip stage {stage_text:?}").into(),
+            )
+        })?,
+        remote_id: r.get(18)?,
+        page_url: r.get(19)?,
     })
 }
 
@@ -471,15 +620,18 @@ impl Worker {
     }
 }
 
-/// Starts the worker thread. It polls every few seconds and whenever woken, picks the oldest
-/// `saved` row whose retry time has passed, marks it `encoding`, runs `processor`, then marks
-/// `encoded` or `failed` (with backoff). `gate` is checked before each job and the job is
-/// skipped while it returns false.
+/// Starts the worker thread. It polls every few seconds and whenever woken. Encode jobs first:
+/// the oldest `saved` row whose retry time has passed is marked `encoding`, run through
+/// `processor`, then marked `encoded` or `failed` (with backoff). Then upload jobs, when an
+/// `uploader` is given and `upload_gate` is open (logged in, auto-upload on): `encoded` rows go
+/// `uploading` -> `done` or `failed`. Each gate is checked before every job.
 pub fn start_worker(
     queue: Arc<Queue>,
     processor: Processor,
     gate: Gate,
     on_change: OnChange,
+    uploader: Option<Uploader>,
+    upload_gate: Gate,
 ) -> Worker {
     let inner = Arc::new(WorkerInner {
         woken: Mutex::new(false),
@@ -488,7 +640,9 @@ pub fn start_worker(
     let thread_inner = Arc::clone(&inner);
     let spawned = std::thread::Builder::new()
         .name("clip-worker".into())
-        .spawn(move || worker_loop(thread_inner, queue, processor, gate, on_change));
+        .spawn(move || {
+            worker_loop(thread_inner, queue, processor, gate, on_change, uploader, upload_gate)
+        });
     if let Err(e) = spawned {
         log::error!("failed to start clip worker thread: {e}");
     }
@@ -501,6 +655,8 @@ fn worker_loop(
     processor: Processor,
     gate: Gate,
     on_change: OnChange,
+    uploader: Option<Uploader>,
+    upload_gate: Gate,
 ) {
     log::info!("clip worker started");
     loop {
@@ -516,7 +672,54 @@ fn worker_loop(
                 }
             }
         }
+        let Some(uploader) = uploader.as_ref() else {
+            continue;
+        };
+        while upload_gate() {
+            match queue.next_uploadable() {
+                Ok(Some(row)) => run_upload(&queue, &row, uploader, &on_change),
+                Ok(None) => break,
+                Err(e) => {
+                    log::error!("clip worker could not select an upload: {e:#}");
+                    break;
+                }
+            }
+        }
     }
+}
+
+fn run_upload(queue: &Queue, row: &ClipRow, uploader: &Uploader, on_change: &OnChange) {
+    let id = row.id;
+    if let Err(e) = queue.mark_uploading(id) {
+        log::error!("clip worker could not mark clip {id} uploading: {e:#}");
+        return;
+    }
+    on_change(id);
+    log::info!("uploading clip {id} ({})", row.source_path);
+    let mut row = row.clone();
+    row.status = ClipStatus::Uploading;
+    row.stage = Stage::Upload;
+
+    let outcome = match catch_unwind(AssertUnwindSafe(|| uploader(&row))) {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow!("uploader panicked: {}", panic_message(&payload))),
+    };
+
+    let written = match outcome {
+        Ok(done) => {
+            log::info!("clip {id} uploaded: {}", done.page_url);
+            queue.mark_done(id, &done.remote_id, &done.page_url)
+        }
+        Err(e) => {
+            let text = format!("{e:#}");
+            log::error!("clip {id} upload failed: {text}");
+            queue.mark_upload_failed(id, &text)
+        }
+    };
+    if let Err(e) = written {
+        log::error!("clip worker could not update clip {id}: {e:#}");
+    }
+    on_change(id);
 }
 
 fn run_job(queue: &Queue, row: &ClipRow, processor: &Processor, on_change: &OnChange) {
@@ -695,7 +898,7 @@ mod tests {
                 changes.fetch_add(1, Ordering::SeqCst);
             })
         };
-        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), on_change);
+        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), on_change, None, Arc::new(|| false));
 
         let id = q.enqueue(clip("w", "2026-09-10T10:00:00.000Z")).unwrap();
         worker.wake();
@@ -728,7 +931,7 @@ mod tests {
                 Ok(outputs())
             })
         };
-        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change());
+        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change(), None, Arc::new(|| false));
         let id = q.enqueue(clip("p", "2026-09-10T10:00:00.000Z")).unwrap();
         worker.wake();
         let failed = wait_until(&q, id, |r| r.status == ClipStatus::Failed);
@@ -747,7 +950,7 @@ mod tests {
                 Ok(outputs())
             })
         };
-        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| false), noop_change());
+        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| false), noop_change(), None, Arc::new(|| false));
         let id = q.enqueue(clip("g", "2026-09-10T10:00:00.000Z")).unwrap();
         worker.wake();
         std::thread::sleep(POLL_INTERVAL * 6);
@@ -766,7 +969,7 @@ mod tests {
                 anyhow::bail!("always")
             })
         };
-        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change());
+        let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change(), None, Arc::new(|| false));
         let id = q.enqueue(clip("m", "2026-09-10T10:00:00.000Z")).unwrap();
         worker.wake();
 
@@ -804,6 +1007,220 @@ mod tests {
         let row = q.get(id).unwrap().unwrap();
         assert_eq!(row.status, ClipStatus::Encoded);
         assert_eq!(row.attempts, 3);
+    }
+
+    fn ok_processor() -> Processor {
+        Arc::new(|_row| Ok(outputs()))
+    }
+
+    fn upload_result() -> UploadResult {
+        UploadResult {
+            remote_id: "abc123".into(),
+            page_url: "https://x/c/abc123".into(),
+        }
+    }
+
+    #[test]
+    fn upload_succeeds_after_encode() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let uploader: Uploader = {
+            let uploads = Arc::clone(&uploads);
+            Arc::new(move |row| {
+                assert_eq!(row.status, ClipStatus::Uploading);
+                assert_eq!(row.av1_path.as_deref(), Some("a.mp4"));
+                uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(upload_result())
+            })
+        };
+        let worker = start_worker(
+            Arc::clone(&q),
+            ok_processor(),
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            Arc::new(|| true),
+        );
+        let id = q.enqueue(clip("u", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+        let done = wait_until(&q, id, |r| r.status == ClipStatus::Done);
+        assert_eq!(done.remote_id.as_deref(), Some("abc123"));
+        assert_eq!(done.page_url.as_deref(), Some("https://x/c/abc123"));
+        assert_eq!(done.stage, Stage::Upload);
+        assert_eq!(done.attempts, 0);
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        // Done rows are never picked up again.
+        assert!(q.next_uploadable().unwrap().is_none());
+    }
+
+    #[test]
+    fn upload_fails_then_retries_with_backoff() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let uploader: Uploader = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_row| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    anyhow::bail!("network {n}")
+                }
+                Ok(upload_result())
+            })
+        };
+        let worker = start_worker(
+            Arc::clone(&q),
+            ok_processor(),
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            Arc::new(|| true),
+        );
+        let id = q.enqueue(clip("f", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+
+        let failed = wait_until(&q, id, |r| r.status == ClipStatus::Failed);
+        assert_eq!(failed.stage, Stage::Upload);
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(failed.error.as_deref(), Some("network 0"));
+        assert!(q.next_attempt_at(id).unwrap().is_some());
+        // The encode outputs survive an upload failure.
+        assert_eq!(failed.av1_path.as_deref(), Some("a.mp4"));
+
+        let done = wait_until(&q, id, |r| r.status == ClipStatus::Done);
+        assert_eq!(done.attempts, 2);
+        assert_eq!(done.error, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn upload_failure_is_not_re_encoded_and_retry_resumes_at_upload() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let processor: Processor = {
+            let encodes = Arc::clone(&encodes);
+            Arc::new(move |_row| {
+                encodes.fetch_add(1, Ordering::SeqCst);
+                Ok(outputs())
+            })
+        };
+        let uploader: Uploader = Arc::new(|_row| anyhow::bail!("always"));
+        let worker = start_worker(
+            Arc::clone(&q),
+            processor,
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            Arc::new(|| true),
+        );
+        let id = q.enqueue(clip("e", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+        let exhausted = wait_until(&q, id, |r| r.attempts >= MAX_ATTEMPTS);
+        assert_eq!(exhausted.status, ClipStatus::Failed);
+        assert_eq!(exhausted.stage, Stage::Upload);
+        assert_eq!(encodes.load(Ordering::SeqCst), 1, "never re-encoded");
+        std::thread::sleep(POLL_INTERVAL * 4);
+        assert_eq!(encodes.load(Ordering::SeqCst), 1);
+
+        q.retry(id).unwrap();
+        let after = wait_until(&q, id, |r| r.attempts < MAX_ATTEMPTS);
+        assert!(
+            matches!(after.status, ClipStatus::Encoded | ClipStatus::Uploading | ClipStatus::Failed),
+            "retry resumes at upload, got {after:?}"
+        );
+        assert_eq!(after.stage, Stage::Upload);
+        wait_until(&q, id, |r| r.status == ClipStatus::Failed && r.attempts == 1);
+        assert_eq!(encodes.load(Ordering::SeqCst), 1, "retry did not re-encode");
+    }
+
+    #[test]
+    fn closed_upload_gate_keeps_row_encoded() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let gate_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let uploader: Uploader = {
+            let uploads = Arc::clone(&uploads);
+            Arc::new(move |_row| {
+                uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(upload_result())
+            })
+        };
+        let upload_gate: Gate = {
+            let gate_open = Arc::clone(&gate_open);
+            Arc::new(move || gate_open.load(Ordering::SeqCst))
+        };
+        let worker = start_worker(
+            Arc::clone(&q),
+            ok_processor(),
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            upload_gate,
+        );
+        let id = q.enqueue(clip("g", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+        wait_until(&q, id, |r| r.status == ClipStatus::Encoded);
+        std::thread::sleep(POLL_INTERVAL * 6);
+        assert_eq!(q.get(id).unwrap().unwrap().status, ClipStatus::Encoded);
+        assert_eq!(uploads.load(Ordering::SeqCst), 0);
+
+        // Opening the gate (login) and waking drains the backlog.
+        gate_open.store(true, Ordering::SeqCst);
+        worker.wake();
+        wait_until(&q, id, |r| r.status == ClipStatus::Done);
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn no_uploader_leaves_rows_encoded() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let worker = start_worker(
+            Arc::clone(&q),
+            ok_processor(),
+            Arc::new(|| true),
+            noop_change(),
+            None,
+            Arc::new(|| true),
+        );
+        let id = q.enqueue(clip("n", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+        wait_until(&q, id, |r| r.status == ClipStatus::Encoded);
+        std::thread::sleep(POLL_INTERVAL * 4);
+        assert_eq!(q.get(id).unwrap().unwrap().status, ClipStatus::Encoded);
+    }
+
+    #[test]
+    fn open_resets_uploading_rows_and_migrates_v1() {
+        let path = temp_db();
+        // Build a version-1 database by hand, as the phase-2 app would have left it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clips (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL UNIQUE, \
+                 game TEXT, title TEXT, recorded_at TEXT NOT NULL, duration_ms INTEGER NOT NULL, \
+                 width INTEGER, height INTEGER, size_source INTEGER NOT NULL, size_av1 INTEGER, \
+                 size_h264 INTEGER, av1_path TEXT, h264_path TEXT, thumb_path TEXT, \
+                 status TEXT NOT NULL, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, \
+                 next_attempt_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+                 PRAGMA user_version = 1; \
+                 INSERT INTO clips (source_path, recorded_at, duration_ms, size_source, status, \
+                 created_at, updated_at) VALUES ('C:\\old.mkv', '2026-01-01T00:00:00.000Z', 1000, \
+                 5, 'uploading', 'x', 'x');",
+            )
+            .unwrap();
+        }
+        let q = Queue::open(&path).unwrap();
+        let row = &q.list().unwrap()[0];
+        assert_eq!(row.status, ClipStatus::Encoded, "interrupted upload goes back to encoded");
+        assert_eq!(row.stage, Stage::Encode);
+        assert_eq!(row.remote_id, None);
+        let version: i32 = q
+            .lock()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // Reopening a migrated database is a no-op.
+        drop(q);
+        Queue::open(&path).unwrap();
     }
 
     #[test]

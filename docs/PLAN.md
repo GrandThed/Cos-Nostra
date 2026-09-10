@@ -117,9 +117,18 @@ Tasks:
 
 Acceptance: ten clips saved in a row during gameplay all end up encoded within a few minutes of leaving the game, with no dropped frames in the game while encoding runs at low process priority.
 
-### Phase 3. Backend. Three weeks.
+### Phase 3. Backend. Code done 2026-09-10, deployment pending.
 
 Goal: a deployed API with Discord login, presigned uploads, clip records and a player page.
+
+What changed from the plan and why:
+
+- Object storage is a Railway Storage Bucket instead of R2, still only through the S3 API. Railway buckets have no public read, so objects are never public: `GET /clips/:id/{av1,h264,thumb}` are the stable URLs and redirect to one-hour presigned GETs. The player page, Discord embeds and the bot use those.
+- Local development and tests run on PGlite (Postgres in WASM) through the same Drizzle schema and migrations; `DATABASE_URL=pglite://memory` or `pglite://./data/dev`. Production uses `pg`.
+- Railway services build from Dockerfiles with the repo root as context, because the npm lockfile lives at the root; each service points at its `railway.json`. Details in the railway-deploy skill.
+- Device tokens are opaque random strings stored hashed; the JWT only signs the OAuth `state`.
+- Backend and bot load the repo-root `.env` locally (`node --env-file-if-exists`), and the root `.env.example` is the single local reference.
+- `device_logins` rows are deleted when the desktop collects the token, which is how "consumed" is represented.
 
 Stack details:
 

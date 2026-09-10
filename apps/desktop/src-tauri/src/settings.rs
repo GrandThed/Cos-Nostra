@@ -7,6 +7,15 @@ pub const MIN_BUFFER_SECONDS: i64 = 5;
 pub const MAX_BUFFER_SECONDS: i64 = 300;
 pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 60_000;
+pub const DEFAULT_BACKEND_URL: &str = "https://cosnostra.benja.ar";
+
+/// The Discord user this device is linked to, as reported by the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub discord_id: String,
+    pub username: String,
+    pub avatar: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -33,6 +42,14 @@ pub struct Settings {
     pub encoders: Option<crate::ffmpeg::Encoders>,
     /// Encode even while a game is in the foreground. Off by default to protect frame rate.
     pub encode_while_gaming: bool,
+    /// Base URL of the Cos Nostra backend, no trailing slash.
+    pub backend_url: String,
+    /// Long-lived device token from the Discord device login. `None` when logged out.
+    pub device_token: Option<String>,
+    /// Who the token belongs to; shown in the UI.
+    pub account: Option<Account>,
+    /// Upload every encoded clip without asking.
+    pub auto_upload: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +69,10 @@ impl Default for Settings {
             sound_on_save: true,
             encoders: None,
             encode_while_gaming: false,
+            backend_url: DEFAULT_BACKEND_URL.into(),
+            device_token: None,
+            account: None,
+            auto_upload: true,
         }
     }
 }
@@ -117,7 +138,13 @@ impl Settings {
         if self.hotkey.trim().is_empty() {
             anyhow::bail!("hotkey must not be empty");
         }
+        validate_backend_url(&self.backend_url)?;
         Ok(())
+    }
+
+    /// True when a device token is stored (not necessarily still valid).
+    pub fn logged_in(&self) -> bool {
+        self.device_token.is_some()
     }
 
     /// True when a change between `self` and `other` requires rebuilding the libobs pipeline.
@@ -127,5 +154,46 @@ impl Settings {
             || self.video_bitrate_kbps != other.video_bitrate_kbps
             || self.fps != other.fps
             || self.clip_dir != other.clip_dir
+    }
+}
+
+/// Accepts `http://host[:port][/path]` or `https://...`; no query, fragment or trailing slash.
+pub fn validate_backend_url(url: &str) -> anyhow::Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| anyhow::anyhow!("backend URL must start with http:// or https://"))?;
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        anyhow::bail!("backend URL needs a host");
+    }
+    if url.ends_with('/') || url.contains('?') || url.contains('#') {
+        anyhow::bail!("backend URL must not end with / or contain ? or #");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_url_validation() {
+        assert!(validate_backend_url(DEFAULT_BACKEND_URL).is_ok());
+        assert!(validate_backend_url("http://localhost:3000").is_ok());
+        assert!(validate_backend_url("https://x.example/api").is_ok());
+        assert!(validate_backend_url("cosnostra.benja.ar").is_err());
+        assert!(validate_backend_url("https://").is_err());
+        assert!(validate_backend_url("https://x.example/").is_err());
+        assert!(validate_backend_url("ftp://x.example").is_err());
+    }
+
+    #[test]
+    fn defaults_are_logged_out() {
+        let s = Settings::default();
+        assert!(!s.logged_in());
+        assert!(s.auto_upload);
+        assert_eq!(s.backend_url, DEFAULT_BACKEND_URL);
+        s.validate().unwrap();
     }
 }

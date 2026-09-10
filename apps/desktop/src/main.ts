@@ -17,6 +17,12 @@ interface Encoders {
   h264: string;
 }
 
+interface Account {
+  discord_id: string;
+  username: string;
+  avatar: string | null;
+}
+
 interface Status {
   recording: boolean;
   encoder: string | null;
@@ -29,6 +35,8 @@ interface Status {
   conflict: CaptureConflict | null;
   encoders: Encoders | null;
   ffmpeg_error: string | null;
+  account: Account | null;
+  auto_upload: boolean;
 }
 
 interface Settings {
@@ -43,9 +51,19 @@ interface Settings {
   sound_on_save: boolean;
   encoders: Encoders | null;
   encode_while_gaming: boolean;
+  backend_url: string;
+  device_token: string | null;
+  account: Account | null;
+  auto_upload: boolean;
+}
+
+interface LoginStarted {
+  code: string;
+  verify_url: string;
 }
 
 type ClipStatus = "saved" | "encoding" | "encoded" | "uploading" | "done" | "failed";
+type Stage = "encode" | "upload";
 
 interface ClipRow {
   id: number;
@@ -65,6 +83,9 @@ interface ClipRow {
   status: ClipStatus;
   error: string | null;
   attempts: number;
+  stage: Stage;
+  remote_id: string | null;
+  page_url: string | null;
 }
 
 const el = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -114,6 +135,9 @@ async function refresh() {
   el("hotkey").textContent = s.hotkey;
   el("seconds").textContent = `${s.buffer_seconds}s`;
   el("dir").textContent = s.clip_dir;
+  el("account").textContent = s.account
+    ? `${s.account.username}${s.auto_upload ? "" : " (uploads off)"}`
+    : "not linked";
   el("conflict").textContent = s.conflict
     ? `${s.conflict.executable} is already captured by another tool (OBS, Discord, GeForce Experience...). Close it or clips will be black.`
     : "";
@@ -179,8 +203,85 @@ async function loadSettings() {
   input("notify_on_save").checked = current.notify_on_save;
   input("sound_on_save").checked = current.sound_on_save;
   input("encode_while_gaming").checked = current.encode_while_gaming;
+  input("backend_url").value = current.backend_url;
+  input("auto_upload").checked = current.auto_upload;
+  renderAccount(current.account);
   setMsg("");
 }
+
+// ---------------------------------------------------------------------------
+// Account block
+
+/** Code of the device login in progress, or null. */
+let loginPending: string | null = null;
+
+function setLoginMsg(text: string, kind: "ok" | "err" | "" = "") {
+  const m = el("login_msg");
+  m.textContent = text;
+  m.className = kind ? `full hint ${kind}` : "full hint";
+}
+
+function renderAccount(account: Account | null) {
+  el("account_logged_out").hidden = !!account || loginPending !== null;
+  el("account_pending").hidden = !!account || loginPending === null;
+  el("account_logged_in").hidden = !account;
+  el("account_name").textContent = account ? `Logged in as ${account.username}` : "";
+  el("login_code").textContent = loginPending ?? "–";
+}
+
+el("login").addEventListener("click", async () => {
+  const btn = el<HTMLButtonElement>("login");
+  btn.disabled = true;
+  setLoginMsg("Contacting the backend…");
+  try {
+    const started = await invoke<LoginStarted>("start_login");
+    loginPending = started.code;
+    setLoginMsg(`If the browser did not open, go to ${started.verify_url}`);
+    renderAccount(null);
+  } catch (e) {
+    setLoginMsg(String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+el("login_cancel").addEventListener("click", async () => {
+  loginPending = null;
+  setLoginMsg("");
+  try {
+    await invoke("cancel_login");
+  } catch (e) {
+    setLoginMsg(String(e), "err");
+  }
+  renderAccount(current?.account ?? null);
+});
+
+el("logout").addEventListener("click", async () => {
+  const btn = el<HTMLButtonElement>("logout");
+  btn.disabled = true;
+  try {
+    await invoke("logout");
+    setLoginMsg("Logged out", "ok");
+  } catch (e) {
+    setLoginMsg(String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+listen<Account | null>("account-changed", (e) => {
+  loginPending = null;
+  if (current) current.account = e.payload;
+  if (e.payload) setLoginMsg(`Logged in as ${e.payload.username}`, "ok");
+  renderAccount(e.payload);
+  void refresh();
+});
+
+listen<string>("login-failed", (e) => {
+  loginPending = null;
+  setLoginMsg(e.payload, "err");
+  renderAccount(current?.account ?? null);
+});
 
 // Hotkey capture. Builds a Tauri shortcut string such as "Alt+F10" or "Ctrl+Shift+F9" from
 // KeyboardEvent.code, which the global-hotkey parser accepts verbatim (KeyA, Digit1, F10...).
@@ -281,6 +382,8 @@ el<HTMLFormElement>("settings-form").addEventListener("submit", async (ev) => {
     notify_on_save: input("notify_on_save").checked,
     sound_on_save: input("sound_on_save").checked,
     encode_while_gaming: input("encode_while_gaming").checked,
+    backend_url: input("backend_url").value.trim(),
+    auto_upload: input("auto_upload").checked,
   };
   const btn = el<HTMLButtonElement>("settings_save");
   btn.disabled = true;
@@ -337,7 +440,7 @@ function badgeText(c: ClipRow): string {
     case "encoded": return "encoded";
     case "uploading": return "uploading";
     case "done": return "done";
-    case "failed": return "failed";
+    case "failed": return c.stage === "upload" ? "upload failed" : "failed";
   }
 }
 
@@ -422,6 +525,22 @@ function renderClip(c: ClipRow): HTMLElement {
   open.textContent = "Open folder";
   open.addEventListener("click", () => run(invoke("open_clip_folder", { id: c.id })));
   buttons.append(open);
+  if (c.status === "done" && c.page_url) {
+    const url = c.page_url;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.textContent = "Copy link";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(url);
+        copy.textContent = "Copied";
+        setTimeout(() => { copy.textContent = "Copy link"; }, 1500);
+      } catch (e) {
+        setClipsError(`Could not copy: ${String(e)}`);
+      }
+    });
+    buttons.append(copy);
+  }
   if (c.status === "failed") {
     const retry = document.createElement("button");
     retry.type = "button";
@@ -444,7 +563,15 @@ function renderClip(c: ClipRow): HTMLElement {
   });
   buttons.append(del);
 
-  meta.append(top, detail, buttons);
+  meta.append(top, detail);
+  if (c.status === "done" && c.page_url) {
+    const link = document.createElement("div");
+    link.className = "link";
+    link.textContent = c.page_url;
+    link.title = c.page_url;
+    meta.append(link);
+  }
+  meta.append(buttons);
   row.append(meta);
   return row;
 }

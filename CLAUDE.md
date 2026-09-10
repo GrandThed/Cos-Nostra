@@ -56,6 +56,8 @@ Toolchain on the dev machine: Rust stable MSVC, Node 24, ffmpeg 9 (`ffmpeg`/`ffp
 - The dev build and the installed build share the single-instance id, so launching one while the other runs only focuses the running one. Stop the dev app before testing an installer.
 - ffmpeg and ffprobe are Tauri sidecars in the gitignored `apps/desktop/src-tauri/binaries/`. `npm run ensure-ffmpeg` (run automatically before `tauri dev` and `tauri build`) fills it from PATH or a download. A build that fails with a missing `ffmpeg-x86_64-pc-windows-msvc.exe` means that script did not run.
 - Clip metadata lives in `%APPDATA%\Cos Nostra\clips.db` (SQLite, WAL). Delete it together with the `*.av1.mp4`, `*.h264.mp4` and `*.jpg` files next to the clips to start over.
+- Never create or drop a `reqwest::blocking` client inside an `async` Tauri command: tokio panics ("Cannot drop a runtime in a context where blocking is not allowed") and the poisoned mutexes take the app down. Wrap the body in `tauri::async_runtime::spawn_blocking` or use a plain thread, as `start_login` and `logout` do.
+- The backend runs locally without Postgres: `DATABASE_URL=pglite://./data/dev`. Point the desktop at it through the Backend URL field in Settings (`http://localhost:3000`), and register `http://localhost:3000/auth/discord/callback` as a redirect in the Discord app if you want the login to complete locally.
 - The exe links `obs.dll` at load time. The installer ships the bootstrapper's dummy from `src-tauri/resources/obs-dummy.dll` and installs per user into `%LOCALAPPDATA%\Cos Nostra` because the real runtime is extracted next to the exe on first launch.
 
 ## Skills

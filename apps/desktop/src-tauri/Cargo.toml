@@ -31,6 +31,8 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# Backend API client. 0.13 with rustls is already in the graph through libobs-bootstrapper.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 chrono = "0.4"
 # Win32 calls for the foreground window lookup and the save sound. Same version libobs-window-helper uses.
 windows = { version = "0.62", features = [
