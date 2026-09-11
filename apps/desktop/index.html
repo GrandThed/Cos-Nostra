@@ -118,6 +118,25 @@
         <div class="full check"><input type="checkbox" id="sound_on_save" /><label for="sound_on_save">Play a sound when a clip is saved</label></div>
         <div class="full check"><input type="checkbox" id="encode_while_gaming" /><label for="encode_while_gaming">Encode while a game is running</label></div>
 
+        <label for="quality">Clip quality</label>
+        <div class="inline">
+          <select id="quality">
+            <option value="small">Smaller files</option>
+            <option value="balanced">Balanced</option>
+            <option value="high">Best quality</option>
+          </select>
+          <span class="hint" id="quality_hint"></span>
+        </div>
+
+        <label for="encode_engine">Encode with</label>
+        <div class="inline">
+          <select id="encode_engine">
+            <option value="cpu">Processor (smaller files, slower)</option>
+            <option value="gpu">Graphics card (faster)</option>
+          </select>
+          <span class="hint" id="encode_engine_hint"></span>
+        </div>
+
         <fieldset>
           <legend>Account</legend>
           <div class="full" id="account_logged_out">

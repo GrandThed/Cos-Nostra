@@ -125,6 +125,114 @@ const CONFIGS = [
       '-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-maxrate', '5M', '-bufsize', '10M',
     ],
   },
+
+  // Rate-quality curve points. A single preset per encoder cannot answer "which encoder is
+  // better", because av1_amf's cqp and libsvtav1's crf are not the same dial and the offset
+  // between them moves with content: on the easy clip cqp 95 and crf 34 land 1.6 VMAF apart,
+  // on the medium clip 2.5 apart and 6x apart in size. Three points each makes the two curves
+  // comparable at matched quality, which is the only honest way to pick.
+  {
+    id: 'amf-cqp110',
+    label: 'av1_amf cqp 110',
+    note: 'curve point',
+    args: ['-c:v', 'av1_amf', '-quality', 'quality', '-rc', 'cqp', '-qp_i', '110', '-qp_p', '110'],
+  },
+  {
+    id: 'amf-cqp128',
+    label: 'av1_amf cqp 128',
+    note: 'curve point',
+    args: ['-c:v', 'av1_amf', '-quality', 'quality', '-rc', 'cqp', '-qp_i', '128', '-qp_p', '128'],
+  },
+  {
+    id: 'svtav1-p6-crf40',
+    label: 'libsvtav1 p6 crf 40',
+    note: 'curve point',
+    args: ['-c:v', 'libsvtav1', '-preset', '6', '-crf', '40', '-svtav1-params', 'tune=0'],
+  },
+  {
+    id: 'svtav1-p6-crf46',
+    label: 'libsvtav1 p6 crf 46',
+    note: 'curve point',
+    args: ['-c:v', 'libsvtav1', '-preset', '6', '-crf', '46', '-svtav1-params', 'tune=0'],
+  },
+
+  // The three levels the app actually ships, so the table can be checked against what the
+  // Settings picker really does. Keep these in step with ffmpeg::av1_args / h264_args.
+  {
+    id: 'ship-av1-small',
+    label: 'SHIP av1 Smaller files',
+    note: 'libsvtav1 p6 crf 46, ceiling 8M',
+    args: ['-c:v', 'libsvtav1', '-preset', '6', '-crf', '46', '-svtav1-params', 'tune=0', '-maxrate', '8M', '-bufsize', '16M'],
+  },
+  {
+    id: 'ship-av1-balanced',
+    label: 'SHIP av1 Balanced',
+    note: 'libsvtav1 p6 crf 40, ceiling 12M',
+    args: ['-c:v', 'libsvtav1', '-preset', '6', '-crf', '40', '-svtav1-params', 'tune=0', '-maxrate', '12M', '-bufsize', '24M'],
+  },
+  {
+    id: 'ship-av1-high',
+    label: 'SHIP av1 Best quality',
+    note: 'libsvtav1 p6 crf 34, ceiling 20M',
+    args: ['-c:v', 'libsvtav1', '-preset', '6', '-crf', '34', '-svtav1-params', 'tune=0', '-maxrate', '20M', '-bufsize', '40M'],
+  },
+  {
+    id: 'ship-h264-balanced',
+    label: 'SHIP h264 Balanced',
+    note: 'libx264 medium crf 22, ceiling 12M - the copy Discord streams',
+    args: ['-c:v', 'libx264', '-preset', 'medium', '-crf', '22', '-maxrate', '12M', '-bufsize', '24M'],
+  },
+  // The H.264 copy is not the fallback its name suggests: og:video on the player page points
+  // at it, so Discord's inline player streams H.264 for every viewer in the server and never
+  // touches the AV1. Confirmed 2026-09-11 from a live embed object, which carries
+  // `video.url = .../clips/<id>/h264` behind a discordapp.net proxy. These rows decide what
+  // the community actually sees.
+  {
+    id: 'x264-crf20-cap8',
+    label: 'libx264 crf 20 @8M',
+    note: 'the hot copy, given a real quality target instead of a starved bitrate',
+    args: [
+      '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-maxrate', '8M', '-bufsize', '16M',
+    ],
+  },
+  {
+    id: 'h264-amf-qvbr24-cap8',
+    label: 'h264_amf qvbr 24 @8M',
+    note: 'same idea on hardware: quality-driven with a ceiling',
+    args: [
+      '-c:v', 'h264_amf', '-quality', 'quality', '-rc', 'qvbr', '-qvbr_quality_level', '24',
+      '-maxrate', '8M', '-bufsize', '16M',
+    ],
+  },
+  {
+    id: 'svtav1-p6-cap8',
+    label: 'libsvtav1 p6 crf 34 @8M',
+    note: 'AV1 at a looser ceiling, to see where the cap stops costing anything',
+    args: [
+      '-c:v', 'libsvtav1', '-preset', '6', '-crf', '34', '-svtav1-params', 'tune=0',
+      '-maxrate', '8M', '-bufsize', '16M',
+    ],
+  },
+  {
+    id: 'svtav1-p4-cap8',
+    note: 'the slow preset where it actually pays: p8 -> p4 at a 5M cap on hard footage was '
+      + 'worth 7.3 VMAF, because a tight ceiling is exactly where better decisions matter',
+    label: 'libsvtav1 p4 crf 34 @8M',
+    args: [
+      '-c:v', 'libsvtav1', '-preset', '4', '-crf', '34', '-svtav1-params', 'tune=0',
+      '-maxrate', '8M', '-bufsize', '16M',
+    ],
+  },
+  {
+    id: 'svtav1-p6-cap5-g300',
+    label: 'libsvtav1 p6 crf 34 @5M g300',
+    note: 'a 5 s GOP instead of 2 s - clips are watched start to finish, not seeked',
+    args: [
+      '-c:v', 'libsvtav1', '-preset', '6', '-crf', '34', '-svtav1-params', 'tune=0',
+      '-maxrate', '5M', '-bufsize', '10M',
+    ],
+    gop: ['-g', '300'],
+  },
 ];
 
 // ---- plumbing ----------------------------------------------------------------------------
@@ -185,7 +293,7 @@ async function measure({ ffmpeg, source, config, outDir, duration }) {
 
   const encode = await run(
     ffmpeg,
-    ['-v', 'error', '-y', '-i', source, ...config.args, ...GOP, '-an', '-f', 'mp4', outFile],
+    ['-v', 'error', '-y', '-i', source, ...config.args, ...(config.gop ?? GOP), '-an', '-f', 'mp4', outFile],
     outDir,
   );
   if (encode.code !== 0) {
@@ -292,7 +400,8 @@ console.log(`out:     ${outDir}`);
 console.log(`corpus:  ${clipNames.join(', ')}`);
 console.log('');
 
-const wanted = onlyConfig ? CONFIGS.filter((c) => c.id === onlyConfig) : CONFIGS;
+const only = onlyConfig ? new Set(onlyConfig.split(',').map((s) => s.trim())) : null;
+const wanted = only ? CONFIGS.filter((c) => only.has(c.id)) : CONFIGS;
 if (wanted.length === 0) throw new Error(`no config matches --only ${onlyConfig}`);
 
 for (const clip of clipNames) {

@@ -14,6 +14,8 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::Quality;
+
 /// Resolved ffmpeg and ffprobe executables.
 #[derive(Debug, Clone)]
 pub struct Binaries {
@@ -145,6 +147,21 @@ pub fn probe_encoders(bins: &Binaries) -> Encoders {
     }
 }
 
+/// The encoders to actually use, given what the probe found and which engine the user picked.
+///
+/// `Gpu` uses the probed hardware encoders; `Cpu` ignores them and encodes in software, which
+/// on the measured machine is both smaller and better (see `av1_args`). The replay buffer is
+/// unaffected - it has to keep up with a game in real time and is always hardware.
+pub fn encoders_for(probed: &Encoders, engine: crate::settings::EncodeEngine) -> Encoders {
+    match engine {
+        crate::settings::EncodeEngine::Gpu => probed.clone(),
+        crate::settings::EncodeEngine::Cpu => Encoders {
+            av1: SOFTWARE_AV1.into(),
+            h264: SOFTWARE_H264.into(),
+        },
+    }
+}
+
 fn first_working<'a>(bins: &Binaries, candidates: &[&'a str]) -> Option<&'a str> {
     candidates.iter().copied().find(|encoder| {
         let started = Instant::now();
@@ -255,30 +272,110 @@ fn input_args(cmd: &mut Command, src: &Path, trim: Trim) {
     cmd.arg("-i").arg(src);
 }
 
-/// Video encoder settings from the `video-encoding` skill presets.
+/// Video encoder settings, measured with `scripts/bench-encoders.mjs`.
 ///
-/// AMF's quantizer scale is 0-255, not the 0-51 that H.264-style encoders use. `-qp_i 28`
-/// there was asking for near-lossless AV1, which is why AV1 came out roughly twice the size
-/// of the H.264 fallback on real gameplay (53 MB against 27 MB for the same 27 s clip). 95
-/// is the measured point that matches the H.264 preset's quality at about a third less size;
-/// the numbers and the method are in the skill. NVENC's `-cq` and QSV's `-global_quality`
-/// really are 0-51 scales, so 28 is right there and stays; neither could be measured on this
-/// AMD dev machine, and both stay behind `probe_encoders`.
-fn av1_args(encoder: &str) -> Vec<&'static str> {
+/// Every software preset here is **capped CRF**: a constant-quality target plus a ceiling the
+/// encoder may not exceed. That is not the same as a bitrate target, and the difference is the
+/// point. On an ordinary clip the ceiling is never reached, so the file comes out as small as
+/// the content allows (a desktop capture lands around 3 MB for 26 s). On high-motion gameplay
+/// the ceiling engages and trims the clip instead of letting it balloon to 50 MB. Sizes stay
+/// in a band the user can predict without paying for it on every clip.
+///
+/// Two measured facts drive the numbers, both from a 28 s 1080p60 high-motion capture:
+///
+/// - **`libsvtav1` is far ahead of `av1_amf`.** At matched size (30.6 MB against 30.8 MB) it
+///   scored 93.43 VMAF where AMD's hardware AV1 interpolates to about 89.3 and `h264_amf`
+///   managed 88.54. AMD's AV1 is barely better than AMD's own H.264, so hardware AV1 is the
+///   fast option, not the good one.
+/// - **The ceiling is a safety net, not a size dial.** Clamping is a far worse way to reach a
+///   size than simply asking for less quality: at a 5 Mbps cap, crf 34 scored 85.21 at 17.0 MB,
+///   while plain crf 46 with no cap at all scored **90.94 at 20.3 MB**. So each level picks its
+///   CRF for the quality it wants and sets `-maxrate` high enough that ordinary clips never
+///   touch it; only a pathological clip gets clamped.
+///
+/// Preset 6 is the chosen speed: about 40 s for a 28 s clip. Preset 4 was measured and is
+/// worth roughly 2 VMAF *when the ceiling binds* (85.21 against 83.13 at a 5 Mbps cap) and
+/// within 0.1 VMAF of preset 6 when it does not. Since the ceilings above are set not to bind,
+/// preset 4 would double the encode time to buy almost nothing.
+///
+/// AMF's quantizer scale is 0-255, not the 0-51 that H.264-style encoders use: `-qp_i 28`
+/// there asks for near-lossless, which is how AV1 once came out twice the size of the H.264
+/// copy. NVENC's `-cq` and QSV's `-global_quality` really are 0-51. **Neither NVENC nor QSV
+/// has ever been measured** - this is an AMD machine - so their rows carry numbers inferred
+/// from their own scales and stay behind `probe_encoders`.
+fn av1_args(encoder: &str, quality: Quality) -> Vec<&'static str> {
+    // (crf, ceiling, buffer) for libsvtav1; the hardware rows carry their own quantizers.
     match encoder {
-        "av1_amf" => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "95", "-qp_p", "95"],
-        "av1_nvenc" => vec!["-cq", "28", "-preset", "p5"],
-        "av1_qsv" => vec!["-global_quality", "28"],
-        _ => vec!["-preset", "8", "-crf", "34", "-svtav1-params", "tune=0"],
+        "av1_amf" => match quality {
+            // Hardware AMF has no usable capped mode: `-rc qvbr` measured *below* the plain
+            // cqp curve (86.82 at 31 MB against cqp 128's 88.22 at 27 MB), so this is
+            // constant quantizer and genuinely uncapped. Choosing the GPU means giving up the
+            // size ceiling, which is why the CPU is the default.
+            Quality::Small => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "128", "-qp_p", "128"],
+            Quality::Balanced => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "110", "-qp_p", "110"],
+            Quality::High => vec!["-quality", "quality", "-rc", "cqp", "-qp_i", "95", "-qp_p", "95"],
+        },
+        "av1_nvenc" => match quality {
+            Quality::Small => vec!["-cq", "38", "-preset", "p5", "-maxrate", "6M", "-bufsize", "12M"],
+            Quality::Balanced => vec!["-cq", "32", "-preset", "p5", "-maxrate", "10M", "-bufsize", "20M"],
+            Quality::High => vec!["-cq", "28", "-preset", "p5", "-maxrate", "16M", "-bufsize", "32M"],
+        },
+        "av1_qsv" => match quality {
+            Quality::Small => vec!["-global_quality", "38", "-maxrate", "6M", "-bufsize", "12M"],
+            Quality::Balanced => vec!["-global_quality", "32", "-maxrate", "10M", "-bufsize", "20M"],
+            Quality::High => vec!["-global_quality", "28", "-maxrate", "16M", "-bufsize", "32M"],
+        },
+        // libsvtav1. `-maxrate` is what turns CRF into capped CRF; SVT reports it as
+        // "BRC mode: capped CRF". Do not reach for `-svtav1-params mbr=`, which expects kbps
+        // and silently clamps a bytes-per-second value to 100 Mbps, leaving the cap off.
+        _ => match quality {
+            Quality::Small => vec![
+                "-preset", "6", "-crf", "46", "-svtav1-params", "tune=0",
+                "-maxrate", "8M", "-bufsize", "16M",
+            ],
+            Quality::Balanced => vec![
+                "-preset", "6", "-crf", "40", "-svtav1-params", "tune=0",
+                "-maxrate", "12M", "-bufsize", "24M",
+            ],
+            Quality::High => vec![
+                "-preset", "6", "-crf", "34", "-svtav1-params", "tune=0",
+                "-maxrate", "20M", "-bufsize", "40M",
+            ],
+        },
     }
 }
 
-fn h264_args(encoder: &str) -> Vec<&'static str> {
+/// The H.264 copy is **not** a fallback that nobody watches. `og:video` on the player page
+/// points at it, so Discord's inline player streams H.264 to every viewer in the server and
+/// never touches the AV1 file - confirmed from a live embed object, which carries
+/// `video.url = .../clips/<id>/h264` behind a discordapp.net proxy. It is the hot copy and it
+/// gets a real quality target here, not the starved 8 Mbps bitrate cap it used to carry, which
+/// wasted bits on easy clips (7.7 MB where AV1 needed 3.1 MB for a better score) and starved
+/// on hard ones (88.54 VMAF).
+fn h264_args(encoder: &str, quality: Quality) -> Vec<&'static str> {
     match encoder {
-        "h264_amf" => vec!["-quality", "quality", "-rc", "vbr_peak", "-b:v", "8M", "-maxrate", "12M"],
-        "h264_nvenc" => vec!["-preset", "p5", "-rc", "vbr", "-b:v", "8M", "-maxrate", "12M"],
-        "h264_qsv" => vec!["-b:v", "8M", "-maxrate", "12M"],
-        _ => vec!["-preset", "veryfast", "-crf", "23"],
+        "h264_amf" => match quality {
+            Quality::Small => vec!["-quality", "quality", "-rc", "vbr_peak", "-b:v", "4M", "-maxrate", "6M"],
+            Quality::Balanced => vec!["-quality", "quality", "-rc", "vbr_peak", "-b:v", "8M", "-maxrate", "12M"],
+            Quality::High => vec!["-quality", "quality", "-rc", "vbr_peak", "-b:v", "14M", "-maxrate", "20M"],
+        },
+        "h264_nvenc" => match quality {
+            Quality::Small => vec!["-preset", "p5", "-rc", "vbr", "-cq", "28", "-b:v", "0", "-maxrate", "6M", "-bufsize", "12M"],
+            Quality::Balanced => vec!["-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M"],
+            Quality::High => vec!["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0", "-maxrate", "20M", "-bufsize", "40M"],
+        },
+        "h264_qsv" => match quality {
+            Quality::Small => vec!["-global_quality", "28", "-maxrate", "6M", "-bufsize", "12M"],
+            Quality::Balanced => vec!["-global_quality", "23", "-maxrate", "12M", "-bufsize", "24M"],
+            Quality::High => vec!["-global_quality", "19", "-maxrate", "20M", "-bufsize", "40M"],
+        },
+        // libx264, capped CRF like the AV1 software path. `medium` rather than `veryfast`:
+        // encoding runs after the game exits and the extra seconds buy real quality.
+        _ => match quality {
+            Quality::Small => vec!["-preset", "medium", "-crf", "26", "-maxrate", "8M", "-bufsize", "16M"],
+            Quality::Balanced => vec!["-preset", "medium", "-crf", "22", "-maxrate", "12M", "-bufsize", "24M"],
+            Quality::High => vec!["-preset", "medium", "-crf", "19", "-maxrate", "20M", "-bufsize", "40M"],
+        },
     }
 }
 
@@ -333,14 +430,19 @@ fn part_path(dst: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// AV1 in MP4 with Opus audio. Hardware encoders use constant quality (AMF QP 95 on its
-/// 0-255 scale, NVENC/QSV 28 on their 0-51 scales), software uses `libsvtav1 -preset 8
-/// -crf 34`. Keyframe every two seconds.
-pub fn encode_av1(bins: &Binaries, encoder: &str, src: &Path, dst: &Path, trim: Trim) -> Result<()> {
+/// AV1 in MP4 with Opus audio, at the user's chosen quality. Keyframe every two seconds.
+pub fn encode_av1(
+    bins: &Binaries,
+    encoder: &str,
+    quality: Quality,
+    src: &Path,
+    dst: &Path,
+    trim: Trim,
+) -> Result<()> {
     encode(
         bins,
         encoder,
-        &av1_args(encoder),
+        &av1_args(encoder, quality),
         &["-c:a", "libopus", "-b:a", "128k"],
         src,
         dst,
@@ -348,12 +450,21 @@ pub fn encode_av1(bins: &Binaries, encoder: &str, src: &Path, dst: &Path, trim: 
     )
 }
 
-/// H.264 in MP4 with AAC audio at about 8 Mbps, for Discord attachments and old devices.
-pub fn encode_h264(bins: &Binaries, encoder: &str, src: &Path, dst: &Path, trim: Trim) -> Result<()> {
+/// H.264 in MP4 with AAC audio: the copy Discord's inline player actually streams, and the
+/// one old devices fall back to. See `h264_args` for why it is not the afterthought its name
+/// suggests.
+pub fn encode_h264(
+    bins: &Binaries,
+    encoder: &str,
+    quality: Quality,
+    src: &Path,
+    dst: &Path,
+    trim: Trim,
+) -> Result<()> {
     encode(
         bins,
         encoder,
-        &h264_args(encoder),
+        &h264_args(encoder, quality),
         &["-c:a", "aac", "-b:a", "160k"],
         src,
         dst,
@@ -454,7 +565,7 @@ mod tests {
 
         let av1 = dir.join("out_av1.mp4");
         let started = Instant::now();
-        encode_av1(&bins, &encoders.av1, &src, &av1, trim).unwrap();
+        encode_av1(&bins, &encoders.av1, Quality::Balanced, &src, &av1, trim).unwrap();
         let av1_info = probe(&bins, &av1).unwrap();
         println!(
             "av1 ({}): {:.1} s, {} bytes, {:?}",
@@ -470,7 +581,7 @@ mod tests {
 
         let h264 = dir.join("out_h264.mp4");
         let started = Instant::now();
-        encode_h264(&bins, &encoders.h264, &src, &h264, trim).unwrap();
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &h264, trim).unwrap();
         let h264_info = probe(&bins, &h264).unwrap();
         println!(
             "h264 ({}): {:.1} s, {} bytes, {:?}",
@@ -491,7 +602,7 @@ mod tests {
 
         // A bad encoder name fails cleanly and leaves no .part behind.
         let bad = dir.join("bad.mp4");
-        let err = encode_av1(&bins, "no_such_encoder", &src, &bad, Trim::default()).unwrap_err();
+        let err = encode_av1(&bins, "no_such_encoder", Quality::Balanced, &src, &bad, Trim::default()).unwrap_err();
         println!("expected failure: {err:#}");
         assert!(!bad.exists() && !part_path(&bad).exists());
 

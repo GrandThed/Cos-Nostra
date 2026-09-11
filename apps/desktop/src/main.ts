@@ -39,6 +39,24 @@ interface Status {
   auto_upload: boolean;
 }
 
+type Quality = "small" | "balanced" | "high";
+type EncodeEngine = "cpu" | "gpu";
+
+/** Measured sizes for a 30 s 1080p60 clip, from scripts/bench-encoders.mjs. "typical" is
+ *  ordinary gameplay, "up to" is the high-motion worst case where the ceiling engages.
+ *  Quoted in megabytes rather than bitrate because that is the number people actually feel,
+ *  in upload time and in what the bucket costs. */
+const QUALITY_HINT: Record<Quality, string> = {
+  small: "~3 MB typical, up to 17 MB",
+  balanced: "~6 MB typical, up to 26 MB",
+  high: "~8 MB typical, up to 42 MB",
+};
+
+const ENGINE_HINT: Record<EncodeEngine, string> = {
+  cpu: "smaller and better; about a minute a clip",
+  gpu: "seconds, but bigger files and no size ceiling",
+};
+
 interface Settings {
   hotkey: string;
   buffer_seconds: number;
@@ -51,6 +69,8 @@ interface Settings {
   sound_on_save: boolean;
   encoders: Encoders | null;
   encode_while_gaming: boolean;
+  quality: Quality;
+  encode_engine: EncodeEngine;
   backend_url: string;
   device_token: string | null;
   account: Account | null;
@@ -90,6 +110,15 @@ interface ClipRow {
 
 const el = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const input = (id: string) => el<HTMLInputElement>(id);
+const select = (id: string) => el<HTMLSelectElement>(id);
+
+/** Keeps the grey text next to the two encode pickers in step with what is selected. */
+function syncEncodeHints(): void {
+  const quality = select("quality").value as Quality;
+  const engine = select("encode_engine").value as EncodeEngine;
+  el("quality_hint").textContent = QUALITY_HINT[quality] ?? "";
+  el("encode_engine_hint").textContent = ENGINE_HINT[engine] ?? "";
+}
 
 // ---------------------------------------------------------------------------
 // Tabs
@@ -203,6 +232,9 @@ async function loadSettings() {
   input("notify_on_save").checked = current.notify_on_save;
   input("sound_on_save").checked = current.sound_on_save;
   input("encode_while_gaming").checked = current.encode_while_gaming;
+  select("quality").value = current.quality;
+  select("encode_engine").value = current.encode_engine;
+  syncEncodeHints();
   input("backend_url").value = current.backend_url;
   input("auto_upload").checked = current.auto_upload;
   renderAccount(current.account);
@@ -348,6 +380,10 @@ function onCaptureKey(e: KeyboardEvent) {
   setMsg("");
 }
 
+for (const id of ["quality", "encode_engine"]) {
+  select(id).addEventListener("change", syncEncodeHints);
+}
+
 el("hotkey_bind").addEventListener("click", () => {
   if (capturing) {
     stopCapture(pendingHotkey);
@@ -382,6 +418,8 @@ el<HTMLFormElement>("settings-form").addEventListener("submit", async (ev) => {
     notify_on_save: input("notify_on_save").checked,
     sound_on_save: input("sound_on_save").checked,
     encode_while_gaming: input("encode_while_gaming").checked,
+    quality: select("quality").value as Quality,
+    encode_engine: select("encode_engine").value as EncodeEngine,
     backend_url: input("backend_url").value.trim(),
     auto_upload: input("auto_upload").checked,
   };

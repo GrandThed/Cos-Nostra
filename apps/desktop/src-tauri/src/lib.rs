@@ -565,13 +565,15 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
         .unwrap()
         .clone()
         .context("ffmpeg is not available")?;
-    let encoders = state
-        .settings
-        .lock()
-        .unwrap()
-        .encoders
-        .clone()
-        .context("encoders have not been probed yet")?;
+    let (probed, quality, engine) = {
+        let s = state.settings.lock().unwrap();
+        (s.encoders.clone(), s.quality, s.encode_engine)
+    };
+    let probed = probed.context("encoders have not been probed yet")?;
+    // The probe records what the graphics card can do; the engine setting decides whether we
+    // use it. Software is the default because it is measurably better per megabyte - see
+    // ffmpeg::av1_args - and clip encoding runs after the game has exited anyway.
+    let encoders = ffmpeg::encoders_for(&probed, engine);
 
     let source = Path::new(&row.source_path);
     let (av1, h264, thumb) = output_paths(source);
@@ -584,7 +586,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     log::info!("clip {}: thumbnail in {:.1?}", row.id, t.elapsed());
 
     let t = Instant::now();
-    ffmpeg::encode_av1(&bins, &encoders.av1, source, &av1, Trim::default())
+    ffmpeg::encode_av1(&bins, &encoders.av1, quality, source, &av1, Trim::default())
         .with_context(|| format!("AV1 encode with {}", encoders.av1))?;
     let size_av1 = file_size(&av1)?;
     log::info!(
@@ -596,7 +598,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     );
 
     let t = Instant::now();
-    ffmpeg::encode_h264(&bins, &encoders.h264, source, &h264, Trim::default())
+    ffmpeg::encode_h264(&bins, &encoders.h264, quality, source, &h264, Trim::default())
         .with_context(|| format!("H.264 encode with {}", encoders.h264))?;
     let size_h264 = file_size(&h264)?;
     log::info!(

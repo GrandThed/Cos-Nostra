@@ -9,6 +9,39 @@ pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 60_000;
 pub const DEFAULT_BACKEND_URL: &str = "https://cosnostra.benja.ar";
 
+/// How much the encoder is allowed to spend on a clip.
+///
+/// Every level is constant quality with a ceiling ("capped CRF"), not a bitrate target. That
+/// distinction is the whole point: an ordinary clip never reaches its ceiling and comes out as
+/// small as its content allows, while a high-motion one is trimmed instead of ballooning. The
+/// per-encoder numbers live in `ffmpeg::av1_args` and `ffmpeg::h264_args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// Tighter ceiling. Noticeably softer on high motion, much smaller everywhere.
+    Small,
+    /// The default.
+    #[default]
+    Balanced,
+    /// Loose ceiling. Big files on hard footage, near-transparent on everything else.
+    High,
+}
+
+/// Which engine encodes finished clips.
+///
+/// This is not the same choice as the replay buffer's encoder, which is always hardware: the
+/// buffer has to keep up with a game in real time, while clip encoding happens afterwards and
+/// can take as long as it likes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodeEngine {
+    /// The probed hardware encoder. Fast, and worse per byte.
+    Gpu,
+    /// libsvtav1 and libx264 on the CPU. Slower, and measurably better per byte.
+    #[default]
+    Cpu,
+}
+
 /// The Discord user this device is linked to, as reported by the backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -42,6 +75,11 @@ pub struct Settings {
     pub encoders: Option<crate::ffmpeg::Encoders>,
     /// Encode even while a game is in the foreground. Off by default to protect frame rate.
     pub encode_while_gaming: bool,
+    /// How much the encoder may spend per clip.
+    pub quality: Quality,
+    /// Hardware or software encoding for finished clips. Not the replay buffer, which is
+    /// always hardware.
+    pub encode_engine: EncodeEngine,
     /// Base URL of the Cos Nostra backend, no trailing slash.
     pub backend_url: String,
     /// Long-lived device token from the Discord device login. `None` when logged out.
@@ -69,6 +107,8 @@ impl Default for Settings {
             sound_on_save: true,
             encoders: None,
             encode_while_gaming: false,
+            quality: Quality::default(),
+            encode_engine: EncodeEngine::default(),
             backend_url: DEFAULT_BACKEND_URL.into(),
             device_token: None,
             account: None,
@@ -195,5 +235,40 @@ mod tests {
         assert!(s.auto_upload);
         assert_eq!(s.backend_url, DEFAULT_BACKEND_URL);
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_written_before_the_quality_picker_still_loads() {
+        // Every existing install has a settings.json with neither field. serde(default) on
+        // the struct is what keeps those from being reset to defaults wholesale, so this
+        // asserts the untouched fields survive and the two new ones arrive at their default.
+        let old = r#"{
+            "hotkey": "Alt+F9",
+            "buffer_seconds": 45,
+            "clip_dir": "C:\\clips",
+            "auto_upload": false
+        }"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.hotkey, "Alt+F9");
+        assert_eq!(s.buffer_seconds, 45);
+        assert!(!s.auto_upload);
+        assert_eq!(s.quality, Quality::Balanced);
+        assert_eq!(s.encode_engine, EncodeEngine::Cpu);
+    }
+
+    #[test]
+    fn quality_and_engine_round_trip_as_snake_case() {
+        // The web UI reads and writes these as the literal strings in its <select> options,
+        // so the wire spelling is part of the contract with main.ts.
+        let mut s = Settings::default();
+        s.quality = Quality::Small;
+        s.encode_engine = EncodeEngine::Gpu;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""quality":"small""#), "{json}");
+        assert!(json.contains(r#""encode_engine":"gpu""#), "{json}");
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.quality, Quality::Small);
+        assert_eq!(back.encode_engine, EncodeEngine::Gpu);
     }
 }

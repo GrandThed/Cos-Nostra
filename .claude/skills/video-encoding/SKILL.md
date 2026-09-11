@@ -27,6 +27,12 @@ The AV1 preset was retuned on 2026-09-10 after AV1 came out bigger than the H.26
 
 ## Presets
 
+> **Superseded for the desktop clip queue.** These are the raw command shapes and the AMF
+> quantizer-scale warning, which still hold. What the app actually runs is chosen by the
+> Settings quality level and the CPU/GPU engine picker — see "The presets, and how they were
+> chosen" below, which supersedes the single hardware preset this section describes. The recap
+> worker in phase 5 still uses the shapes here directly.
+
 Measured on the dev machine (RX 9060 XT, Ryzen 5 5500) on a 28 s 1080p60 clip: `av1_amf` 7 s,
 `libsvtav1 -preset 8` 13 s.
 
@@ -125,6 +131,85 @@ on their native 0-51 scales, stay behind `probe_encoders`, and want the same tre
 machine that has them. Audio is excluded from every size above (the sources here carry AAC that
 both branches re-encode); in production add roughly 0.5 MB per 30 s for Opus 128k and 0.6 MB for
 AAC 160k.
+
+## The presets, and how they were chosen
+
+Measured 2026-09-11 with `apps/desktop/scripts/bench-encoders.mjs`, which is committed and
+resumable — run it on any new machine rather than trusting the numbers below. Corpus: three real
+1080p60 captures off this machine's replay buffer, chosen to span difficulty rather than to
+flatter anything.
+
+| clip | content | why it is in the corpus |
+|---|---|---|
+| easy | desktop and a browser, 26.4 s | nearly static; flatters AV1 |
+| medium | Wardogs, 29.7 s | ordinary gameplay |
+| hard | Wardogs high motion, 28.3 s | the clip that produced a 56 MB AV1 and started this |
+
+Five findings, in the order they change decisions:
+
+1. **`libsvtav1` beats `av1_amf` decisively, and AMD's AV1 barely beats AMD's own H.264.** On
+   the hard clip at matched size, `libsvtav1 p6 crf 40` scored **93.43 at 30.6 MB** where
+   `h264_amf` scored 88.54 at 30.8 MB and `av1_amf` interpolates to roughly 89.3. Hardware AV1
+   is the *fast* option, not the good one. Encoding runs after the game exits, so software is
+   the default.
+2. **A bitrate ceiling is a terrible way to reach a size.** Clamping crf 34 to 5 Mbps gave 85.21
+   at 17.0 MB; simply asking for crf 46 with no clamp at all gave **90.94 at 20.3 MB**. Pick the
+   CRF for the quality you want and set `-maxrate` as a safety net that ordinary clips never
+   touch. Every shipped level is capped CRF in that spirit.
+3. **SVT preset only matters when the ceiling binds.** At a 5 Mbps cap, p8 → p6 → p4 went
+   77.90 → 83.13 → 85.21. Where the cap never engages all three land within 0.1 VMAF. Since
+   the shipped ceilings are set not to bind, **preset 6** is the choice: p4 would double the
+   encode time to buy almost nothing.
+4. **AMF's quality-VBR modes are worse than its own plain cqp.** `av1_amf -rc qvbr 28 @5M`
+   scored 86.82 at 31.1 MB against cqp 128's 88.22 at 26.9 MB, and `h264_amf -rc qvbr 24 @8M`
+   collapsed to 77.26. Do not reach for qvbr on AMF. That is also why the GPU path has no
+   ceiling at all: there is no usable capped mode, so choosing the graphics card means giving
+   up predictable sizes.
+5. **A 5 s GOP is worth about 2 VMAF under a binding cap** (85.55 against 83.13 at 5 Mbps, for
+   7 percent more size). Not applied: `-g 120` keeps seeking and phase 6 trimming cheap, and
+   the effect disappears once the ceiling stops binding. Worth revisiting if trimming moves to
+   stream copy.
+
+What ships, per level, all `libsvtav1 -preset 6` plus `libx264 -preset medium`:
+
+| level | AV1 | H.264 |
+|---|---|---|
+| Smaller files | `-crf 46 -maxrate 8M` | `-crf 26 -maxrate 8M` |
+| Balanced (default) | `-crf 40 -maxrate 12M` | `-crf 22 -maxrate 12M` |
+| Best quality | `-crf 34 -maxrate 20M` | `-crf 19 -maxrate 20M` |
+
+Measured at Balanced against what shipped before (`av1_amf` cqp 95 and `h264_amf` 8M vbr_peak):
+
+| clip | AV1 before | AV1 after | H.264 before | H.264 after | total bytes |
+|---|---|---|---|---|---|
+| easy | 2.4 MB / 95.77 | 2.7 MB / **97.26** | 7.7 MB / 97.23 | **4.1 MB** / 96.21 | −33% |
+| medium | 1.2 MB / 94.50 | 5.6 MB / **96.96** | 14.5 MB / 97.11 | **6.8 MB** / 96.50 | −21% |
+| hard | 53.2 MB / 94.02 | **25.9 MB** / 91.84 | 30.8 MB / 88.54 | 36.4 MB / **92.81** | −26% |
+
+Storage drops 21-33 percent everywhere. The hard clip's AV1 halves, which was the presenting
+problem. The H.264 copy drops by about half on ordinary clips and gains 4.3 VMAF on the hard
+one, which matters more than it looks — see below.
+
+**Do not tune the H.264 copy as an afterthought.** `og:video` on the player page points at it,
+so Discord's inline player streams H.264 to every viewer in the server and never touches the
+AV1 file. Confirmed 2026-09-11 from a live embed object:
+
+```json
+"video": { "url": ".../clips/<id>/h264",
+           "proxy_url": "https://images-ext-1.discordapp.net/external/.../h264" }
+```
+
+So the H.264 copy is the hot path and the AV1 is the archive. The old preset had this backwards:
+a bitrate target that wasted bits on easy clips (7.7 MB where AV1 needed 3.1 MB for a better
+score) and starved on hard ones.
+
+A related trap: **do not shrink clips to fit Discord's 10 MB attachment limit.** The bare-link
+path already gets a native inline player at full quality with no size cap (see the discord-bot
+skill), so trading quality for attachability buys nothing.
+
+**NVENC and QSV are still unmeasured.** This is an AMD machine. Their rows in `av1_args` and
+`h264_args` carry numbers inferred from their own 0-51 scales and stay behind `probe_encoders`.
+They are also only reachable by choosing the graphics card in Settings, which is not the default.
 
 ### cqp is constant quality, so AV1 is not always the smaller file
 
