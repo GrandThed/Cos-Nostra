@@ -94,7 +94,11 @@ pub struct Me {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewClipUpload {
+    /// Omitted rather than sent as null: the backend takes either now, but an older one
+    /// rejects a null on an optional field and fails the whole upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub game: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub duration_ms: i64,
     pub width: u32,

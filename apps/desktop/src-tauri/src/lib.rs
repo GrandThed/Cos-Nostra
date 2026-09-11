@@ -837,6 +837,20 @@ fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedG
 // ---------------------------------------------------------------------------
 // Saving
 
+/// The game libobs currently has hooked, shaped like a foreground detection so the two are
+/// interchangeable at save time. Used only when the foreground window is not itself a game.
+fn hooked_game_as_detected(state: &State<AppState>) -> Option<games::DetectedGame> {
+    let hooked = state.hooked_game.lock().unwrap().clone()?;
+    let game = games::name_for(&hooked.executable, &hooked.title)?;
+    let confident = games::is_known(&hooked.executable);
+    Some(games::DetectedGame {
+        game,
+        executable: hooked.executable,
+        title: hooked.title,
+        confident,
+    })
+}
+
 fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
     let state = app.state::<AppState>();
     let (notify, sound) = {
@@ -854,10 +868,14 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
         Ok(path) => {
             log::info!("clip saved: {}", path.display());
             // The game is still focused right now; look before the toast steals attention.
-            let detected = games::detect_foreground();
+            // Falling back to the hooked game matters more than it looks: the hotkey is
+            // global, so a clip can be saved while the game is running but not focused
+            // (alt-tabbed, a second monitor, an overlay), and the foreground window alone
+            // would then label real gameplay as nothing at all.
+            let detected = games::detect_foreground().or_else(|| hooked_game_as_detected(&state));
             match &detected {
-                Some(d) => log::info!("foreground game: {} ({})", d.game, d.executable),
-                None => log::info!("no game in the foreground"),
+                Some(d) => log::info!("game for this clip: {} ({})", d.game, d.executable),
+                None => log::info!("no game detected for this clip"),
             }
             let queue_app = app.clone();
             let queue_path = path.clone();

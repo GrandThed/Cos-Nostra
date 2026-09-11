@@ -51,6 +51,12 @@ pub fn name_for(executable: &str, title: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// True when the executable is in the known-games table, i.e. the name is not a guess made
+/// from a window title. Mirrors what `detect_foreground` puts in `DetectedGame::confident`.
+pub fn is_known(executable: &str) -> bool {
+    table_lookup(executable).is_some()
+}
+
 fn table_lookup(executable: &str) -> Option<&'static str> {
     let executable = executable.trim();
     if executable.is_empty() {
