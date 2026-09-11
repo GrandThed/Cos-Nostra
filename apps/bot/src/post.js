@@ -1,16 +1,18 @@
 // Posts one clip to every configured guild channel and records the resulting message ids
 // with the backend.
 //
-// The attachment-vs-embed decision is made per guild, not per clip: the upload limit is a
+// The attachment-vs-link decision is made per guild, not per clip: the upload limit is a
 // property of the guild's boost tier, so the same clip can go up as a playable attachment
-// in a boosted guild and as a thumbnail embed with a player link everywhere else.
+// in a boosted guild and as a link everywhere else. Both paths play inline — the link path
+// relies on Discord unfurling the player page into a native video embed, which is why this
+// module never sends an embed of its own. See messageContent().
 //
 // Failure policy: a single guild never takes the whole post down. A channel that cannot be
 // fetched, a download that fails, a backend write that errors, an emoji the bot may not
 // use - all are logged and the loop moves on. Only data the whole post depends on (the clip
 // itself, the guild list) rejects, so the caller's retry queue can replay the entire post.
 
-import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
+import { AttachmentBuilder } from 'discord.js';
 
 const MB = 1024 * 1024;
 
@@ -40,7 +42,6 @@ export function uploadLimitBytes(premiumTier) {
 // too, so only attach a file that is comfortably under it.
 const SIZE_MARGIN = 0.95;
 
-const EMBED_COLOR = 0x5865f2;
 const MAX_CONTENT = 2000;
 const MAX_TITLE = 256;
 
@@ -71,61 +72,27 @@ function attachmentName(clip) {
   return base === id ? `${id}.mp4` : `${base}-${id}.mp4`;
 }
 
-/**
- * `0:27`, `1:05` or `1:02:03`. Null when the duration is missing or nonsense so callers can
- * leave the field out.
- * @param {number | null | undefined} ms
- */
-function formatDuration(ms) {
-  if (ms === null || ms === undefined) return null;
-  const total = Math.round(Number(ms) / 1000);
-  if (!Number.isFinite(total) || total < 0) return null;
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
-  const pad = (n) => String(n).padStart(2, '0');
-  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
-}
-
 /** @param {Clip} clip */
 function clipTitle(clip) {
   return truncate(clip.title || clip.game || 'Clip', MAX_TITLE);
 }
 
 /**
- * Message text, used on both paths. The player link goes in the content because mobile
- * clients collapse embeds, and it is wrapped in angle brackets so Discord does not add a
- * second, unstyled preview of the same page beside the attachment or our own embed.
+ * Message text, used on both paths.
+ *
+ * On the link path the URL is left bare on purpose: Discord turns the player page into a
+ * native `type=video` embed from its og:video tags, and that preview is the only way to get
+ * an inline player for a clip too big to attach. Wrapping the URL in angle brackets
+ * suppresses the preview, so it is only wrapped when a real attachment is already playing
+ * inline and a second player would be noise.
  * @param {Clip} clip
+ * @param {{ unfurl: boolean }} opts  unfurl: let Discord build its video preview
  */
-function messageContent(clip) {
+function messageContent(clip, { unfurl }) {
   const who = clip.owner?.username;
   const head = who ? `${clipTitle(clip)} - ${who}` : clipTitle(clip);
-  return truncate(`${head}\n<${clip.urls.page}>`, MAX_CONTENT);
-}
-
-/** @param {Clip} clip */
-function buildEmbed(clip) {
-  const embed = new EmbedBuilder()
-    .setColor(EMBED_COLOR)
-    .setTitle(clipTitle(clip))
-    .setURL(clip.urls.page)
-    .setImage(clip.urls.thumb)
-    .setFooter({ text: 'Cos Nostra' });
-
-  if (clip.owner?.username) embed.setAuthor({ name: clip.owner.username });
-
-  const fields = [];
-  if (clip.game) fields.push({ name: 'Game', value: String(clip.game), inline: true });
-  const duration = formatDuration(clip.durationMs);
-  if (duration) fields.push({ name: 'Duration', value: duration, inline: true });
-  if (fields.length > 0) embed.addFields(...fields);
-
-  // recordedAt arrives as a JSON date string; skip it rather than send an Invalid Date.
-  const recorded = clip.recordedAt ? Date.parse(clip.recordedAt) : NaN;
-  if (Number.isFinite(recorded)) embed.setTimestamp(new Date(recorded));
-
-  return embed;
+  const link = unfurl ? clip.urls.page : `<${clip.urls.page}>`;
+  return truncate(`${head}\n${link}`, MAX_CONTENT);
 }
 
 /**
@@ -215,7 +182,7 @@ export function createPoster({
           `clip ${clip.id}: attaching ${size} B in guild ${config.guildId} (tier ${tier}, limit ${limit} B)`,
         );
         return {
-          content: messageContent(clip),
+          content: messageContent(clip, { unfurl: false }),
           files: [new AttachmentBuilder(bytes, { name: attachmentName(clip) })],
         };
       } catch (err) {
@@ -229,7 +196,12 @@ export function createPoster({
         `clip ${clip.id}: ${size} B over the ${limit} B limit of guild ${config.guildId} (tier ${tier}), posting an embed`,
       );
     }
-    return { content: messageContent(clip), embeds: [buildEmbed(clip)] };
+    // Deliberately no embeds[]: Discord drops the link preview on any message that carries
+    // an embed of its own, and that preview is what holds the video player. Measured on
+    // 2026-09-11 — a rich embed plus a bare URL produced one `type=rich` embed and no
+    // player, while the URL alone produced `type=video` at 1920x1080. The page's og: tags
+    // already supply the title, owner, game, duration and thumbnail, so nothing is lost.
+    return { content: messageContent(clip, { unfurl: true }) };
   }
 
   /**

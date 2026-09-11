@@ -224,31 +224,26 @@ test('a 27 MB clip in a tier 0 guild is posted as an embed with the player link'
   const posted = await poster.postClip('clip1');
 
   assert.equal(posted.length, 1);
-  assert.deepEqual(fetchStub.calls, [], 'the embed path must not download the video');
+  assert.deepEqual(fetchStub.calls, [], 'the link path must not download the video');
   const payload = channel.sent[0];
   assert.equal(payload.files, undefined);
-  assert.equal(payload.embeds.length, 1);
+  // No embed of our own: Discord drops the link preview on any message that carries one,
+  // and that preview is the video player. This is the whole point of the link path.
+  assert.equal(payload.embeds, undefined, 'an embed here would suppress Discord’s player');
   assert.ok(
     payload.content.includes(clip.urls.page),
-    `content ${JSON.stringify(payload.content)} must carry the player URL for collapsed embeds`,
+    `content ${JSON.stringify(payload.content)} must carry the player URL`,
   );
-  const embed = payload.embeds[0].toJSON();
-  assert.equal(embed.title, 'Ace on Ascent');
-  assert.equal(embed.url, clip.urls.page);
-  assert.equal(embed.image.url, clip.urls.thumb);
-  assert.equal(embed.author.name, 'benja');
-  assert.ok(embed.footer.text);
-  assert.deepEqual(
-    embed.fields.map((f) => [f.name, f.value]),
-    [
-      ['Game', 'Valorant'],
-      ['Duration', '0:27'],
-    ],
+  assert.ok(
+    !payload.content.includes(`<${clip.urls.page}>`),
+    'the URL must not be wrapped in angle brackets, which suppresses the preview',
   );
+  assert.ok(payload.content.includes('Ace on Ascent'), 'content still names the clip');
+  assert.ok(payload.content.includes('benja'), 'content still names the owner');
 });
 
 test('the safety margin keeps a clip just under the raw limit off the attachment path', async () => {
-  // 9.8 MB is under the 10 MB tier 0 limit but over the 95% margin, so it must embed.
+  // 9.8 MB is under the 10 MB tier 0 limit but over the 95% margin, so it must go as a link.
   const clip = makeClip({ sizeH264: Math.round(9.8 * MB) });
   const channel = makeChannel({ channelId: 'c1', guildId: 'g1', premiumTier: 0 });
   const backend = makeBackend({ clip, guilds: [{ guildId: 'g1', channelId: 'c1', seedEmojis: [] }] });
@@ -258,7 +253,8 @@ test('the safety margin keeps a clip just under the raw limit off the attachment
   await poster.postClip('clip1');
 
   assert.equal(channel.sent[0].files, undefined);
-  assert.equal(channel.sent[0].embeds.length, 1);
+  assert.equal(channel.sent[0].embeds, undefined);
+  assert.ok(channel.sent[0].content.includes(clip.urls.page));
   assert.deepEqual(fetchStub.calls, []);
 });
 
@@ -410,7 +406,8 @@ test('a failed H.264 download falls back to the embed instead of losing the post
 
   assert.deepEqual(posted, [{ guildId: 'g1', channelId: 'c1', messageId: 'm1' }]);
   assert.equal(channel.sent[0].files, undefined);
-  assert.equal(channel.sent[0].embeds.length, 1);
+  assert.equal(channel.sent[0].embeds, undefined);
+  assert.ok(channel.sent[0].content.includes(clip.urls.page));
   assert.ok(log.lines.warn.some((l) => l.includes('502')));
 });
 
@@ -441,13 +438,13 @@ test('the same clip attaches in a tier 3 guild and embeds in a tier 0 guild', as
   assert.equal(tier3.sent[0].files[0].name, 'clip1.mp4');
   assert.equal(tier3.sent[0].embeds, undefined);
 
+  // The tier 0 guild gets the bare player link so Discord can build the video preview,
+  // while the tier 3 guild's attachment keeps its link wrapped to avoid a second player.
   assert.equal(tier0.sent[0].files, undefined);
-  const embed = tier0.sent[0].embeds[0].toJSON();
-  assert.equal(embed.title, 'Clip');
-  assert.deepEqual(
-    embed.fields.map((f) => [f.name, f.value]),
-    [['Duration', '1:02:03']],
-  );
+  assert.equal(tier0.sent[0].embeds, undefined);
+  assert.ok(tier0.sent[0].content.includes(clip.urls.page));
+  assert.ok(!tier0.sent[0].content.includes(`<${clip.urls.page}>`));
+  assert.ok(tier3.sent[0].content.includes(`<${clip.urls.page}>`));
 });
 
 test('no configured guilds is a no-op', async () => {

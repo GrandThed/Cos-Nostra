@@ -96,12 +96,11 @@ export default async function playerRoutes(app) {
     const h264 = media(clip.id, 'h264');
     const thumb = media(clip.id, 'thumb');
     const pageUrl = `${app.config.PUBLIC_URL}/c/${encodeURIComponent(clip.id)}`;
-    const description = [
-      clip.username,
-      clip.game,
-      formatDuration(clip.durationMs),
-      `${reactionCount} reaction${reactionCount === 1 ? '' : 's'}`,
-    ]
+    // No reaction count in here. Discord caches an embed when it first crawls the page and
+    // does not re-crawl as votes come in, so a count baked into og:description would freeze
+    // at whatever it was seconds after posting - almost always "0 reactions". The page body
+    // below shows the live count instead.
+    const description = [clip.username, clip.game, formatDuration(clip.durationMs)]
       .filter(Boolean)
       .join(' · ');
 
