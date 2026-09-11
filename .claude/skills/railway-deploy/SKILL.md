@@ -108,7 +108,7 @@ RAILWAY_DOCKERFILE_PATH  apps/bot/Dockerfile
 DISCORD_TOKEN            bot token from the Discord application
 DISCORD_CLIENT_ID        same application
 BOT_SHARED_SECRET        identical string to the backend's, byte for byte
-BACKEND_URL              http://<backend internal hostname>:<backend $PORT>
+BACKEND_URL              https://cosnostra.benja.ar   (public; see the section below)
 BOT_PORT                 3001   (phase 4, internal HTTP server for /post and /health)
 ```
 
@@ -117,6 +117,44 @@ Only `DISCORD_TOKEN` is read today; the rest are staged for phase 4. The bot val
 Note `BOT_PORT`, not `PORT`: the repo-root `.env` is shared by both apps and `PORT=3000` is already the backend's.
 
 **The port in `BACKEND_URL` is not 3000 in production.** `apps/backend/src/index.js` binds `config.PORT`, and on Railway that is the injected `PORT` (8080 in practice), not the 3000 from `.env.example` or the Dockerfile `EXPOSE`. Private networking does no port mapping, so the bot must dial the port the backend actually listened on. Read it off the backend deploy log line `Server listening at http://0.0.0.0:<port>` and use that number. Locally it really is 3000.
+
+## The bot cannot reach the backend
+
+Symptom: a slash command answers "Could not reach the Cos Nostra backend", and the bot service
+log says `[error] /clips setup failed: TypeError: fetch failed`.
+
+`fetch failed` is a **connection** failure, not an HTTP status: nothing answered at that address.
+It is not a secret problem and not a permissions problem. The two causes seen here:
+
+- **The port.** `apps/backend/src/index.js` binds `config.PORT`, which on Railway is the injected
+  `PORT` (8080 in practice), not the 3000 in `.env.example` or the Dockerfile `EXPOSE`. Private
+  networking does no port mapping, so the bot must dial the port the backend actually listened
+  on — read it from the backend deploy log line `Server listening at http://0.0.0.0:<port>`.
+- **The hostname.** Railway generates service names, so `backend.railway.internal` is usually
+  wrong. Read the real one off the Networking panel of that service.
+
+The reliable fix, and what is set today, is to point `BACKEND_URL` at the **public** URL
+`https://cosnostra.benja.ar`. The bot only ever sends JSON to the backend, so the egress is
+negligible, and it sidesteps both traps. Moving it back onto the private network is an
+optimisation rather than a requirement, and it has to be verified against that log line.
+
+## Never run two bots on one token
+
+The most expensive trap in this project so far, because the evidence is split across two machines
+and each half looks like a different bug.
+
+A local `npm start -w apps/bot` while the Railway service is deployed means **two gateway
+connections on the same `DISCORD_TOKEN`**. Discord delivers every interaction to both. The loser
+logs `DiscordAPIError[40060]: Interaction has already been acknowledged` on its first
+`deferReply`, and the user sees whatever the *winner* replied, which may be an error that appears
+nowhere in the logs you are reading. Clips also post twice and every reaction is written twice.
+
+**The tell: a reply the running process never logged means another instance answered it.**
+
+Before debugging a command that misbehaves, make sure exactly one instance is running. Pause the
+Railway service to test locally, or stop the local one to test the deployed one. Kill the `node`
+process whose command line contains `apps/bot`; stopping the `npm` wrapper alone can leave the
+child alive and still connected.
 
 ## The empty-string trap
 

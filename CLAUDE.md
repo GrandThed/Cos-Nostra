@@ -58,9 +58,10 @@ Toolchain on the dev machine: Rust stable MSVC, Node 24, ffmpeg 9 (`ffmpeg`/`ffp
 - Clip metadata lives in `%APPDATA%\Cos Nostra\clips.db` (SQLite, WAL). Delete it together with the `*.av1.mp4`, `*.h264.mp4` and `*.jpg` files next to the clips to start over.
 - Never create or drop a `reqwest::blocking` client inside an `async` Tauri command: tokio panics ("Cannot drop a runtime in a context where blocking is not allowed") and the poisoned mutexes take the app down. Wrap the body in `tauri::async_runtime::spawn_blocking` or use a plain thread, as `start_login` and `logout` do.
 - The backend runs locally without Postgres: `DATABASE_URL=pglite://./data/dev`. Point the desktop at it through the Backend URL field in Settings (`http://localhost:3000`), and register `http://localhost:3000/auth/discord/callback` as a redirect in the Discord app if you want the login to complete locally.
+- Never run `npm start -w apps/bot` while the Railway bot service is deployed: two gateway connections on one `DISCORD_TOKEN` both receive every interaction, so clips post twice, reactions are written twice, and the loser logs `Interaction has already been acknowledged` while the user sees a reply that appears in no log you are reading. See the `discord-bot` skill.
 - A dev build uploads to **production**: `settings.rs` defaults `backend_url` to `https://cosnostra.benja.ar`, and `auto_upload` defaults on, so linking Discord in `tauri dev` sends every already-encoded clip in the queue to the real bucket, oldest first. Before testing the queue, either uncheck "Upload clips automatically" in Settings or point Backend URL at `http://localhost:3000`. Clips that got up by accident come down with `DELETE /clips/:id` using the device token.
 - The exe links `obs.dll` at load time. The installer ships the bootstrapper's dummy from `src-tauri/resources/obs-dummy.dll` and installs per user into `%LOCALAPPDATA%\Cos Nostra` because the real runtime is extracted next to the exe on first launch.
 
 ## Skills
 
-Project skills live in `.claude/skills/`: `run-desktop`, `libobs-api`, `video-encoding`, `railway-deploy`. Use them instead of rediscovering the workflow.
+Project skills live in `.claude/skills/`: `run-desktop`, `libobs-api`, `video-encoding`, `railway-deploy`, `discord-bot`. Use them instead of rediscovering the workflow.

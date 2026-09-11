@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-10. Phases 1, 2 and 3 are done and verified on an AMD RX 9060 XT; the backend is live at https://cosnostra.benja.ar. Phase 4 is next.
+Last updated 2026-09-11. Phases 1, 2 and 3 are done and verified on an AMD RX 9060 XT. The backend and the bot are both live on Railway; phase 4 is built and deployed with its acceptance test part-run (see the phase for exactly what is left). Phases 5 and 6 have not started.
 
 ## 1. What we are building
 
@@ -195,22 +195,53 @@ Deployment: one Railway service built from `apps/backend/Dockerfile` with the re
 
 Acceptance: from a clean install, a user logs in through Discord, a clip uploaded from the desktop app opens in the browser at its player URL on desktop and on a phone.
 
-### Phase 4. Discord bot. Two weeks.
+### Phase 4. Discord bot. Built and deployed 2026-09-11, acceptance test part-run.
 
 Goal: clips show up in Discord and every reaction is counted.
 
-Tasks:
+Both services are live on Railway and the bot is in the dev guild (FAMAFIA,
+`438477166573912074`) with `/clips` registered guild-scoped.
 
-- Gateway intents: Guilds, GuildMessages, GuildMessageReactions. Partials for Message and Reaction so reactions on old messages still arrive.
-- Slash commands registered per guild: `/clips setup` to choose the clip channel, `/clips latest`, `/clips top [year] [game]`, `/clips mine`, `/clips link` to get a device login link.
-- Posting: an internal HTTP server inside the bot, `POST /post`, called by the backend after upload. Fetch the guild's upload limit from the API. If the H.264 file fits, upload it as an attachment so it plays inline. Otherwise send an embed with the thumbnail, the game, the owner, and a link to the player page.
-- Reaction tracking: on add or remove, if the message id belongs to a post, write the vote to the backend. Bot's own reactions are ignored. Count each user once per emoji.
-- Seed reactions: after posting, the bot adds two or three configured emojis so people can click instead of searching.
-- Resilience: the bot keeps a local queue for backend writes and retries so a backend deploy never loses votes.
+What is verified:
 
-Deployment: Railway service `bot`, root directory `apps/bot`, env vars `DISCORD_TOKEN`, `BACKEND_URL`, `BOT_SHARED_SECRET`.
+- The bot logs in, serves `GET /health` and `POST /post` on `BOT_PORT`, and rejects a wrong
+  shared secret with 401 in constant time.
+- `POST /post` posts a real clip to the configured channel and records the message through
+  `POST /internal/posts`, with the seed emojis added. Driven by hand with the exact body the
+  backend's `notifyBot` sends.
+- `/clips setup channel:#clips` writes `guild_settings` from Discord.
+- 98 bot tests and 28 backend tests, none of which touch a gateway or a network.
 
-Acceptance: upload a clip from the desktop app and see it in the channel within seconds. React, remove the reaction, react again, and `/clips top` reflects the final count.
+What is **not** verified yet, and is the first thing a next session should finish:
+
+- Reaction tracking end to end. Nobody has reacted to a real post yet, so the add / remove /
+  re-add path and `/clips top` have only been exercised against fakes.
+- The automatic path: a desktop upload calling `notifyBot`, which needs `BOT_INTERNAL_URL` set
+  on the backend service. Every post so far was triggered by hand.
+- `/clips latest`, `/clips mine` and `/clips link` have never been run in Discord.
+
+What changed from the plan and why:
+
+- Posting sends **no embed of its own**. Discord suppresses the link preview on any message
+  that carries an embed, and that preview is what holds the video player, so a clip too large
+  to attach used to appear as a static thumbnail. Posting the bare player URL instead makes
+  Discord build a native `type=video` embed at 1920x1080 from the page's og: tags: an inline
+  player at full quality with no size limit. The measurements are in the discord-bot skill.
+  The attachment path still suppresses the preview, since the file already plays inline.
+- Consequently `og:description` in `routes/player.js` carries no reaction count: Discord caches
+  an embed on first crawl and never re-crawls, so the count would freeze at zero.
+- A clip is posted to **every** configured guild, one `posts` row each, which is what
+  `posts.guild_id` always implied. Restricting it to guilds the owner belongs to is future work.
+- `guild_settings` (guild id, channel, seed emojis) plus `GET`/`PUT /internal/guilds` were added
+  to the backend; the plan never said where `/clips setup` would keep its channel.
+- `/clips setup` is gated on Manage Guild at runtime rather than with
+  `setDefaultMemberPermissions`, which Discord only accepts on a top-level command and which
+  would have hidden `latest`, `top`, `mine` and `link` from ordinary members.
+- The reaction outbox is in-memory. A crash loses the backlog; the plan's "local queue" was not
+  specified as durable and nothing yet justifies a file or a table.
+
+Acceptance: upload a clip from the desktop app and see it in the channel within seconds. React,
+remove the reaction, react again, and `/clips top` reflects the final count.
 
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
