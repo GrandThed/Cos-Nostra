@@ -328,6 +328,20 @@ impl Queue {
         Ok(row)
     }
 
+    /// Forgets the local AV1 and H.264 outputs of a clip whose files the caller removed. The
+    /// row, its thumbnail, its recorded sizes and its upload link stay, so the clip is still
+    /// listed and still watchable through the site; `av1_path` being null is how the UI knows
+    /// there is nothing left here to open. Only ever called for clips the backend has.
+    pub fn clear_local_video(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET av1_path = NULL, h264_path = NULL, updated_at = ?2 WHERE id = ?1",
+            params![id, now_rfc3339()],
+        )
+        .with_context(|| format!("clearing local video of clip {id}"))?;
+        Ok(())
+    }
+
     pub fn set_game(&self, id: i64, game: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -433,7 +447,7 @@ impl Queue {
         self.mark_failed_in(id, Stage::Upload, error)
     }
 
-    fn mark_encoded(&self, id: i64, out: &Outputs) -> Result<()> {
+    pub(crate) fn mark_encoded(&self, id: i64, out: &Outputs) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE clips SET status = 'encoded', error = NULL, next_attempt_at = NULL, \
@@ -454,7 +468,7 @@ impl Queue {
     }
 
     /// Records an encode failure, bumps attempts and schedules the next try (or none at the cap).
-    fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
+    pub(crate) fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
         self.mark_failed_in(id, Stage::Encode, error)
     }
 

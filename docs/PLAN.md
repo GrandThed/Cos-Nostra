@@ -267,6 +267,38 @@ Deferred, with reasons:
   on add and remove, and the dev guild had no animated emoji to click.
 
 
+### Storage tab. Done 2026-09-11.
+
+Not in the original plan. It exists because the clipper never deleted anything: the replay
+buffer writes about 20 Mbps and every original recording stayed on disk next to its own AV1
+copy, which is roughly a tenth of the size. A month of use is tens of gigabytes, most of it
+footage that has already been encoded and uploaded.
+
+- `storage.rs` owns the file layout (`output_paths`, `clip_files`, moved out of `lib.rs`) and
+  answers `storage_stats`: total bytes, a split by kind, a per-game breakdown for the bar, a
+  published-versus-local split, what each cleanup would free, and free space on the volume.
+  Every number is a fresh `stat`, never the sizes recorded at encode time, because files move
+  and get deleted outside the app.
+- Three cleanups, each behind a confirming second click: drop the original recordings of clips
+  that already encoded; release the local video of clips the backend already has; delete failed
+  clips outright. Leftover files in the folder that no row claims are counted and named but
+  never deleted, since they are not ours.
+- Two settings, both off by default so nothing changes for an existing install:
+  `delete_source_after_encode` and `storage_limit_gb`. The limit is enforced from the queue's
+  status-change callback, and only ever gives up clips the backend has, so it can leave the
+  folder over the limit rather than deleting the only copy of something. The tab says so when
+  that happens.
+
+What changed from what one might expect:
+
+- Releasing a published clip keeps the row, the thumbnail and the page URL, and only nulls
+  `av1_path` and `h264_path`. The clip stays in the Clips tab reading "on the site only" with
+  its Copy link button; no schema change was needed, since a null output path already meant
+  "no local file". Deleting the row instead would have thrown away the link.
+- The database lives in `%APPDATA%` and the clips in Videos, which the first version of the
+  tests did not reproduce: the SQLite WAL files landed in the clip folder and were counted as
+  leftovers. The fixture now keeps them apart the way the app does.
+
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
 Goal: once a year the bot posts a compilation of the best clips.

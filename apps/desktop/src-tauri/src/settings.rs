@@ -8,6 +8,9 @@ pub const MAX_BUFFER_SECONDS: i64 = 300;
 pub const MIN_BITRATE_KBPS: u32 = 2_000;
 pub const MAX_BITRATE_KBPS: u32 = 60_000;
 pub const DEFAULT_BACKEND_URL: &str = "https://cosnostra.benja.ar";
+/// Upper bound for the clip folder budget. Well past any plausible disk, and only here so a
+/// typo cannot ask for a limit that overflows the byte arithmetic.
+pub const MAX_STORAGE_LIMIT_GB: u32 = 100_000;
 
 /// How much the encoder is allowed to spend on a clip.
 ///
@@ -88,6 +91,13 @@ pub struct Settings {
     pub account: Option<Account>,
     /// Upload every encoded clip without asking.
     pub auto_upload: bool,
+    /// Delete the original replay-buffer recording once both encoder outputs exist. The buffer
+    /// writes about ten times what the AV1 copy costs, so this is where the disk goes. Off by
+    /// default because the original is the best source for a future re-encode or trim.
+    pub delete_source_after_encode: bool,
+    /// Keep the clip folder under this many gigabytes, 0 for no limit. Enforced by dropping the
+    /// local video of the oldest clips the backend already has, never anything only stored here.
+    pub storage_limit_gb: u32,
 }
 
 impl Default for Settings {
@@ -113,6 +123,8 @@ impl Default for Settings {
             device_token: None,
             account: None,
             auto_upload: true,
+            delete_source_after_encode: false,
+            storage_limit_gb: 0,
         }
     }
 }
@@ -177,6 +189,9 @@ impl Settings {
         }
         if self.hotkey.trim().is_empty() {
             anyhow::bail!("hotkey must not be empty");
+        }
+        if self.storage_limit_gb > MAX_STORAGE_LIMIT_GB {
+            anyhow::bail!("storage limit must be at most {MAX_STORAGE_LIMIT_GB} GB");
         }
         validate_backend_url(&self.backend_url)?;
         Ok(())
@@ -254,6 +269,20 @@ mod tests {
         assert!(!s.auto_upload);
         assert_eq!(s.quality, Quality::Balanced);
         assert_eq!(s.encode_engine, EncodeEngine::Cpu);
+        // The storage settings arrived later still, and both defaults mean "behave as before".
+        assert!(!s.delete_source_after_encode);
+        assert_eq!(s.storage_limit_gb, 0);
+    }
+
+    #[test]
+    fn the_storage_limit_is_range_checked() {
+        let ok = Settings { storage_limit_gb: 500, ..Default::default() };
+        ok.validate().unwrap();
+        let absurd = Settings {
+            storage_limit_gb: MAX_STORAGE_LIMIT_GB + 1,
+            ..Default::default()
+        };
+        assert!(absurd.validate().is_err());
     }
 
     #[test]

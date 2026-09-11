@@ -10,8 +10,8 @@
       html, body { height: 100%; }
       body { margin: 0; padding: 12px 16px; box-sizing: border-box; overflow-y: auto; }
       h1 { font-size: 16px; margin: 0; }
-      header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-      nav button { background: none; border: none; padding: 4px 8px; font: inherit; cursor: pointer; opacity: 0.6; border-bottom: 2px solid transparent; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+      nav button { background: none; border: none; padding: 4px 7px; font: inherit; cursor: pointer; opacity: 0.6; border-bottom: 2px solid transparent; }
       nav button[aria-selected="true"] { opacity: 1; border-bottom-color: currentColor; }
       section[hidden] { display: none; }
       .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid #8884; }
@@ -53,6 +53,25 @@
       .badge.failed { border-color: #d33; background: #d3333322; cursor: help; }
       #clips_empty { opacity: 0.6; padding: 12px 0; }
       .clip .link { font-family: ui-monospace, monospace; font-size: 11px; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* Storage tab. The two bars are the whole point of the page, so they get the space. */
+      .sub { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6; margin: 16px 0 4px; font-weight: 600; }
+      #storage_head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+      #storage_total { font-size: 22px; font-weight: 600; line-height: 1.1; }
+      .bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: #8883; margin: 8px 0 6px; }
+      .bar span { display: block; height: 100%; min-width: 1px; }
+      .legend-row { display: grid; grid-template-columns: 1fr max-content max-content; gap: 10px; align-items: center; padding: 3px 0; border-bottom: 1px solid #8882; font-size: 12px; }
+      .legend-row .name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+      .legend-row .name em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .legend-row .n { font-size: 11px; opacity: 0.6; white-space: nowrap; }
+      .legend-row .b { font-family: ui-monospace, monospace; text-align: right; min-width: 64px; }
+      .swatch { display: block; width: 9px; height: 9px; border-radius: 2px; flex: none; }
+      .clean-row { display: grid; grid-template-columns: 1fr max-content max-content; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #8884; }
+      .clean-row .what { min-width: 0; font-size: 13px; }
+      .clean-row .what small { display: block; opacity: 0.65; font-size: 11px; }
+      .clean-row .b { font-family: ui-monospace, monospace; font-size: 12px; }
+      .clean-row button { padding: 3px 8px; font-size: 11px; }
+      .clean-row[data-empty="true"] { opacity: 0.5; }
+      #storage_kinds { margin-top: 6px; }
       /* Account block in Settings. */
       fieldset { grid-column: 1 / -1; border: 1px solid #8884; border-radius: 4px; padding: 8px 10px; margin: 4px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }
       legend { font-size: 12px; opacity: 0.7; padding: 0 4px; }
@@ -65,6 +84,7 @@
       <nav role="tablist">
         <button id="tab-status" role="tab" aria-selected="true">Status</button>
         <button id="tab-clips" role="tab" aria-selected="false">Clips</button>
+        <button id="tab-storage" role="tab" aria-selected="false">Storage</button>
         <button id="tab-settings" role="tab" aria-selected="false">Settings</button>
       </nav>
     </header>
@@ -91,6 +111,50 @@
       <div id="clips_error" class="banner err"></div>
       <div id="clips"></div>
       <div id="clips_empty" hidden>No clips yet. Press the hotkey while playing.</div>
+    </section>
+
+    <section id="panel-storage" hidden>
+      <div id="storage_error" class="banner err"></div>
+      <div id="storage_head">
+        <div>
+          <div id="storage_total">–</div>
+          <div class="hint" id="storage_sub">reading the folder…</div>
+        </div>
+        <button type="button" id="storage_open">Open folder</button>
+      </div>
+      <div class="bar" id="storage_bar"></div>
+      <div class="legend" id="storage_legend"></div>
+      <div class="hint" id="storage_kinds"></div>
+
+      <h2 class="sub">Where these clips live</h2>
+      <div class="bar" id="storage_where"></div>
+      <div class="legend" id="storage_where_legend"></div>
+
+      <h2 class="sub">Free up space</h2>
+      <div id="storage_clean"></div>
+      <div class="hint" id="storage_clean_msg"></div>
+
+      <h2 class="sub">Keep it in check</h2>
+      <div id="storage_over" class="banner warn"></div>
+      <form id="storage-form">
+        <div class="full check">
+          <input type="checkbox" id="delete_source_after_encode" />
+          <label for="delete_source_after_encode">Delete the original recording after encoding</label>
+        </div>
+        <label for="storage_limit_gb">Keep at most</label>
+        <div class="inline">
+          <input type="number" id="storage_limit_gb" min="0" max="100000" step="1" />
+          <span class="hint">GB &middot; 0 for no limit</span>
+        </div>
+        <div class="full hint">
+          Over the limit, the oldest clips the site already has give up their local video. The
+          thumbnail and the link stay, and clips that exist only on this PC are never touched.
+        </div>
+        <div class="full actions">
+          <button type="submit" id="storage_save">Save</button>
+          <span id="storage_msg" class="hint"></span>
+        </div>
+      </form>
     </section>
 
     <section id="panel-settings" hidden>

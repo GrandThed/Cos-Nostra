@@ -1,6 +1,7 @@
 mod api;
 mod capture;
 mod settings;
+mod storage;
 mod ffmpeg;
 mod games;
 mod queue;
@@ -28,7 +29,8 @@ use capture::{CaptureConflict, HookCallback, HookedGame, Recorder};
 use ffmpeg::{Binaries, Encoders, Trim};
 use games::DetectedGame;
 use queue::{
-    ClipRow, Gate, NewClip, OnChange, Outputs, Processor, Queue, UploadResult, Uploader, Worker,
+    ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, UploadResult,
+    Uploader, Worker,
 };
 use settings::{Account, Settings};
 
@@ -395,7 +397,7 @@ async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
         .delete(id)
         .map_err(|e| format!("{e:#}"))?;
     if let Some(row) = row {
-        for p in clip_files(&row) {
+        for p in storage::clip_files(&row) {
             match std::fs::remove_file(&p) {
                 Ok(()) => log::info!("deleted {p}"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -498,6 +500,59 @@ async fn reprobe_encoders(app: AppHandle) -> Result<Encoders, String> {
     Ok(encoders)
 }
 
+// ---------------------------------------------------------------------------
+// Storage commands
+
+/// What the clips cost on this PC. Stats every file, so it runs off the main thread.
+#[tauri::command]
+async fn storage_stats(app: AppHandle) -> Result<storage::StorageStats, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+        let rows = queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))?;
+        Ok(storage::scan(&rows, &clip_dir))
+    })
+    .await
+}
+
+/// Runs one of the cleanups the Storage tab offers. The UI asks for a second click first.
+#[tauri::command]
+async fn clean_storage(
+    app: AppHandle,
+    target: storage::CleanTarget,
+) -> Result<storage::CleanResult, String> {
+    let emit_to = app.clone();
+    let result = on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let queue = queue_or_err(&state)?;
+        storage::clean(&queue, target).map_err(|e| format!("{e:#}"))
+    })
+    .await?;
+    emit_clips_changed(&emit_to, None);
+    Ok(result)
+}
+
+/// Reveals the clip folder itself, for the leftover files the app will not delete on its own.
+#[tauri::command]
+fn open_clip_dir(app: AppHandle) -> Result<(), String> {
+    let dir = app.state::<AppState>().settings.lock().unwrap().clip_dir.clone();
+    app.opener()
+        .open_path(dir.display().to_string(), None::<&str>)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Runs blocking work off the async runtime, flattening the join error into the same `String`
+/// every command returns.
+async fn on_blocking_thread<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("task failed: {e}"))?
+}
+
 /// Standard base64 with padding. Small enough to not be worth a dependency.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
@@ -514,42 +569,8 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Every file a clip row may own, for deletion.
-fn clip_files(row: &ClipRow) -> Vec<String> {
-    let mut files = vec![row.source_path.clone()];
-    for p in [&row.av1_path, &row.h264_path, &row.thumb_path] {
-        if let Some(p) = p {
-            files.push(p.clone());
-        }
-    }
-    // Rows that never reached the processor have no output paths recorded; also try the
-    // conventional names so a failed clip does not leave partial outputs behind.
-    let (av1, h264, thumb) = output_paths(Path::new(&row.source_path));
-    for p in [av1, h264, thumb] {
-        let p = p.display().to_string();
-        if !files.contains(&p) {
-            files.push(p);
-        }
-    }
-    files
-}
-
 // ---------------------------------------------------------------------------
 // Encoding pipeline
-
-/// Outputs live next to the source: `<stem>.av1.mp4`, `<stem>.h264.mp4`, `<stem>.jpg`.
-fn output_paths(source: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let stem = source
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "clip".to_string());
-    let dir = source.parent().map(Path::to_path_buf).unwrap_or_default();
-    (
-        dir.join(format!("{stem}.av1.mp4")),
-        dir.join(format!("{stem}.h264.mp4")),
-        dir.join(format!("{stem}.jpg")),
-    )
-}
 
 fn file_size(path: &Path) -> anyhow::Result<i64> {
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -576,7 +597,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     let encoders = ffmpeg::encoders_for(&probed, engine);
 
     let source = Path::new(&row.source_path);
-    let (av1, h264, thumb) = output_paths(source);
+    let (av1, h264, thumb) = storage::output_paths(source);
     log::info!("encoding clip {} ({})", row.id, source.display());
 
     let t = Instant::now();
@@ -691,6 +712,51 @@ fn encode_allowed(app: &AppHandle) -> bool {
     games::detect_foreground().is_none()
 }
 
+/// The queue's status-change callback: refresh the UI, then apply the two storage settings to
+/// the clip that just moved. Runs on the worker thread, between jobs, so the file deletions
+/// never race an encode. Both settings are off by default, and then this is one lock and a
+/// return.
+fn on_clip_changed(app: &AppHandle, id: i64) {
+    emit_clips_changed(app, Some(id));
+    let state = app.state::<AppState>();
+    let (drop_sources, limit_gb, clip_dir) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.delete_source_after_encode,
+            s.storage_limit_gb,
+            s.clip_dir.clone(),
+        )
+    };
+    if !drop_sources && limit_gb == 0 {
+        return;
+    }
+    let Some(queue) = state.queue() else { return };
+    // Only the two resting states matter. Everything else is a clip mid-flight, whose files
+    // are still being written.
+    let row = match queue.get(id) {
+        Ok(Some(row)) if matches!(row.status, ClipStatus::Encoded | ClipStatus::Done) => row,
+        Ok(_) => return,
+        Err(e) => {
+            log::warn!("storage upkeep could not read clip {id}: {e:#}");
+            return;
+        }
+    };
+
+    let mut changed = false;
+    if drop_sources && row.status == ClipStatus::Encoded && storage::drop_source(&row) > 0 {
+        changed = true;
+    }
+    if limit_gb > 0 {
+        match storage::enforce_limit(&queue, &clip_dir, i64::from(limit_gb) * storage::GB) {
+            Ok(freed) => changed |= freed.clips > 0,
+            Err(e) => log::warn!("storage limit could not be applied: {e:#}"),
+        }
+    }
+    if changed {
+        emit_clips_changed(app, None);
+    }
+}
+
 /// Locates ffmpeg, probes encoders if needed, opens the queue and starts the worker.
 /// Blocking (the probe takes seconds); runs on a background thread at startup.
 fn start_pipeline(app: &AppHandle) {
@@ -752,7 +818,7 @@ fn start_pipeline(app: &AppHandle) {
     let gate_app = app.clone();
     let gate: Gate = Arc::new(move || encode_allowed(&gate_app));
     let change_app = app.clone();
-    let on_change: OnChange = Arc::new(move |id| emit_clips_changed(&change_app, Some(id)));
+    let on_change: OnChange = Arc::new(move |id| on_clip_changed(&change_app, id));
     let upload_app = app.clone();
     let uploader: Uploader = Arc::new(move |row| upload_clip(&upload_app, row));
     let upload_gate_app = app.clone();
@@ -1264,6 +1330,9 @@ pub fn run() {
             retry_clip,
             open_clip_folder,
             get_thumbnail,
+            storage_stats,
+            clean_storage,
+            open_clip_dir,
             get_encoders,
             reprobe_encoders,
             start_login,

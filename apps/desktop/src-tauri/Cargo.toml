@@ -40,6 +40,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_Media_Audio",
+    "Win32_Storage_FileSystem",
 ] }
 
 # Embedded OBS. libobs-bootstrapper downloads the signed OBS runtime on first launch.

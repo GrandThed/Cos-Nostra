@@ -75,6 +75,8 @@ interface Settings {
   device_token: string | null;
   account: Account | null;
   auto_upload: boolean;
+  delete_source_after_encode: boolean;
+  storage_limit_gb: number;
 }
 
 interface LoginStarted {
@@ -108,6 +110,49 @@ interface ClipRow {
   page_url: string | null;
 }
 
+/** Clips and the bytes they hold on this PC. */
+interface Bucket {
+  clips: number;
+  bytes: number;
+}
+
+interface GameUsage {
+  game: string | null;
+  clips: number;
+  bytes: number;
+}
+
+interface Kinds {
+  sources: number;
+  av1: number;
+  h264: number;
+  thumbs: number;
+  other: number;
+  other_files: number;
+}
+
+interface StorageStats {
+  clip_dir: string;
+  clips: number;
+  total: number;
+  kinds: Kinds;
+  games: GameUsage[];
+  published: Bucket;
+  local_only: Bucket;
+  reclaim_sources: Bucket;
+  reclaim_published: Bucket;
+  reclaim_failed: Bucket;
+  free_space: number | null;
+  disk_size: number | null;
+}
+
+type CleanTarget = "sources" | "published" | "failed";
+
+interface CleanResult {
+  clips: number;
+  bytes: number;
+}
+
 const el = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const input = (id: string) => el<HTMLInputElement>(id);
 const select = (id: string) => el<HTMLSelectElement>(id);
@@ -123,8 +168,8 @@ function syncEncodeHints(): void {
 // ---------------------------------------------------------------------------
 // Tabs
 
-type Tab = "status" | "clips" | "settings";
-const TABS: readonly Tab[] = ["status", "clips", "settings"];
+type Tab = "status" | "clips" | "storage" | "settings";
+const TABS: readonly Tab[] = ["status", "clips", "storage", "settings"];
 let activeTab: Tab = "status";
 
 function showTab(name: Tab) {
@@ -135,6 +180,7 @@ function showTab(name: Tab) {
   }
   if (name === "settings") void loadSettings();
   if (name === "clips") void loadClips();
+  if (name === "storage") void loadStorage();
 }
 for (const t of TABS) el(`tab-${t}`).addEventListener("click", () => showTab(t));
 
@@ -452,6 +498,7 @@ let clipsDirty = false;
 
 function fmtBytes(n: number | null): string {
   if (n === null || n < 0) return "–";
+  if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
@@ -549,20 +596,26 @@ function renderClip(c: ClipRow): HTMLElement {
   else if (c.status === "saved" && c.attempts > 0 && c.error) badge.title = `Attempt ${c.attempts} failed: ${c.error}`;
   top.append(game, badge);
 
+  // A clip the Storage tab released keeps its row and its link but has no files left here.
+  const released = c.status === "done" && !c.av1_path && !c.h264_path;
   const detail = document.createElement("div");
   detail.className = "detail";
-  const sizes = c.size_av1 !== null
-    ? `${fmtBytes(c.size_source)} → ${fmtBytes(c.size_av1)}`
-    : fmtBytes(c.size_source);
+  const sizes = released
+    ? `${fmtBytes(c.size_av1)} · on the site only`
+    : c.size_av1 !== null
+      ? `${fmtBytes(c.size_source)} → ${fmtBytes(c.size_av1)}`
+      : fmtBytes(c.size_source);
   detail.textContent = `${fmtDate(c.recorded_at)} · ${fmtDuration(c.duration_ms)} · ${sizes}`;
 
   const buttons = document.createElement("div");
   buttons.className = "buttons";
-  const open = document.createElement("button");
-  open.type = "button";
-  open.textContent = "Open folder";
-  open.addEventListener("click", () => run(invoke("open_clip_folder", { id: c.id })));
-  buttons.append(open);
+  if (!released) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.textContent = "Open folder";
+    open.addEventListener("click", () => run(invoke("open_clip_folder", { id: c.id })));
+    buttons.append(open);
+  }
   if (c.status === "done" && c.page_url) {
     const url = c.page_url;
     const copy = document.createElement("button");
@@ -664,4 +717,298 @@ function editGame(c: ClipRow, span: HTMLSpanElement) {
 
 listen<{ id: number | null }>("clips-changed", () => {
   if (activeTab === "clips") void loadClips();
+  if (activeTab === "storage") void loadStorage();
+});
+
+// ---------------------------------------------------------------------------
+// Storage panel
+
+/** One segment of a bar, and its legend row. */
+interface Slice {
+  label: string;
+  color: string;
+  /** What the count means for this slice: "18 clips", "3 files". */
+  note: string;
+  bytes: number;
+}
+
+/** Distinct at 14 px against both themes. Cycles if someone plays more games than this. */
+const GAME_COLORS = [
+  "#4c8dff", "#f2a33c", "#45c17c", "#e4585f", "#a86ee0", "#22b8cf", "#d66ba0",
+];
+/** Games past this are folded into one slice, so the bar stays readable at 480 px. */
+const MAX_GAME_SLICES = 7;
+const COLOR_REST = "#7d8798";
+const COLOR_PUBLISHED = "#45c17c";
+const COLOR_LOCAL = "#4c8dff";
+
+const GB = 1024 * 1024 * 1024;
+
+/** What each cleanup does, in the order they are worth doing. */
+const CLEANERS: {
+  target: CleanTarget;
+  label: string;
+  note: string;
+  verb: string;
+  of: (s: StorageStats) => Bucket;
+}[] = [
+  {
+    target: "sources",
+    label: "Original recordings",
+    note: "The raw buffer file of clips that already encoded. The AV1 and H.264 copies stay.",
+    verb: "Delete",
+    of: (s) => s.reclaim_sources,
+  },
+  {
+    target: "published",
+    label: "Clips already on the site",
+    note: "Removes the video from this PC. The thumbnail, the link and the Discord post stay.",
+    verb: "Remove",
+    of: (s) => s.reclaim_published,
+  },
+  {
+    target: "failed",
+    label: "Clips that failed",
+    note: "Deletes the clip and every file it owns, for good.",
+    verb: "Delete",
+    of: (s) => s.reclaim_failed,
+  },
+];
+
+/** Cleanup whose button is waiting for its confirming second click. */
+let pendingClean: CleanTarget | null = null;
+let storageLoading = false;
+
+function setStorageMsg(text: string, kind: "ok" | "err" | "" = "") {
+  const m = el("storage_msg");
+  m.textContent = text;
+  m.className = kind ? `hint ${kind}` : "hint";
+}
+
+async function loadStorage() {
+  if (storageLoading) return;
+  storageLoading = true;
+  try {
+    const [stats, settings] = await Promise.all([
+      invoke<StorageStats>("storage_stats"),
+      invoke<Settings>("get_settings"),
+    ]);
+    current = settings;
+    el("storage_error").textContent = "";
+    renderStorage(stats, settings);
+  } catch (e) {
+    el("storage_error").textContent = String(e);
+  } finally {
+    storageLoading = false;
+  }
+}
+
+function renderStorage(s: StorageStats, settings: Settings) {
+  el("storage_total").textContent = fmtBytes(s.total);
+  const sub = [`${s.clips} clip${s.clips === 1 ? "" : "s"}`];
+  if (s.free_space !== null) sub.push(`${fmtBytes(s.free_space)} free on the drive`);
+  el("storage_sub").textContent = sub.join(" · ");
+  el("storage_sub").title = s.clip_dir;
+
+  const games = gameSlices(s);
+  renderBar(el("storage_bar"), games, s.total);
+  renderLegend(el("storage_legend"), games);
+  el("storage_kinds").textContent = kindsLine(s.kinds);
+
+  const where: Slice[] = [
+    { label: "On the site", color: COLOR_PUBLISHED, note: clipsNote(s.published.clips), bytes: s.published.bytes },
+    { label: "Only on this PC", color: COLOR_LOCAL, note: clipsNote(s.local_only.clips), bytes: s.local_only.bytes },
+  ];
+  renderBar(el("storage_where"), where, s.published.bytes + s.local_only.bytes);
+  renderLegend(el("storage_where_legend"), where);
+
+  renderCleaners(s);
+
+  input("delete_source_after_encode").checked = settings.delete_source_after_encode;
+  input("storage_limit_gb").value = String(settings.storage_limit_gb);
+  const limit = settings.storage_limit_gb * GB;
+  el("storage_over").textContent =
+    limit > 0 && s.total > limit
+      ? `Over the ${settings.storage_limit_gb} GB limit by ${fmtBytes(s.total - limit)}. ` +
+        "Nothing more can go automatically: what is left is not on the site yet."
+      : "";
+  setStorageMsg("");
+}
+
+/** The biggest games, then everything else, then whatever the app did not put there. */
+function gameSlices(s: StorageStats): Slice[] {
+  const used = s.games.filter((g) => g.bytes > 0);
+  const slices: Slice[] = used.slice(0, MAX_GAME_SLICES).map((g, i) => ({
+    label: g.game ?? "Unknown game",
+    color: GAME_COLORS[i % GAME_COLORS.length],
+    note: clipsNote(g.clips),
+    bytes: g.bytes,
+  }));
+  const rest = used.slice(MAX_GAME_SLICES);
+  if (rest.length) {
+    slices.push({
+      label: `${rest.length} more games`,
+      color: COLOR_REST,
+      note: clipsNote(rest.reduce((n, g) => n + g.clips, 0)),
+      bytes: rest.reduce((n, g) => n + g.bytes, 0),
+    });
+  }
+  if (s.kinds.other > 0) {
+    slices.push({
+      label: "Other files in the folder",
+      color: "#8892a0",
+      note: `${s.kinds.other_files} file${s.kinds.other_files === 1 ? "" : "s"}`,
+      bytes: s.kinds.other,
+    });
+  }
+  return slices;
+}
+
+function clipsNote(n: number): string {
+  return `${n} clip${n === 1 ? "" : "s"}`;
+}
+
+function kindsLine(k: Kinds): string {
+  const parts: [string, number][] = [
+    ["Originals", k.sources],
+    ["AV1", k.av1],
+    ["H.264", k.h264],
+    ["Thumbnails", k.thumbs],
+    ["Other", k.other],
+  ];
+  return parts
+    .filter(([, n]) => n > 0)
+    .map(([name, n]) => `${name} ${fmtBytes(n)}`)
+    .join(" · ");
+}
+
+function renderBar(bar: HTMLElement, slices: Slice[], total: number) {
+  bar.replaceChildren(
+    ...slices.map((s) => {
+      const seg = document.createElement("span");
+      seg.style.width = total > 0 ? `${(s.bytes / total) * 100}%` : "0";
+      seg.style.background = s.color;
+      seg.title = `${s.label} — ${fmtBytes(s.bytes)}`;
+      return seg;
+    }),
+  );
+}
+
+function renderLegend(list: HTMLElement, slices: Slice[]) {
+  list.replaceChildren(
+    ...slices.map((s) => {
+      const row = document.createElement("div");
+      row.className = "legend-row";
+
+      const name = document.createElement("div");
+      name.className = "name";
+      const swatch = document.createElement("i");
+      swatch.className = "swatch";
+      swatch.style.background = s.color;
+      const label = document.createElement("em");
+      label.textContent = s.label;
+      label.title = s.label;
+      name.append(swatch, label);
+
+      const note = document.createElement("span");
+      note.className = "n";
+      note.textContent = s.note;
+      const bytes = document.createElement("span");
+      bytes.className = "b";
+      bytes.textContent = fmtBytes(s.bytes);
+
+      row.append(name, note, bytes);
+      return row;
+    }),
+  );
+}
+
+function renderCleaners(s: StorageStats) {
+  el("storage_clean").replaceChildren(
+    ...CLEANERS.map((c) => {
+      const bucket = c.of(s);
+      const row = document.createElement("div");
+      row.className = "clean-row";
+      row.dataset.empty = String(bucket.clips === 0);
+
+      const what = document.createElement("div");
+      what.className = "what";
+      what.textContent = c.label;
+      const note = document.createElement("small");
+      note.textContent = bucket.clips ? `${clipsNote(bucket.clips)} · ${c.note}` : c.note;
+      what.append(note);
+
+      const bytes = document.createElement("span");
+      bytes.className = "b";
+      bytes.textContent = fmtBytes(bucket.bytes);
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.disabled = bucket.clips === 0;
+      button.textContent = pendingClean === c.target ? "Confirm" : c.verb;
+      button.addEventListener("click", () => {
+        if (pendingClean !== c.target) {
+          pendingClean = c.target;
+          renderCleaners(s);
+          return;
+        }
+        pendingClean = null;
+        button.disabled = true;
+        void runClean(c.target);
+      });
+
+      row.append(what, bytes, button);
+      return row;
+    }),
+  );
+}
+
+async function runClean(target: CleanTarget) {
+  const msg = el("storage_clean_msg");
+  msg.className = "hint";
+  msg.textContent = "Working…";
+  try {
+    const freed = await invoke<CleanResult>("clean_storage", { target });
+    msg.textContent = freed.clips
+      ? `Freed ${fmtBytes(freed.bytes)} from ${clipsNote(freed.clips)}.`
+      : "Nothing left to free there.";
+    msg.className = "hint ok";
+  } catch (e) {
+    msg.textContent = String(e);
+    msg.className = "hint err";
+  }
+  // The cleanup emits clips-changed, but reload here too so the numbers refresh even when the
+  // Rust side had nothing to report.
+  await loadStorage();
+}
+
+el("storage_open").addEventListener("click", async () => {
+  try {
+    await invoke("open_clip_dir");
+  } catch (e) {
+    el("storage_error").textContent = String(e);
+  }
+});
+
+el<HTMLFormElement>("storage-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!current) return;
+  const next: Settings = {
+    ...current,
+    delete_source_after_encode: input("delete_source_after_encode").checked,
+    storage_limit_gb: Number(input("storage_limit_gb").value),
+  };
+  const btn = el<HTMLButtonElement>("storage_save");
+  btn.disabled = true;
+  setStorageMsg("Saving…");
+  try {
+    await invoke("save_settings", { settings: next });
+    current = next;
+    await loadStorage();
+    setStorageMsg("Saved", "ok");
+  } catch (e) {
+    setStorageMsg(String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
 });
