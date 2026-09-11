@@ -126,6 +126,40 @@ machine that has them. Audio is excluded from every size above (the sources here
 both branches re-encode); in production add roughly 0.5 MB per 30 s for Opus 128k and 0.6 MB for
 AAC 160k.
 
+### cqp is constant quality, so AV1 is not always the smaller file
+
+Measured 2026-09-11 on a 28.3 s 1080p60 Wardogs capture, 71.2 MB at 19.9 Mbps, taken through the
+app's own replay buffer — the first real clip to go through the phase 4 automatic path.
+
+| encode | size | bitrate | VMAF |
+|---|---|---|---|
+| `av1_amf` cqp 95 — what ships | 56.2 MB | 15.78 Mbps | **94.02** |
+| `h264_amf` 8M vbr_peak — the fallback | 32.9 MB | 9.13 Mbps | 88.54 |
+| `av1_amf` cqp 128 | 28.6 MB | 8.00 Mbps | 88.22 |
+
+**The AV1 file came out 71 percent larger than the H.264 fallback**, the opposite of the 32
+percent smaller measured in phase 2. That is not a regression: a hand-run of the exact arguments
+from `av1_args()` reproduced the app's output byte for byte (56,199,121), so the preset is being
+applied. It is content. cqp asks for a quality and pays whatever the footage costs, while
+`h264_amf -rc vbr_peak -b:v 8M -maxrate 12M` targets a bitrate and simply starves on hard
+footage — which is what its 88.54 against AV1's 94.02 is showing.
+
+Two things follow, and they are worth knowing before re-tuning anything:
+
+- **Do not read "AV1 is the small one" as an invariant.** It holds on the easy-to-medium footage
+  phase 2 measured (a 27 s clip at 5.43 Mbps, a queue screen at 1.6 MB) and inverts on high
+  motion. Upload time and stored bytes therefore vary far more per clip than the phase 2 table
+  suggests.
+- **At equal size AV1's win on this footage is small.** cqp 128 lands at 28.6 MB / 88.22 against
+  H.264's 32.9 MB / 88.54: 13 percent smaller for a third of a VMAF point less. The generational
+  gain that shows up on easy content is mostly gone here.
+
+Left at cqp 95 on purpose. Capping AV1 (a higher qp, or mixing in `-maxrate`) would trade away
+the quality that is the reason for keeping an AV1 copy at all, and one clip is not enough to
+re-tune a preset that was chosen against a VMAF curve. If large clips start hurting, the knob to
+measure is qp, and it should be measured on several clips of *different* difficulty rather than
+on one more.
+
 ### Reproducing the measurement
 
 The harness is not committed — it is three scratchpad scripts that shell out to ffmpeg
@@ -140,7 +174,11 @@ ffmpeg -hide_banner -v error -y -i encoded.mp4 -i source.mp4 -lavfi \
 
 Distorted stream first, reference second. On Windows the `log_path` inside `-lavfi` needs its
 backslashes turned into forward slashes and its drive colon escaped, or ffmpeg parses the path
-as more filter options. Read `pooled_metrics.vmaf.mean` out of the JSON. Before trusting any
+as more filter options (`No option name near '/Users/...'`, then `Error parsing filterchain`).
+Escaping the colon through a shell is fiddly enough that the reliable move is to `cd` to the
+output directory first and pass a **bare filename** — `log_path=vmaf_av1.json` — which has no
+colon to escape. The two `-i` paths are ordinary arguments and need none of this. Read
+`pooled_metrics.vmaf.mean` out of the JSON. Before trusting any
 number, check that the app's own clip queue is idle — its encodes share the same engine.
 
 ## Probe a file

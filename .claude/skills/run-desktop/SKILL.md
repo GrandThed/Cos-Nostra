@@ -24,11 +24,26 @@ The OBS runtime lands in `apps/desktop/src-tauri/target/debug/` (`obs.dll`, `obs
 
 ## Test a save
 
-Send the hotkey from PowerShell while the app runs:
+Send the hotkey from PowerShell while the app runs. **`SendKeys` does not reach a global
+hotkey.** It posts to the foreground window's message queue, so with a game focused it is
+swallowed: no clip, no log line, no error — it looks exactly like a broken hotkey. Use
+`keybd_event`, which injects at the level `RegisterHotKey` actually listens to:
 
 ```powershell
-(New-Object -ComObject WScript.Shell).SendKeys("%{F10}")
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class KB { [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra); }
+'@
+[KB]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)   # Alt down   (VK_MENU)
+[KB]::keybd_event(0x79, 0, 0, [UIntPtr]::Zero)   # F10 down   (VK_F10)
+[KB]::keybd_event(0x79, 0, 2, [UIntPtr]::Zero)   # F10 up     (KEYEVENTF_KEYUP)
+[KB]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # Alt up
 ```
+
+`SendKeys` is still right for driving the app's *own* window (see "Drive the UI" below), where
+the target has focus. One side effect worth knowing: the injected Alt pulls the game out of the
+foreground, so the saved clip gets its name from the hooked game rather than from the foreground
+window. That is the fallback added in phase 4 and it is why the clip is still labelled at all.
 
 Then look for `clip saved: <path>` in the log and verify the file:
 
@@ -127,6 +142,38 @@ Then stop the background tauri dev task. Avoid `taskkill /IM node.exe` unless no
 - Fast iteration on Rust only: `cargo check` in `apps/desktop/src-tauri`, about two seconds warm.
 
 ## Common failures
+
+- `LoadLibraryExW failed: ... (os error 4551)` on a DLL under `target/debug/deps` — seen with
+  `yoke_derive` and `tauri_macros` — followed by a cascade of `can't find crate for ...` for
+  `tauri`, `reqwest` and every plugin: **Smart App Control blocked a proc-macro.** rustc compiles
+  proc-macros to unsigned DLLs and loads them into itself, and SAC refuses an unsigned binary
+  with no reputation. The "can't find crate" lines are the cascade, not the cause, and they make
+  it look like a wrecked target directory. Confirm it is SAC:
+
+  ```powershell
+  Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy |
+    Select-Object VerifiedAndReputablePolicyState        # 0 off, 1 enforcing, 2 evaluation
+  Get-WinEvent -LogName Microsoft-Windows-CodeIntegrity/Operational -MaxEvents 10 |
+    Where-Object Id -in 3033,3077                        # names the blocked file
+  ```
+
+  Rebuild just the crate the error names, so a fresh DLL is written. SAC has allowed the new one
+  every time so far:
+
+  ```
+  cargo clean -p yoke-derive     # the crate in the error, NOT cos-nostra-desktop
+  cargo check
+  ```
+
+  Do not reach for `cargo clean -p cos-nostra-desktop`: it throws away about 7 GB, fixes nothing,
+  and forces the same proc-macro load again on the way back. Turning Smart App Control off is the
+  only permanent fix, and it is the machine owner's decision — Windows cannot re-enable it
+  afterwards without a reinstall, so never change that setting unasked.
+
+- `failed to remove file ...\cos-nostra-desktop.exe` / `Acceso denegado (os error 5)` at the end
+  of a build: a previous app instance is still running and holding the exe. `taskkill /IM
+  cos-nostra-desktop.exe /F`, then build again. Pair it with the port 1420 check below, because
+  a half-dead `tauri dev` usually leaves both.
 
 - Black clip: another app holds the game capture hook, or the game runs with an anti-cheat that blocks it. The monitor layer should still show the desktop; if the clip is fully black the graphics adapter index may be wrong on a multi-GPU machine.
 - Hotkey does nothing: another program registered Alt+F10 first. Change `hotkey` in settings.
