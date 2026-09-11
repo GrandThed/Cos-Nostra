@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-11. Phases 1, 2 and 3 are done and verified on an AMD RX 9060 XT. The backend and the bot are both live on Railway; phase 4 is built and deployed with its acceptance test part-run (see the phase for exactly what is left). Phases 5 and 6 have not started.
+Last updated 2026-09-11. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phases 5 and 6 have not started.
 
 ## 1. What we are building
 
@@ -195,30 +195,41 @@ Deployment: one Railway service built from `apps/backend/Dockerfile` with the re
 
 Acceptance: from a clean install, a user logs in through Discord, a clip uploaded from the desktop app opens in the browser at its player URL on desktop and on a phone.
 
-### Phase 4. Discord bot. Built and deployed 2026-09-11, acceptance test part-run.
+### Phase 4. Discord bot. Done 2026-09-11.
 
 Goal: clips show up in Discord and every reaction is counted.
 
 Both services are live on Railway and the bot is in the dev guild (FAMAFIA,
 `438477166573912074`) with `/clips` registered guild-scoped.
 
+Acceptance, run end to end against production on 2026-09-11: a clip saved with the hotkey
+during a real Wardogs session encoded, uploaded, and the backend's `POST /clips/:id/complete`
+at 14:52:25.076 produced Discord message `1547983158601850932` at 14:52:25.147 - **71 ms**,
+with nothing triggered by hand. It rendered as a native `type=video` embed at 1920x1080 with
+the three seed reactions. A human then reacted with two emojis (`open` 0 -> 2, rankings
+`2r/1u`) and removed one (`open` -> 1, `1r/1u`), which is the pairing test that matters: the
+remove closed the row its own add had opened. `/clips top` then listed the clip first with
+"1 reactor" and `/clips latest` showed `Reactions = 1`. The bot's own seed emojis were never
+counted at any point.
+
 What is verified:
 
-- The bot logs in, serves `GET /health` and `POST /post` on `BOT_PORT`, and rejects a wrong
-  shared secret with 401 in constant time.
-- `POST /post` posts a real clip to the configured channel and records the message through
-  `POST /internal/posts`, with the seed emojis added. Driven by hand with the exact body the
-  backend's `notifyBot` sends.
-- `/clips setup channel:#clips` writes `guild_settings` from Discord.
-- 98 bot tests and 28 backend tests, none of which touch a gateway or a network.
+- The whole loop, as above: hotkey to Discord to a counted reaction.
+- `POST /post` posts a clip and records the message; a wrong shared secret is 401 in
+  constant time.
+- `/clips setup`, `/clips latest` and `/clips top` driven from Discord.
+- 98 bot tests and 29 backend tests, none of which touch a gateway or a network.
 
-What is **not** verified yet, and is the first thing a next session should finish:
+Two bugs this test found, both fixed:
 
-- Reaction tracking end to end. Nobody has reacted to a real post yet, so the add / remove /
-  re-add path and `/clips top` have only been exercised against fakes.
-- The automatic path: a desktop upload calling `notifyBot`, which needs `BOT_INTERNAL_URL` set
-  on the backend service. Every post so far was triggered by hand.
-- `/clips latest`, `/clips mine` and `/clips link` have never been run in Discord.
+- **A clip with no game could never upload.** The desktop serialises a Rust `Option::None` as
+  JSON null and zod's `.optional()` rejects null, so `POST /clips` answered 400 and the queue
+  retried forever. Every clip uploaded before this happened to have a game, so nothing had
+  exercised it. `game`, `title`, `width` and `height` are `nullish` now; a wrong type is
+  still a 400, and there is a regression test.
+- **Game detection only read the foreground window.** The hotkey is global, so a clip is often
+  saved while the game is running but not focused, and those clips arrived with no game at all.
+  It now falls back to the game libobs has hooked.
 
 What changed from the plan and why:
 
@@ -239,9 +250,22 @@ What changed from the plan and why:
   would have hidden `latest`, `top`, `mine` and `link` from ordinary members.
 - The reaction outbox is in-memory. A crash loses the backlog; the plan's "local queue" was not
   specified as durable and nothing yet justifies a file or a table.
+- `BOT_INTERNAL_URL` on the backend is what makes the path automatic, and it was the last
+  thing missing. Until it is set the backend logs `BOT_INTERNAL_URL unset, not notifying bot`
+  and clips upload without ever reaching Discord.
 
-Acceptance: upload a clip from the desktop app and see it in the channel within seconds. React,
-remove the reaction, react again, and `/clips top` reflects the final count.
+Deferred, with reasons:
+
+- `/clips mine` and `/clips link` answer ephemerally, so their replies are not in the channel
+  history and cannot be read back through the REST API the way the others were. Their handlers
+  are covered by unit tests and share the defer/edit path that `latest` and `top` exercised
+  live.
+- Re-adding the same emoji after removing it was not observed as a separate step. Add was
+  proven twice and remove was proven to close the row its add opened, which is the case the
+  emoji-key bug would have broken; a re-add is the same insert path as the first add.
+- Animated custom emoji. `emojiKey` exists precisely because discord.js keys them differently
+  on add and remove, and the dev guild had no animated emoji to click.
+
 
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
