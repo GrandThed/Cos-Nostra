@@ -26,12 +26,17 @@ const MEDIA_NAMES = Object.keys(MEDIA);
 const UPLOAD_TTL = 3600;
 const MEDIA_TTL = 3600;
 
+// Optional metadata is `nullish`, not `optional`: the desktop serialises a Rust
+// `Option::None` as JSON null, so a clip saved with no game detected used to fail its whole
+// upload with a 400 on `game` and `title`. Absent and null mean the same thing here - the
+// columns are nullable either way - and being strict about which one the client sent buys
+// nothing. Found closing phase 4; see docs/PLAN.md.
 const createSchema = z.object({
-  game: z.string().trim().max(200).optional(),
-  title: z.string().trim().max(200).optional(),
+  game: z.string().trim().max(200).nullish(),
+  title: z.string().trim().max(200).nullish(),
   durationMs: z.number().int().positive(),
-  width: z.number().int().positive().optional(),
-  height: z.number().int().positive().optional(),
+  width: z.number().int().positive().nullish(),
+  height: z.number().int().positive().nullish(),
   recordedAt: z.iso.datetime({ offset: true }),
   sizeAv1: z.number().int().nonnegative(),
   sizeH264: z.number().int().nonnegative(),

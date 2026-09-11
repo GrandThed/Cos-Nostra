@@ -291,6 +291,42 @@ test('create, complete and read a clip', async () => {
   }
 });
 
+test('a clip with no game uploads: null means absent, not invalid', async () => {
+  // The desktop serialises Rust Option::None as JSON null, which an .optional() schema
+  // rejects. That 400'd the whole upload of any clip saved with no game detected - found
+  // on a real clip while closing phase 4, so it stays covered here.
+  const app = await clipApp();
+  try {
+    await makeUser(app, '150', 'nogame', 'tok-nogame');
+    for (const body of [
+      { ...validBody, game: null, title: null },
+      { ...validBody, game: null, title: null, width: null, height: null },
+      (({ game, title, ...rest }) => rest)(validBody),
+    ]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/clips',
+        headers: auth('tok-nogame'),
+        payload: body,
+      });
+      assert.equal(res.statusCode, 201, res.body);
+      const read = await app.inject({ method: 'GET', url: `/clips/${res.json().id}` });
+      // Still pending, so the public read is a 404; the row is what matters here.
+      assert.equal(read.statusCode, 404);
+    }
+    // A wrong type is still a 400: nullish widened null, it did not switch validation off.
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-nogame'),
+      payload: { ...validBody, game: 42 },
+    });
+    assert.equal(bad.statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
 test('listing filters, sorting, pagination and rankings', async () => {
   const app = await clipApp();
   try {
