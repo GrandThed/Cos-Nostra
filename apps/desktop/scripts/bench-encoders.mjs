@@ -40,6 +40,10 @@ const CORPUS = {
   easy: '2026-09-10 18-47-22.mp4', // desktop and a browser, mostly static
   medium: '2026-09-10 18-09-08.mp4', // Wardogs, moderate motion
   hard: '2026-09-11 11-19-06.mp4', // Wardogs, high motion - the clip that started this
+  // Cheap at constant quality (crf 40 needs only 3.5 Mbps) but av1_amf cqp 95 spent 25.6 Mbps
+  // on it and produced a file larger than its own source. Kept because it is the sharpest
+  // demonstration that AMF's cqp scale is not a quality dial you can reason about.
+  amfblowup: '2026-09-11 13-38-56.mp4',
 };
 
 const CLIP_DIR = process.env.COS_CLIP_DIR ?? join(process.env.USERPROFILE ?? '', 'Videos', 'Cos Nostra');
