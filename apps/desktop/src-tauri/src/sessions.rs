@@ -401,6 +401,10 @@ impl SessionStore {
     /// At startup: a session still `recording` belongs to a run of the app that died mid-game.
     /// It ends at the last thing known about it, and joins the queue for processing. Returns
     /// every session waiting to be processed, oldest first.
+    ///
+    /// A recording that was never stopped gets its file's last write as its stop: the recorder
+    /// writes as it goes, so that is within seconds of when the app went away, where the start
+    /// request alone would end an hour-long session the moment it began.
     pub fn recover(&self) -> Result<Vec<i64>> {
         let stale: Vec<i64> = {
             let conn = self.lock();
@@ -409,6 +413,12 @@ impl SessionStore {
             ids
         };
         for id in stale {
+            for rec in self.recordings(id)?.into_iter().filter(|r| r.stopped_at.is_none()) {
+                match std::fs::metadata(&rec.path).and_then(|m| m.modified()) {
+                    Ok(written) => self.stop_recording(rec.id, DateTime::<Utc>::from(written))?,
+                    Err(e) => log::warn!("recording {} has no last write time: {e}", rec.path),
+                }
+            }
             let last: String = self.lock().query_row(
                 "SELECT MAX(t) FROM ( \
                    SELECT started_at AS t FROM sessions WHERE id = ?1 \
@@ -831,6 +841,26 @@ mod tests {
         assert_eq!(recs[0].stopped_at.as_deref(), Some(format_time(t(700)).as_str()));
         // Running it again changes nothing.
         assert_eq!(s.recover().unwrap(), vec![id]);
+    }
+
+    /// The app restarted mid-game with nothing on the timeline: the recording's last write is
+    /// the end, not its start.
+    #[test]
+    fn recovery_ends_an_eventless_session_at_the_recordings_last_write() {
+        let (s, dir) = store();
+        // Long enough ago that the file's modified time (now) is clearly later.
+        let begun = Utc::now() - ChronoDuration::minutes(12);
+        let id = s.create_session(SessionGame::League, "League of Legends", begun).unwrap();
+        let file = dir.join("session-1-1.mp4");
+        std::fs::write(&file, b"footage").unwrap();
+        s.add_recording(id, &file, begun).unwrap();
+
+        assert_eq!(s.recover().unwrap(), vec![id]);
+        let row = s.session(id).unwrap().unwrap();
+        let ended = parse_time(row.ended_at.as_deref().unwrap()).unwrap();
+        assert!(ended - begun >= ChronoDuration::minutes(11), "ended {ended}, begun {begun}");
+        let rec = &s.recordings(id).unwrap()[0];
+        assert_eq!(rec.stopped_at, row.ended_at);
     }
 
     #[test]

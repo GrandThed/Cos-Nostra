@@ -25,6 +25,7 @@ player leaves the game. The reasoning and what has been verified are in `docs/PL
 | `timeline.rs` | the game-agnostic vocabulary: which games, events, the `Provider` trait, which footage a match wants |
 | `session_watch.rs` | the thread that sees a game start and stop, keeps a recording running, feeds provider events in; runs against a `Host` trait so tests use a fake |
 | `providers/valorant.rs` | Riot Client lockfile and local API, presence decoding, the presence-to-events state machine |
+| `providers/league.rs` | the game's Live Client Data API on port 2999: game clock to wall clock, the player's kills, objectives, the result |
 | `sessions.rs` | `sessions.db`: sessions, recordings, matches, events |
 | `cutter.rs` | a finished session into match files, by stream copy from the nearest keyframe |
 | `session_app.rs` | the app side: the real `Host`, processing, the Matches tab's commands |

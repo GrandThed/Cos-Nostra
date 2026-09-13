@@ -17,6 +17,11 @@ import type { MatchRow, SessionRow, TimelineEvent } from "./types";
 
 /** Kept after the moment a round is decided when clipping it, for the kill and the reaction. */
 const ROUND_TAIL_MS = 3000;
+/** Selecting a moment (a kill, a dragon) takes this much before it, for the fight leading up. */
+const MOMENT_BEFORE_MS = 12_000;
+/** A multikill is stamped at its last kill, so the lead-up is longer. */
+const MULTIKILL_BEFORE_MS = 20_000;
+const MOMENT_AFTER_MS = 4_000;
 const MIN_CLIP_MS = 1000;
 /** A pointer that moves less than this on the timeline is a click (seek), not a drag (select). */
 const DRAG_PX = 4;
@@ -589,8 +594,9 @@ function paintBar(): void {
     const at = offset(view.match, e.at);
     if (e.kind === "match_start" || e.kind === "match_end") {
       nodes.push(h("span", { class: "tl-edge", style: `left:${pct(at)}`, title: eventLabel(e) }));
-    } else if (e.kind === "kill" || e.kind === "death" || e.kind === "assist") {
-      nodes.push(h("span", { class: `tl-dot ${e.kind}`, style: `left:${pct(at)}`, title: eventLabel(e) }));
+    } else if (e.kind !== "round_end") {
+      const side = e.kind === "objective" ? (e.ours === true ? " ours" : e.ours === false ? " theirs" : "") : "";
+      nodes.push(h("span", { class: `tl-dot ${e.kind}${side}`, style: `left:${pct(at)}`, title: eventLabel(e) }));
     }
   }
   fill(view.bar, ...nodes);
@@ -710,20 +716,13 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
   return view.events.map((e) => {
     const at = offset(match, e.at);
     const round = e.kind === "round_end" ? rounds.get(e.round) : undefined;
-    const tone =
-      e.kind === "round_end"
-        ? e.won === true
-          ? "won"
-          : e.won === false
-            ? "lost"
-            : ""
-        : e.kind === "match_end" && e.result
-          ? e.result === "win"
-            ? "won"
-            : e.result === "loss"
-              ? "lost"
-              : ""
-          : "";
+    const tone = toneOf(e);
+    // A round selects itself; a moment selects the fight around it.
+    const range: [number, number] | null = round
+      ? [round.start, round.end + ROUND_TAIL_MS]
+      : e.kind === "match_start" || e.kind === "match_end"
+        ? null
+        : [at - (e.kind === "multikill" ? MULTIKILL_BEFORE_MS : MOMENT_BEFORE_MS), at + MOMENT_AFTER_MS];
     return h(
       "div",
       { class: `event ${e.kind} ${tone}`.trim() },
@@ -738,15 +737,16 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
         h("span", { class: "at mono", text: fmtDuration(Math.max(0, at)) }),
         h("span", { class: "what", text: eventLabel(e) }),
       ),
-      round
+      range
         ? h("button", {
             type: "button",
             class: "btn small",
             text: t("matches.select"),
-            title: t("matches.selectRound"),
+            title: round ? t("matches.selectRound") : t("matches.selectMoment"),
             onclick: () => {
-              setRange(Math.max(0, round.start), Math.min(duration(), round.end + ROUND_TAIL_MS));
-              seek(round.start);
+              const from = Math.max(0, range[0]);
+              setRange(from, Math.min(duration(), range[1]));
+              seek(from);
             },
           })
         : null,
@@ -754,14 +754,35 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
   });
 }
 
-/** Why a recording carries no matches. Only Valorant has a provider so far (`providers/mod.rs`). */
-function undetectedReason(session: SessionRow): string {
-  if (session.game !== "valorant") {
-    return t("matches.noDetection", { game: session.game_name });
+/** The edge colour of a row: green for what went the player's way, red for what did not. */
+function toneOf(e: TimelineEvent): "won" | "lost" | "" {
+  const good = (yes: boolean | null) => (yes === true ? "won" : yes === false ? "lost" : "");
+  switch (e.kind) {
+    case "round_end":
+      return good(e.won);
+    case "match_end":
+      return good(e.result === "win" ? true : e.result === "loss" ? false : null);
+    case "objective":
+      return good(e.ours);
+    case "kill":
+    case "multikill":
+      return "won";
+    case "death":
+      return "lost";
+    default:
+      return "";
   }
-  return session.provider_reached
-    ? t("matches.noMatchReported")
-    : t("matches.statusUnreadable");
+}
+
+/** Why a recording carries no matches. Valorant and League have providers (`providers/mod.rs`). */
+function undetectedReason(session: SessionRow): string {
+  if (session.game === "valorant") {
+    return session.provider_reached ? t("matches.noMatchReported") : t("matches.statusUnreadable");
+  }
+  if (session.game === "league") {
+    return session.provider_reached ? t("matches.leagueNoMatchReported") : t("matches.leagueUnavailable");
+  }
+  return t("matches.noDetection", { game: session.game_name });
 }
 
 function eventLabel(e: TimelineEvent): string {
@@ -803,6 +824,30 @@ function eventLabel(e: TimelineEvent): string {
       return [t("matches.event.death"), e.killer, e.weapon].filter(Boolean).join(" · ");
     case "assist":
       return [t("matches.event.assist"), e.victim].filter(Boolean).join(" · ");
+    case "multikill":
+      return multikillLabel(e.count);
+    case "objective":
+      return [
+        e.name,
+        e.ours === true ? t("matches.event.yourTeam") : e.ours === false ? t("matches.event.enemyTeam") : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+  }
+}
+
+function multikillLabel(count: number): string {
+  switch (count) {
+    case 2:
+      return t("matches.event.doubleKill");
+    case 3:
+      return t("matches.event.tripleKill");
+    case 4:
+      return t("matches.event.quadraKill");
+    case 5:
+      return t("matches.event.pentaKill");
+    default:
+      return t("matches.event.nKills", { n: count });
   }
 }
 

@@ -329,6 +329,30 @@
   background: var(--info);
 }
 
+/* A multikill sits on top of the kills it caps, so it is drawn bigger and on top. */
+.tl-dot.multikill {
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  background: var(--acc);
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--acc);
+  z-index: 1;
+}
+
+.tl-dot.objective {
+  top: 25%;
+  border-radius: 2px;
+  background: var(--mut);
+}
+
+.tl-dot.objective.ours {
+  background: var(--ok);
+}
+
+.tl-dot.objective.theirs {
+  background: var(--err);
+}
+
 .tl-sel {
   position: absolute;
   top: 0;
