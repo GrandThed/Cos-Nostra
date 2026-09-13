@@ -471,3 +471,57 @@ test('a client that has not logged in yet does not break the bot check', async (
   await flush();
   assert.equal(jobs.length, 1);
 });
+
+// ---- partial users ---------------------------------------------------------------------
+//
+// With Partials.User (client.js) discord.js emits messageReactionRemove for a user it has
+// never cached, which is every user after a deploy. Such a User carries its id and little
+// else: `bot` is undefined until it is fetched, and this module never fetches it.
+
+/** A User the gateway delivered without a cached copy behind it. */
+function partialUser(id = 'user-9') {
+  return {
+    id,
+    partial: true,
+    bot: undefined,
+    fetch: async () => assert.fail('the user must not be fetched on every reaction'),
+  };
+}
+
+test('a remove from a user that is not cached still closes the vote', async () => {
+  const h = setup();
+  h.client.emit('messageReactionRemove', makeReaction(), partialUser());
+  await flush();
+
+  assert.deepEqual(h.jobs, [
+    { messageId: 'm1', userDiscordId: 'user-9', emoji: FIRE, action: 'remove' },
+  ]);
+  assert.deepEqual(h.logged.warn, []);
+  assert.deepEqual(h.logged.error, []);
+});
+
+test("the bot's own seed is recognised by id even when the user is partial", async () => {
+  // reaction.remove() on our own seed arrives like this; the bot flag is unreadable, so the
+  // id is what has to carry the check.
+  const h = setup();
+  h.client.emit('messageReactionRemove', makeReaction(), partialUser('bot-1'));
+  await flush();
+
+  assert.deepEqual(h.jobs, []);
+  assert.deepEqual(h.calls.getPost, [], 'our own seed is dropped before any backend lookup');
+});
+
+test('a partial reaction and a partial user on one remove are handled together', async () => {
+  const order = [];
+  const h = setup();
+  h.client.emit(
+    'messageReactionRemove',
+    makeReaction({ partial: true, messagePartial: true, order }),
+    partialUser(),
+  );
+  await flush();
+
+  assert.deepEqual(order, ['reaction.fetch'], 'MessageReaction#fetch covers the message too');
+  assert.equal(h.jobs.length, 1);
+  assert.equal(h.jobs[0].action, 'remove');
+});

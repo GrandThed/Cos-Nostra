@@ -28,7 +28,7 @@ export function clipKeys(userId, clipId) {
  * @typedef {object} Storage
  * @property {string} bucket
  * @property {S3Client} client
- * @property {(key: string, contentType: string, expiresSeconds?: number) => Promise<string>} presignPut
+ * @property {(key: string, contentType: string, expiresSeconds?: number, contentLength?: number) => Promise<string>} presignPut
  * @property {(key: string, expiresSeconds?: number, responseContentType?: string) => Promise<string>} presignGet
  * @property {(key: string) => Promise<{ size: number, contentType: string | null } | null>} head
  * @property {(keys: string[]) => Promise<void>} deleteMany
@@ -48,8 +48,20 @@ export function createStorage(cfg) {
     bucket: Bucket,
     client,
 
-    presignPut(key, contentType, expiresSeconds = 3600) {
-      const cmd = new PutObjectCommand({ Bucket, Key: key, ContentType: contentType });
+    /**
+     * A PUT URL for one object. When `contentLength` is given the SDK signs the
+     * `content-length` header, so the URL can only ever write exactly that many bytes: a
+     * body of any other size fails the signature check at the bucket. `contentType` is not
+     * signed (the SDK drops it from the URL), which is why reads force the type instead -
+     * see presignGet's ResponseContentType.
+     */
+    presignPut(key, contentType, expiresSeconds = 3600, contentLength) {
+      const cmd = new PutObjectCommand({
+        Bucket,
+        Key: key,
+        ContentType: contentType,
+        ...(contentLength === undefined ? {} : { ContentLength: contentLength }),
+      });
       return getSignedUrl(client, cmd, { expiresIn: expiresSeconds });
     },
 

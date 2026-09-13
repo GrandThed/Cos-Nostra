@@ -15,6 +15,13 @@
       "when": 1789076319543,
       "tag": "0001_amazing_pretty_boy",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789173323238,
+      "tag": "0002_remarkable_lady_vermin",
+      "breakpoints": true
     }
   ]
 }

@@ -1,7 +1,7 @@
 // Device tokens and login codes. A device token is shown to the desktop app exactly once
 // and only its SHA-256 is stored, so a database leak does not hand out working tokens.
 
-import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 /** @returns {string} 32 random bytes as base64url */
 export function newToken() {
@@ -11,6 +11,19 @@ export function newToken() {
 /** @returns {string} hex SHA-256 of the token, what `devices.token_hash` stores */
 export function hashToken(token) {
   return createHash('sha256').update(token).digest('hex');
+}
+
+/**
+ * Compares two secrets without leaking where they differ through timing. Lengths are compared
+ * first because `timingSafeEqual` throws on a mismatch; the length of a secret is not itself a
+ * useful leak here, every value we compare has a fixed shape.
+ * @param {string} a
+ * @param {string} b
+ */
+export function constantTimeEqual(a, b) {
+  const ab = Buffer.from(String(a), 'utf8');
+  const bb = Buffer.from(String(b), 'utf8');
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
 // No 0/O/1/I so a code read off a screen cannot be mistyped.

@@ -88,12 +88,16 @@ S3_BUCKET                ${{<bucket service>.BUCKET}}
 S3_ACCESS_KEY_ID         ${{<bucket service>.ACCESS_KEY_ID}}
 S3_SECRET_ACCESS_KEY     ${{<bucket service>.SECRET_ACCESS_KEY}}
 S3_URL_STYLE             virtual   (path only for older buckets that reject virtual-host URLs)
+MAX_CLIP_MB              2048   optional; largest single AV1 or H.264 upload, signed into the PUT URL
+USER_QUOTA_GB            50     optional; stored bytes one account may hold, 0 disables the quota
 LOG_LEVEL                info
 BOT_INTERNAL_URL         http://<bot internal hostname>:3001   (leave unset until phase 4)
 DISCORD_API_BASE         optional, defaults to https://discord.com/api
 ```
 
 `PORT` is injected by Railway (8080 in practice) and the app binds `0.0.0.0:$PORT`. **Do not set `PORT` on the backend** — a hardcoded value breaks the healthcheck. `NODE_ENV` comes from the Dockerfile.
+
+`MAX_CLIP_MB` and `USER_QUOTA_GB` both have working defaults, so a deploy that omits them is fine. They are worth knowing about because they are enforced at `POST /clips`, before anything is signed: a clip over the cap, or one that would take the account past its quota, is a 413 and no upload URL is minted. The desktop does not retry a 413 — it parks the clip for a manual retry — so a quota set too low looks to the user like clips that stop uploading and say why on the card, not like a stuck queue.
 
 Generate the two secrets with:
 
@@ -220,11 +224,13 @@ curl -s -X POST https://cosnostra.benja.ar/auth/device \
   -H 'content-type: application/json' -d '{"deviceName":"probe"}'
 ```
 
-Open the `verifyUrl` it returns in a browser that has a Discord session, then poll
-`GET /auth/device/<code>`. It answers `{"status":"pending"}` until the callback lands and then
-hands the token out exactly once. **If Discord has already authorized this application for that
-account, the whole OAuth leg completes with no clicks** — the browser round trip is invisible,
-which makes the flow scriptable.
+Open the `verifyUrl` it returns in a browser that has a Discord session, press Continue on the
+confirmation page, then poll `GET /auth/device/<code>` with
+`-H 'authorization: Bearer <pollSecret>'` (the `pollSecret` comes from the same response; without
+it the poll is a 401 whether or not the code exists). It answers `{"status":"pending"}` until the
+callback lands and then hands the token out exactly once. The Continue click is mandatory and
+must come from a form on the backend's own origin: it is what stops a phished link from linking
+a stranger's device.
 
 With the token:
 

@@ -50,11 +50,15 @@ test('createClient requires baseUrl', () => {
   assert.throws(() => createClient({}), TypeError);
 });
 
-test('startDeviceLogin posts deviceName without auth', async () => {
-  answer = { status: 200, body: { code: 'ABCD', verificationUrl: 'x', expiresIn: 600, interval: 5 } };
+test('startDeviceLogin posts deviceName without auth and hands back the poll secret', async () => {
+  answer = {
+    status: 200,
+    body: { code: 'ABCD', verifyUrl: 'x', pollSecret: 'secret-abc', expiresIn: 600 },
+  };
   const api = createClient({ baseUrl, token: 'dev-token' });
   const out = await api.startDeviceLogin('Gaming PC');
   assert.equal(out.code, 'ABCD');
+  assert.equal(out.pollSecret, 'secret-abc');
   assert.equal(last().method, 'POST');
   assert.equal(last().url, '/auth/device');
   assert.deepEqual(JSON.parse(last().body), { deviceName: 'Gaming PC' });
@@ -62,12 +66,25 @@ test('startDeviceLogin posts deviceName without auth', async () => {
   assert.equal(last().headers.authorization, undefined);
 });
 
-test('pollDeviceLogin encodes the code and sends no auth', async () => {
+test('pollDeviceLogin encodes the code and sends the poll secret, not the device token', async () => {
   answer = { status: 200, body: { status: 'pending' } };
   const api = createClient({ baseUrl, token: 'dev-token' });
-  const out = await api.pollDeviceLogin('a b/c');
+  const out = await api.pollDeviceLogin('a b/c', 'secret-abc');
   assert.equal(out.status, 'pending');
   assert.equal(last().url, '/auth/device/a%20b%2Fc');
+  assert.equal(last().headers.authorization, 'Bearer secret-abc');
+});
+
+test('pollDeviceLogin without a secret sends no authorization header at all', async () => {
+  // The backend answers 401; the client must not quietly fall back to the configured token,
+  // which would send a device token to a route that is not expecting one.
+  answer = { status: 401, body: { error: 'unauthorized' } };
+  const api = createClient({ baseUrl, token: 'dev-token' });
+  await assert.rejects(api.pollDeviceLogin('ABCD2345'), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 401);
+    return true;
+  });
   assert.equal(last().headers.authorization, undefined);
 });
 

@@ -356,61 +356,42 @@ test('/clips mine lists the caller own clips, ephemerally', async () => {
 
 // ---- /clips link -----------------------------------------------------------------------
 
-test('/clips link replies ephemerally with the code and the verify URL', async () => {
-  const names = [];
-  const backend = {
-    startDeviceLogin: async (deviceName) => {
-      names.push(deviceName);
-      return {
-        code: 'ABCD2345',
-        verifyUrl: 'https://cosnostra.benja.ar/auth/discord/start?device=ABCD2345',
-        expiresIn: 600,
-      };
-    },
-  };
-  const interaction = makeInteraction({ sub: 'link' });
-  await run(interaction, backend);
-
-  assert.deepEqual(names, ['Discord benja']);
-  // The code is credential-ish: the only response must be the ephemeral deferred one.
-  assert.equal(interaction.calls.reply.length, 0);
-  assert.equal(interaction.calls.deferReply.length, 1);
-  assert.equal(interaction.calls.deferReply[0].flags, EPHEMERAL);
-  assert.equal(interaction.calls.editReply.length, 1);
-
-  const { content } = lastEdit(interaction);
-  assert.match(content, /ABCD2345/);
-  assert.match(content, /https:\/\/cosnostra\.benja\.ar\/auth\/discord\/start\?device=ABCD2345/);
-  assert.match(content, /10 minutes/);
-});
-
-test('/clips link falls back to POST /auth/device when the backend has no login method', async () => {
+test('/clips link points at the desktop app and starts no device login', async () => {
+  // The bot must not call POST /auth/device. Only the caller of that route is given the
+  // pollSecret, and it is shown once, so a login the bot starts is one nobody can finish.
   const realFetch = globalThis.fetch;
-  const realUrl = process.env.BACKEND_URL;
-  const requests = [];
-  process.env.BACKEND_URL = 'https://cosnostra.benja.ar/';
-  globalThis.fetch = async (url, init) => {
-    requests.push({ url, init });
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ code: 'ZZZZ9999', verifyUrl: 'https://example.test/verify' }),
-    };
+  const attempts = [];
+  globalThis.fetch = async (url) => {
+    attempts.push(String(url));
+    throw new Error('the bot must not reach the network for /clips link');
+  };
+  const backend = {
+    startDeviceLogin: async () => {
+      attempts.push('startDeviceLogin');
+      throw new Error('the bot must not start a device login');
+    },
   };
   try {
     const interaction = makeInteraction({ sub: 'link' });
-    await run(interaction, { listClips: async () => ({ items: [] }) });
+    await run(interaction, backend);
 
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, 'https://cosnostra.benja.ar/auth/device');
-    assert.equal(requests[0].init.method, 'POST');
-    assert.deepEqual(JSON.parse(requests[0].init.body), { deviceName: 'Discord benja' });
+    assert.deepEqual(attempts, [], 'no device login was started');
+    // Still the caller's business only; ephemeral-ness is fixed at defer time.
+    assert.equal(interaction.calls.reply.length, 0);
+    assert.equal(interaction.calls.deferReply.length, 1);
     assert.equal(interaction.calls.deferReply[0].flags, EPHEMERAL);
-    assert.match(lastEdit(interaction).content, /ZZZZ9999/);
+    assert.equal(interaction.calls.editReply.length, 1);
+
+    const { content } = lastEdit(interaction);
+    assert.match(content, /Settings/);
+    assert.match(content, /Link Discord/);
+    // The confirmation page is only worth anything if people know to check the code.
+    assert.match(content, /code/i);
+    // No link to click: a login URL arriving in chat is the exact shape of the attack the
+    // confirmation page exists to stop, and the bot should not teach people to trust one.
+    assert.doesNotMatch(content, /https?:\/\//);
   } finally {
     globalThis.fetch = realFetch;
-    if (realUrl === undefined) delete process.env.BACKEND_URL;
-    else process.env.BACKEND_URL = realUrl;
   }
 });
 
@@ -507,4 +488,73 @@ test('an unknown subcommand is logged and never left hanging', async () => {
 test('registerCommands rejects a missing client or backend', () => {
   assert.throws(() => registerCommands({ backend: {} }), TypeError);
   assert.throws(() => registerCommands({ client: new EventEmitter() }), TypeError);
+});
+
+// ---- mentions --------------------------------------------------------------------------
+
+test('/clips top does not echo a mention in the game option back into the channel', async () => {
+  const backend = {
+    getRankings: async () => ({ items: [{ clip: CLIP, reactions: 7, distinctReactors: 5 }] }),
+  };
+  // A member can type anything into `game`; this one matches no clip, so it takes the branch
+  // that used to interpolate it straight into a public message.
+  const interaction = makeInteraction({
+    sub: 'top',
+    options: { year: 2026, game: '@everyone <@&1234567890>' },
+  });
+  await run(interaction, backend);
+
+  const payload = lastEdit(interaction);
+  // Public reply: mentions are off on the payload, not only on the client.
+  assert.deepEqual(payload.allowedMentions, { parse: [] });
+  // And the value is quoted rather than echoed raw, so it reads as a value and cannot close
+  // the code span it is in.
+  assert.match(payload.content, /`@everyone <@&1234567890>`/);
+  assert.doesNotMatch(payload.content, /No ranked @everyone/);
+});
+
+test('a game option full of backticks cannot break out of its code span', async () => {
+  const backend = { getRankings: async () => ({ items: [] }) };
+  const interaction = makeInteraction({
+    sub: 'top',
+    options: { year: 2026, game: '`@everyone`' },
+  });
+  await run(interaction, backend);
+
+  const { content } = lastEdit(interaction);
+  assert.match(content, /`@everyone`/);
+  // Exactly the two backticks this reply opened and closed with.
+  assert.equal(content.split('`').length - 1, 2);
+});
+
+test('every /clips reply disables mentions', async () => {
+  // The embeds and the content interpolate clip titles and usernames from the backend, so no
+  // reply may ping, whether it is public, ephemeral or the error path.
+  const err = new Error('down');
+  err.name = 'ApiError';
+  err.status = 500;
+  const backend = {
+    getGuild: async () => null,
+    putGuild: async (guildId, body) => ({ guildId, ...body }),
+    listClips: async () => ({ items: [CLIP] }),
+    getRankings: async () => ({ items: [{ clip: CLIP, reactions: 7, distinctReactors: 5 }] }),
+  };
+  for (const sub of ['setup', 'latest', 'top', 'mine', 'link']) {
+    const interaction = makeInteraction({ sub, options: { channel: textChannel() } });
+    await run(interaction, backend);
+    assert.deepEqual(
+      lastEdit(interaction).allowedMentions,
+      { parse: [] },
+      `/clips ${sub} replied with mentions enabled`,
+    );
+  }
+
+  // The error path edits the same deferred reply and must not be the exception.
+  const failing = makeInteraction({ sub: 'latest' });
+  await run(failing, {
+    listClips: async () => {
+      throw err;
+    },
+  });
+  assert.deepEqual(lastEdit(failing).allowedMentions, { parse: [] });
 });

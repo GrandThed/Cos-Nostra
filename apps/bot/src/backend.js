@@ -85,13 +85,10 @@ export function createBackend({ baseUrl, botToken, fetch }) {
      */
     listGuilds: () => api.listGuilds(),
 
-    /**
-     * Starts a device login for /clips link. A public route, so it carries no auth; it is
-     * here so the command uses the validated BACKEND_URL rather than reading the env again.
-     * @param {string} deviceName
-     * @returns {Promise<{ code: string, verifyUrl: string, expiresIn: number }>}
-     */
-    startDeviceLogin: (deviceName) => api.startDeviceLogin(deviceName),
+    // No startDeviceLogin here on purpose. The response's `pollSecret` is the only thing that
+    // can finish a device login and it is shown once, so a login started from the bot could
+    // never be collected by the desktop, which starts its own. /clips link explains where the
+    // button is instead; see handleLink in commands.js.
 
     /** @param {import('@cos-nostra/shared').ClipListQuery} [query] */
     listClips: (query) => api.listClips(query),
