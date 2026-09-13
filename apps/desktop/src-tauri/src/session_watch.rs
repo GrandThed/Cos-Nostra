@@ -287,7 +287,11 @@ impl Watch {
                     self.store.add_event(live.id, None, e)?;
                 }
             },
-            Event::Kill { .. } | Event::Death { .. } | Event::Assist { .. } => {
+            Event::Kill { .. }
+            | Event::Death { .. }
+            | Event::Assist { .. }
+            | Event::Multikill { .. }
+            | Event::Objective { .. } => {
                 self.store.add_event(live.id, live.open_match, e)?;
             }
         }

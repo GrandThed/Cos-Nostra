@@ -407,13 +407,35 @@ Not verified, and what would:
 - Marker precision on real footage. The file's start comes from the stop time, which libobs
   honours to within a frame or two; presence polls are one second apart.
 
+Also verified 2026-09-13: a real League match (ARAM) was recorded, ended and kept whole, before
+League had a provider. An app restart mid-game ended that session at its start in the list,
+because recovery only knew the recording's start request; recovery now takes the recording
+file's last write as its stop.
+
+League provider (`providers/league.rs`), added the same day. The game client's documented Live
+Client Data API (`https://127.0.0.1:2999/liveclientdata/allgamedata`, no login, self-signed
+certificate) answers only while a match is loaded. Each poll gives the game clock, the active
+player's Riot ID, all players with champion and team, and the event list. The clock's zero in
+wall-clock time is the smallest `now - gameTime` seen, and every event lands at zero plus its
+`EventTime`, which also places the past events right when the app joins mid-match. The player's
+own kills, deaths, assists and multikills go on the timeline (other players' kills do not), plus
+dragons, heralds, barons, voidgrubs, towers and inhibitors with whose team got them (towers by
+the structure's `T1`/`T2` side, not the last hit), team aces, and `GameEnd` with the result.
+`Multikill` and `Objective` were added to `timeline::Event` for it, and every non-round event now
+has a Select button in the Matches tab that takes the dozen seconds leading up to it. Tested
+against hand-written snapshots, including a match joined midway, a post-game screen that keeps
+the API up, and a new game without an end; **not yet run against a real match**, and Riot's
+event field names are from its sample events rather than a capture.
+
 Next:
 
+- Play a League match with this build and check that kills land where they happened. The log
+  line `league: match on (...)` shows the mode, the map and which names count as the player; if
+  kills never show up, the names in events differ from the active player's.
 - Valorant phase 2: after `match_end`, fetch the match details (`pd.<shard>.a.pvp.net`,
   entitlement token from the local API) and add each kill with `timeSinceGameStartMillis`,
   anchored on the round ends already in the timeline.
-- League: Live Client Data API on `127.0.0.1:2999` (`ChampionKill`, `Multikill`, `Ace`).
-  Counter-Strike: Game State Integration, which needs a `.cfg` in the game's folder.
+- Counter-Strike: Game State Integration, which needs a `.cfg` in the game's folder.
 - Teamfight Tactics runs as `TFTClient-Win64-Shipping.exe`, which is not a session game yet.
 - Matches in the Storage tab, and a limit on how much session footage is kept.
 

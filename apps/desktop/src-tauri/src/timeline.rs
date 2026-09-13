@@ -181,6 +181,18 @@ pub enum Event {
     Assist {
         victim: Option<String>,
     },
+    /// The player's kill streak reached `count` in quick succession: 2 is a double kill, 5 a
+    /// penta in League, an ace in a five-a-side shooter.
+    Multikill {
+        count: u32,
+    },
+    /// Something the match turns on that is not a kill: a dragon, a tower, a team ace, a bomb
+    /// plant. `ours` is true when the player's team got it, false when the other team did, and
+    /// `None` when the game does not say.
+    Objective {
+        name: String,
+        ours: Option<bool>,
+    },
 }
 
 impl Event {
@@ -193,6 +205,8 @@ impl Event {
             Self::Kill { .. } => "kill",
             Self::Death { .. } => "death",
             Self::Assist { .. } => "assist",
+            Self::Multikill { .. } => "multikill",
+            Self::Objective { .. } => "objective",
         }
     }
 }

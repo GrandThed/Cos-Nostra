@@ -255,4 +255,7 @@ export type TimelineEvent = { id: number; match_id: number | null; at: string } 
   | { kind: "kill"; victim: string | null; weapon: string | null; headshot: boolean }
   | { kind: "death"; killer: string | null; weapon: string | null }
   | { kind: "assist"; victim: string | null }
+  | { kind: "multikill"; count: number }
+  /** `ours`: the player's team got it (true), the other team did (false), or unknown. */
+  | { kind: "objective"; name: string; ours: boolean | null }
 );
