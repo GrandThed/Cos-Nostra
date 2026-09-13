@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-13. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed; phase 5 has not started.
+Last updated 2026-09-13. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed. Phase 5 (a public per-guild clip site, redefined from the original yearly-recap plan) is built and tested locally; it deploys alongside phase 6's replace route, since both need the same backend push.
 
 ## 1. What we are building
 
@@ -480,19 +480,73 @@ Next:
   match id; if `matchId` never appears in the presence blob, kills silently never populate,
   which is the whole reason `Presence::match_id` and everything downstream of it is UNVERIFIED.
 
-### Phase 5. Yearly recap. Two weeks, mostly a worker.
+### Phase 5. Public per-guild clip site. Built 2026-09-13, not yet deployed.
 
-Goal: once a year the bot posts a compilation of the best clips.
+Redefined from the original plan's once-a-year recap worker (kept below as a later idea) to
+something used every day: a "YouTube for the server's clips" at a URL scoped to each Discord
+server, open to browse and watch with no login, with Discord login only to manage your own
+clips.
 
-Tasks:
+What exists:
 
-- `/clips recap start [year]` opens an event: the backend freezes the ranking for that year and guild and stores it on the event row.
-- Selection rules, configurable per guild: top N clips by distinct reacting users, at most K per owner, minimum one clip per active member if there is room.
-- Rendering worker: a Node script in `apps/backend/worker` that downloads the H.264 sources, normalizes each to 1920 by 1080 at 60 fps with loudness normalized audio, adds a title card per clip with owner and game, concatenates with ffmpeg, and encodes to AV1 plus H.264. Uploads to `events/<guild>/<year>/`.
-- Where it runs: as a Railway worker service with a larger CPU plan started only for the job, or on the organizer's PC with the same script. The script must work in both places, so it is plain Node plus ffmpeg with no Railway assumptions.
-- The bot posts the result with a leaderboard embed and a link to a recap page on the backend that lists every clip in order.
+- **Path-scoped per guild, not hardcoded to one server.** `guild_settings` gained nullable
+  `name`, `icon` (a bare Discord CDN hash, same convention as `users.avatar`) and `slug`
+  columns, the last with a unique index. `/clips setup` now sends the guild's live `name`/`icon`
+  (from `interaction.guild`, no extra Discord call) on every run, plus an optional `slug`
+  argument, sticky like `language`. A taken slug is refused with `409 slug_taken`; the bot
+  catches that specific status, retries the same `PUT /internal/guilds/:guildId` once without
+  the slug, and reports the conflict separately so it never costs the channel or language
+  change riding along with it. Setting the slug for an existing guild is a manual, one-time
+  `/clips setup` re-run - there is no admin UI or batch script, since every future guild uses
+  the exact same path.
+- **Viewing needs no login.** `routes/guildSite.js` serves `/:slug` (recent clips), `/:slug/games`
+  and `/:slug/g/:game` (browse by game), `/:slug/users` and `/:slug/u/:discordId` (browse by
+  user, with avatars), all public, all built on the same `clips` join through `posts.guildId`
+  that `GET /rankings` already used. `/:slug/c/:id` never renders a clip itself - it 302s to
+  `/c/:id?guild=:slug` so there is exactly one place a clip is ever rendered, keeping the
+  Discord-unfurl-critical Open Graph tags in `routes/player.js` from ever diverging.
+- **A browser session, separate from the desktop's device tokens.** `GET /login` and
+  `GET /login/callback` run the same Discord OAuth dance `lib/discord.js` already had, but end
+  in a `browser_sessions` row (a random token, only its hash stored - the same shape as
+  `devices`, chosen over a sealed cookie or a bare JWT specifically because it can be revoked
+  server-side) carried in a signed, `httpOnly`, `sameSite=lax` cookie. `sameSite=lax` alone is
+  the CSRF defense for the mutating routes below; no token was needed. `POST /logout` destroys
+  the row and clears the cookie. New required env var `SESSION_COOKIE_SECRET` (>=32 chars);
+  the Discord application needs a second OAuth2 redirect, `<PUBLIC_URL>/login/callback`,
+  alongside the device flow's.
+- **Clip management reuses the desktop's own routes, not a parallel API.** `PATCH /clips/:id`
+  (new: rename title, change game) and the existing `DELETE /clips/:id` both now accept either
+  a device token or a session cookie through one `deviceOrSessionAuth` preHandler, so the
+  website's rename/delete panel on the player page (shown only to the clip's owner, via a
+  same-origin `fetch`) calls exactly what the desktop app calls, with exactly the same ownership
+  check. Someone not logged in sees a "Log in with Discord" link instead; the panel and the OG
+  tags coexist on the one player page.
+- **No template engine, no static files.** Every page is still hand-built HTML through
+  `lib/html.js`'s shared `layout()`, extended with a dozen more CSS rules (guild header, avatar
+  cards, the management panel) rather than adding `@fastify/static` or a build step.
 
-Acceptance: run the recap against last year's test data and get a watchable video with correct ordering and credits.
+Verified 2026-09-13 against PGlite: 60 backend tests pass (session login and logout, an owner
+renaming and a stranger being refused, guild browsing by game and by user, a 404 for an unknown
+or reserved slug, a taken slug's 409 and the bot's retry-without-slug), plus 177 bot tests and
+19 shared-package tests, none of which touch a network. **Not yet run against production** -
+that needs the Discord application's second redirect URI and `SESSION_COOKIE_SECRET` set on
+Railway first (see Phase 6, which deploys alongside this), then one `/clips setup` run with a
+chosen slug for the existing FAMAFIA guild.
+
+What changed from the plan and why:
+
+- The yearly recap worker (rendering a compilation video, `/clips recap start`) is **not**
+  part of this phase any more. It is still a reasonable later feature - the ideas below are
+  kept for when it gets picked up - but it stopped being what "phase 5" means for this project.
+- `GET /clips` (the JSON API the desktop and `/clips mine`/`top` use) was **not** extended with
+  a `?guild=` filter. The site's browse pages need shapes (distinct games, distinct users) that
+  do not fit that endpoint's cursor-paginated contract, so they query the database directly in
+  `guildSite.js` instead, the same way `player.js` already does.
+
+Later idea, not currently planned: a yearly recap compilation video (`/clips recap start
+[year]`, selection rules per guild, an ffmpeg rendering worker, a posted leaderboard embed).
+Nothing about the site above blocks building this later; it would sit alongside it as another
+page and another bot command.
 
 ### Phase 6. Editing in the desktop app. Cutting done 2026-09-11.
 

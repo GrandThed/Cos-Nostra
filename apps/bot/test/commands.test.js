@@ -175,6 +175,11 @@ test('commands is JSON for one /clips command with its subcommands', () => {
     ['es', 'en'],
   );
 
+  // The clip site's URL segment is optional too, and sticky like language.
+  const slug = setup.options.find((opt) => opt.name === 'slug');
+  assert.equal(slug.required, false);
+  assert.equal(slug.type, 3);
+
   const top = subs.find((opt) => opt.name === 'top');
   const byName = Object.fromEntries(top.options.map((opt) => [opt.name, opt]));
   assert.equal(byName.year.required, false);
@@ -307,6 +312,74 @@ test('/clips setup ignores a language that is not supported', async () => {
   // Sending it on would be a 400 that also loses the channel change.
   assert.equal('locale' in putCalls[0][1], false);
   assert.match(lastEdit(interaction).content, /se van a publicar/);
+});
+
+test('/clips setup sends the guild name and icon straight from the interaction', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => null,
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...body };
+    },
+  };
+  const interaction = makeInteraction({ sub: 'setup', options: { channel: textChannel() } });
+  interaction.guild = { name: 'FAMAFIA', icon: 'iconhash123' };
+  await run(interaction, backend);
+
+  assert.equal(putCalls[0][1].name, 'FAMAFIA');
+  assert.equal(putCalls[0][1].icon, 'iconhash123');
+});
+
+test('/clips setup sends a chosen slug and confirms the clip site URL', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => null,
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...body, slug: body.slug };
+    },
+  };
+  const interaction = makeInteraction({
+    sub: 'setup',
+    options: { channel: textChannel(), slug: 'FAMAFIA' },
+  });
+  await run(interaction, backend);
+
+  // Slugs are normalized to lowercase before they ever leave the bot.
+  assert.equal(putCalls[0][1].slug, 'famafia');
+  // No language was picked, so the guild's default (Spanish) reply is what confirms it.
+  assert.match(lastEdit(interaction).content, /Sitio de clips: \/famafia/);
+});
+
+test('/clips setup: a taken slug still saves the rest and says so separately', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => null,
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      if (body.slug) {
+        const err = new Error('slug taken');
+        err.name = 'ApiError';
+        err.status = 409;
+        throw err;
+      }
+      return { guildId, ...body };
+    },
+  };
+  const interaction = makeInteraction({
+    sub: 'setup',
+    options: { channel: textChannel(), slug: 'famafia' },
+  });
+  await run(interaction, backend);
+
+  // First call tries the slug, second retries without it so the channel change is not lost.
+  assert.equal(putCalls.length, 2);
+  assert.equal(putCalls[0][1].slug, 'famafia');
+  assert.equal('slug' in putCalls[1][1], false);
+  const { content } = lastEdit(interaction);
+  assert.match(content, /Los clips nuevos se van a publicar en <#chan-9>/);
+  assert.match(content, /ya la usa otro servidor/);
 });
 
 // ---- /clips config ---------------------------------------------------------------------
