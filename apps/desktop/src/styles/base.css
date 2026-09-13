@@ -1,0 +1,444 @@
+/* Reset, page frame, and the handful of components the inventory board (1k) defines:
+   buttons, badges, chips, toggles, inputs. Everything is one element and one class. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 13px;
+  line-height: 1.45;
+  /* The window has no chrome of its own, so it draws its own edge. */
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Maximised, the rounded corners would cut into the screen edge. */
+body.maximized {
+  border-radius: 0;
+  border-color: transparent;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--display);
+  font-weight: 600;
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.muted {
+  color: var(--mut);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* --- Buttons ------------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--mut);
+}
+
+.btn.primary {
+  background: var(--acc);
+  border-color: var(--acc);
+  color: var(--accInk);
+  font-weight: 600;
+}
+
+.btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn.danger {
+  border-color: var(--err);
+  color: var(--err);
+  font-weight: 500;
+}
+
+/* Second click of a two-click confirm. Re-armed by the script after three seconds. */
+.btn.danger.armed {
+  background: var(--err);
+  border-color: var(--err);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn.warn.armed {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #231a05;
+  font-weight: 600;
+}
+
+.btn.small {
+  padding: 5px 12px;
+  font-size: 12.5px;
+  border-radius: 8px;
+}
+
+.btn:disabled {
+  color: var(--mut);
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn .key {
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+
+.btn .key:empty {
+  display: none;
+}
+
+/* --- Status badges ------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--panel2);
+  color: var(--mut);
+  white-space: nowrap;
+}
+
+.badge.encoding,
+.badge.retrying {
+  color: var(--warn);
+}
+.badge.ready {
+  color: var(--ink);
+}
+.badge.uploading {
+  color: var(--info);
+}
+.badge.done {
+  color: var(--ok);
+}
+.badge.failed {
+  color: var(--err);
+}
+.badge.released {
+  color: var(--rel);
+}
+
+/* --- Chips and pills ----------------------------------------------------- */
+
+.chip {
+  padding: 4px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--mut);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chip[aria-pressed="true"] {
+  background: var(--panel2);
+  border-color: var(--acc);
+  color: var(--ink);
+}
+
+.chip.dashed {
+  border-style: dashed;
+  font-size: 11.5px;
+  padding: 3px 10px;
+}
+
+.chip .new {
+  color: var(--acc);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* --- Inputs -------------------------------------------------------------- */
+
+.field {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 10px;
+  background: var(--bg);
+  color: inherit;
+  min-width: 0;
+}
+
+.field:focus {
+  border-color: var(--acc);
+  outline: none;
+}
+
+.field.mono {
+  font-size: 12px;
+}
+
+.field.num {
+  width: 74px;
+  text-align: right;
+}
+
+select.field {
+  padding: 5px 8px;
+  border-radius: 8px;
+  color: var(--mut);
+  background: transparent;
+}
+
+/* --- Toggle -------------------------------------------------------------- */
+
+.toggle {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle .track {
+  position: relative;
+  flex: none;
+  width: 32px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: 9px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  transition: background 0.12s ease;
+}
+
+.toggle .track::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--mut);
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.toggle input:checked + .track {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.toggle input:checked + .track::after {
+  transform: translateX(14px);
+  width: 14px;
+  height: 14px;
+  background: #fff;
+}
+
+.toggle input:focus-visible + .track {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+.toggle .label small {
+  display: block;
+  color: var(--mut);
+  font-size: 11.5px;
+  text-wrap: pretty;
+}
+
+/* --- Checkbox ------------------------------------------------------------ */
+
+.check {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.check input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.check .box {
+  position: relative;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--mut);
+  border-radius: 4px;
+}
+
+.check input:checked + .box {
+  background: var(--acc);
+  border-color: var(--acc);
+}
+
+.check input:checked + .box::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 0.5px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--accInk);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.check input:focus-visible + .box {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+/* --- Radio cards (the quality and engine pickers) ------------------------ */
+
+.cards {
+  display: flex;
+  gap: 8px;
+}
+
+.radio-card {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 11px;
+  background: transparent;
+  text-align: left;
+  min-width: 0;
+}
+
+.radio-card b {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.radio-card small {
+  display: block;
+  color: var(--mut);
+  font-size: 11px;
+  text-wrap: pretty;
+}
+
+.radio-card[aria-checked="true"] {
+  border: 2px solid var(--acc);
+  padding: 8px 10px;
+  background: var(--bg);
+}
+
+/* --- The mascot: a hand-drawn smiley blob ------------------------------- */
+
+.mark {
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  border-radius: 52% 48% 45% 55%;
+  background: var(--acc);
+}
+
+.mark::before {
+  content: "";
+  position: absolute;
+  left: 26%;
+  top: 32%;
+  width: 17%;
+  height: 17%;
+  border-radius: 50%;
+  background: var(--accInk);
+  box-shadow: 0.32em 0 0 var(--accInk);
+}
+
+/* A button that reads as a link: used inline in banners and in the status panel rows. */
+.link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--acc);
+  text-decoration: underline;
+  font: inherit;
+}
+
+/* --- Section labels ------------------------------------------------------ */
+
+.section-label {
+  color: var(--mut);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* --- Scrollbars ---------------------------------------------------------- */
+
+.scroll {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}

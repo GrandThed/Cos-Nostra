@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
@@ -30,7 +30,7 @@ serde_json = "1"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # Backend API client. 0.13 with rustls is already in the graph through libobs-bootstrapper.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 chrono = "0.4"

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use libobs_bootstrapper::status_handler::ObsBootstrapStatusHandler;
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -24,13 +25,13 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutSt
 use tauri_plugin_notification::NotificationExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
-use api::{Api, DevicePoll, NewClipUpload};
+use api::{Api, DevicePoll, NewClipUpload, ReplaceClipUpload};
 use capture::{CaptureConflict, HookCallback, HookedGame, Recorder};
-use ffmpeg::{Binaries, Encoders, Trim};
+use ffmpeg::{Binaries, Cut, Encoders, Segment};
 use games::DetectedGame;
 use queue::{
-    ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, UploadResult,
-    Uploader, Worker,
+    ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, Refused,
+    UploadResult, Uploader, Worker,
 };
 use settings::{Account, Settings};
 
@@ -57,11 +58,24 @@ struct AppState {
     worker: Mutex<Option<Worker>>,
     /// The device login in progress, if any. Replaced by `start_login`, cleared on finish.
     login: Mutex<Option<LoginSession>>,
+    /// Where the OBS runtime download has got to. The first-run screen reads it, and polls it
+    /// once at startup because the webview may finish loading after the download does.
+    bootstrap: Mutex<Bootstrap>,
+    /// Per-clip encode and upload percentages, keyed by clip id. Live only: the queue owns the
+    /// statuses, this is just how far the job that is running right now has got.
+    progress: Mutex<std::collections::HashMap<i64, ClipProgress>>,
 }
 
 /// A running device login: the poll thread stops when `cancelled` is set.
+///
+/// `poll_secret` lives here and nowhere else. It is not persisted (a login that outlives the
+/// process is not a login) and it is never sent to the webview, which has no use for it.
 struct LoginSession {
     code: String,
+    /// Held so the secret's lifetime is the login's: replacing or cancelling a login drops it.
+    /// The poll thread got its own copy, which is why nothing reads this one.
+    #[allow(dead_code)]
+    poll_secret: String,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -110,6 +124,29 @@ struct Status {
     auto_upload: bool,
 }
 
+/// How far the OBS runtime bootstrap has got. `Ready` on every launch after the first.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum Bootstrap {
+    Downloading { progress: f32, message: String },
+    Extracting { progress: f32, message: String },
+    /// The runtime landed; the app has to restart before it can load the real `obs.dll`.
+    Restarting,
+    /// The default: the common launch has the runtime already, and the first-run screen only
+    /// appears once the bootstrapper says it has work to do.
+    #[default]
+    Ready,
+    Failed { message: String },
+}
+
+/// The percentage the running encode or upload of one clip has reached.
+#[derive(Serialize, Clone, Copy, Debug)]
+struct ClipProgress {
+    id: i64,
+    stage: &'static str,
+    percent: u8,
+}
+
 #[derive(Serialize, Clone)]
 struct ClipSaved {
     path: String,
@@ -122,6 +159,37 @@ struct ClipsChanged {
 
 fn emit_clips_changed(app: &AppHandle, id: Option<i64>) {
     let _ = app.emit("clips-changed", ClipsChanged { id });
+}
+
+/// Records how far a clip's encode or upload has got and tells the UI. Called from the worker
+/// thread several times a second, so it does nothing when the whole percent has not moved.
+fn set_progress(app: &AppHandle, id: i64, stage: &'static str, percent: u8) {
+    let percent = percent.min(100);
+    let state = app.state::<AppState>();
+    {
+        let mut live = state.progress.lock().unwrap();
+        match live.get(&id) {
+            Some(p) if p.stage == stage && p.percent == percent => return,
+            _ => live.insert(id, ClipProgress { id, stage, percent }),
+        };
+    }
+    let _ = app.emit("clip-progress", ClipProgress { id, stage, percent });
+}
+
+/// Forgets a clip's percentage once its job is over, so a finished badge never shows a stale
+/// number if the clip is retried later.
+fn clear_progress(app: &AppHandle, id: i64) {
+    app.state::<AppState>().progress.lock().unwrap().remove(&id);
+    let _ = app.emit("clip-progress", ClipProgress { id, stage: "idle", percent: 0 });
+}
+
+/// Lets the asset protocol read the clip folder, so the player can play the local H.264 file.
+/// Re-run whenever the folder changes; scopes only ever widen, which is fine for a folder the
+/// user chose themselves.
+fn allow_clip_dir(app: &AppHandle, dir: &Path) {
+    if let Err(e) = app.asset_protocol_scope().allow_directory(dir, false) {
+        log::warn!("clip folder {} is not readable by the player: {e}", dir.display());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +238,15 @@ fn save_clip(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    // The device token never crosses into the webview. It is a long-lived bearer for the
+    // backend, and the webview is the one part of this app that runs code the backend (or a
+    // page it serves) can influence; the UI shows the login through `account` instead.
+    // `save_settings_inner` puts the live token back on the way in, so a round trip through
+    // the UI does not log the device out.
+    Settings {
+        device_token: None,
+        ..state.settings.lock().unwrap().clone()
+    }
 }
 
 /// Validates, persists and applies new settings. Async so the hotkey swap and the file write
@@ -254,11 +330,14 @@ fn start_login_inner(app: &AppHandle) -> anyhow::Result<LoginStarted> {
     if let Some(old) = state.login.lock().unwrap().take() {
         old.cancelled.store(true, Ordering::SeqCst);
     }
+    let backend_url = state.settings.lock().unwrap().backend_url.clone();
     let api = state.api()?;
     let device_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into());
     let start = api
         .start_device_login(&device_name)
         .context("starting device login")?;
+    // Before this ever reaches the shell. See `check_verify_url`.
+    check_verify_url(&backend_url, &start.verify_url)?;
     log::info!("device login {} started, opening {}", start.code, start.verify_url);
     if let Err(e) = app.opener().open_url(&start.verify_url, None::<&str>) {
         log::warn!("opening browser: {e}");
@@ -267,11 +346,13 @@ fn start_login_inner(app: &AppHandle) -> anyhow::Result<LoginStarted> {
     let cancelled = Arc::new(AtomicBool::new(false));
     *state.login.lock().unwrap() = Some(LoginSession {
         code: start.code.clone(),
+        poll_secret: start.poll_secret.clone(),
         cancelled: Arc::clone(&cancelled),
     });
     let poll_app = app.clone();
     let code = start.code.clone();
-    std::thread::spawn(move || poll_login(&poll_app, api, &code, cancelled));
+    let poll_secret = start.poll_secret;
+    std::thread::spawn(move || poll_login(&poll_app, api, &code, &poll_secret, cancelled));
     let _ = app.emit("login-changed", ());
     Ok(LoginStarted {
         code: start.code,
@@ -279,8 +360,66 @@ fn start_login_inner(app: &AppHandle) -> anyhow::Result<LoginStarted> {
     })
 }
 
+/// Scheme and authority of an absolute http(s) URL, lowercased, port kept. `None` for anything
+/// that is not plainly `http://host...` or `https://host...`.
+///
+/// Deliberately strict rather than lenient: userinfo (`https://good.example@evil.example/`),
+/// backslashes (which browsers and shells treat as separators) and whitespace all mean "not a
+/// URL I am willing to reason about", because the caller uses the answer to decide whether to
+/// hand the string to the Windows shell.
+fn origin_of(url: &str) -> Option<(String, String)> {
+    // A backslash is a path separator to the shell and a slash to a browser, so a URL
+    // containing one means two different things to the two things that will see it.
+    if url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\') {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some((scheme, authority))
+}
+
+/// True for the two hosts a backend may legitimately be reached over plain http: a local one.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = authority.split(':').next().unwrap_or(authority);
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// Refuses to open a browser URL that did not come from the configured backend.
+///
+/// `verify_url` arrives in the backend's answer to `POST /auth/device`, and `open_url` on
+/// Windows ends up in `powershell Start-Process -FilePath <target>`, which happily launches a
+/// local or UNC `.bat`, `.exe` or `.hta`. A backend that is compromised, impersonated or
+/// simply reached over a hostile network would then get code execution on every client that
+/// presses "Link Discord". So the URL has to be https (or http to a local backend, which is
+/// how the dev backend is used) and has to point at the same host and port as the backend
+/// the user configured.
+fn check_verify_url(backend_url: &str, verify_url: &str) -> anyhow::Result<()> {
+    let (backend_scheme, backend_host) = origin_of(backend_url)
+        .with_context(|| format!("backend URL is not an http(s) URL: {backend_url}"))?;
+    let (scheme, host) = origin_of(verify_url).ok_or_else(|| {
+        anyhow::anyhow!("the backend answered with a verification URL that is not http(s)")
+    })?;
+    if host != backend_host {
+        anyhow::bail!(
+            "the backend answered with a verification URL for {host}, which is not the backend \
+             ({backend_host}); refusing to open it"
+        );
+    }
+    if scheme != "https" && !(backend_scheme == "http" && is_loopback_authority(&backend_host)) {
+        anyhow::bail!("the verification URL must be https; refusing to open {scheme}://{host}");
+    }
+    Ok(())
+}
+
 /// Polls the device code until it is ready. Runs on its own thread.
-fn poll_login(app: &AppHandle, api: Api, code: &str, cancelled: Arc<AtomicBool>) {
+fn poll_login(app: &AppHandle, api: Api, code: &str, poll_secret: &str, cancelled: Arc<AtomicBool>) {
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     let outcome: Result<(String, Account), String> = loop {
         std::thread::sleep(LOGIN_POLL);
@@ -290,10 +429,15 @@ fn poll_login(app: &AppHandle, api: Api, code: &str, cancelled: Arc<AtomicBool>)
         if Instant::now() > deadline {
             break Err("login timed out; try again".into());
         }
-        match api.poll_device_login(code) {
+        match api.poll_device_login(code, poll_secret) {
             Ok(Some(DevicePoll::Pending)) => {}
             Ok(Some(DevicePoll::Ready { token, user })) => break Ok((token, user.into())),
             Ok(None) => break Err("login code expired; try again".into()),
+            // The poll secret is not accepted. Retrying for ten minutes cannot fix that.
+            Err(e) if api::status_of(&e) == Some(401) => {
+                log::warn!("device login poll rejected: {e:#}");
+                break Err("the backend rejected this login; try again".into());
+            }
             Err(e) => {
                 // Transient network trouble: keep polling until the deadline.
                 log::warn!("polling device login: {e:#}");
@@ -389,24 +533,49 @@ fn list_clips(state: State<AppState>) -> Result<Vec<ClipRow>, String> {
     queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))
 }
 
-/// Removes the row and every file we know about for it. Missing files are fine.
+/// Deletes a clip everywhere: the copy on the site first, then the row and every file we know
+/// about here. Missing files are fine.
+///
+/// The site goes first on purpose. If it cannot be reached, nothing local is touched and the
+/// error says so, because a clip deleted only here would leave a video on the site that the
+/// app can no longer see, let alone remove. A clip the site has already forgotten (404) is not
+/// an obstacle.
 #[tauri::command]
 async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let row = queue_or_err(&state)?
-        .delete(id)
-        .map_err(|e| format!("{e:#}"))?;
-    if let Some(row) = row {
-        for p in storage::clip_files(&row) {
-            match std::fs::remove_file(&p) {
-                Ok(()) => log::info!("deleted {p}"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("could not delete {p}: {e}"),
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let queue = queue_or_err(&state)?;
+        let row = queue.get(id).map_err(|e| format!("{e:#}"))?;
+
+        if let Some(remote_id) = row.as_ref().and_then(|r| r.remote_id.as_deref()) {
+            let api = state.api().map_err(|e| format!("{e:#}"))?;
+            match api.delete_clip(remote_id) {
+                Ok(()) => log::info!("clip {id}: removed {remote_id} from the site"),
+                Err(e) if api::status_of(&e) == Some(404) => {
+                    log::info!("clip {id}: the site no longer has {remote_id}");
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the copy on the site could not be deleted, so nothing was removed here: {e:#}"
+                    ))
+                }
             }
         }
-    }
-    emit_clips_changed(&app, Some(id));
-    Ok(())
+
+        let row = queue.delete(id).map_err(|e| format!("{e:#}"))?;
+        if let Some(row) = row {
+            for p in storage::clip_files(&row) {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => log::info!("deleted {p}"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("could not delete {p}: {e}"),
+                }
+            }
+        }
+        emit_clips_changed(&app, Some(id));
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -420,14 +589,59 @@ fn set_clip_game(app: AppHandle, id: i64, game: Option<String>) -> Result<(), St
     Ok(())
 }
 
+/// Renames every clip of one game at once, which is also how two games are merged: rename the
+/// misdetected one to the name the good one already has and the library folds them together.
+/// `from` is `None` for the "Unknown game" pile, `to` is `None` to send clips back to it.
+#[tauri::command]
+fn rename_game(app: AppHandle, from: Option<String>, to: Option<String>) -> Result<usize, String> {
+    let state = app.state::<AppState>();
+    let to = to.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+    let changed = queue_or_err(&state)?
+        .rename_game(from.as_deref(), to.as_deref())
+        .map_err(|e| format!("{e:#}"))?;
+    if changed > 0 {
+        emit_clips_changed(&app, None);
+    }
+    Ok(changed)
+}
+
 #[tauri::command]
 fn retry_clip(app: AppHandle, id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     queue_or_err(&state)?
         .retry(id)
         .map_err(|e| format!("{e:#}"))?;
+    clear_progress(&app, id);
     state.wake_worker();
     emit_clips_changed(&app, Some(id));
+    Ok(())
+}
+
+/// The percentages of whatever the worker is busy with, so a UI that opened mid-job is not
+/// left waiting for the next event.
+#[tauri::command]
+fn clip_progress(state: State<AppState>) -> Vec<ClipProgress> {
+    state.progress.lock().unwrap().values().copied().collect()
+}
+
+/// How far the OBS runtime download has got. Polled once on load; updates arrive as events.
+#[tauri::command]
+fn get_bootstrap(state: State<AppState>) -> Bootstrap {
+    state.bootstrap.lock().unwrap().clone()
+}
+
+/// Closes the first-run flow, whether the user linked Discord or skipped it.
+#[tauri::command]
+fn finish_first_run(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut settings = state.settings.lock().unwrap();
+    if settings.first_run_done {
+        return Ok(());
+    }
+    settings.first_run_done = true;
+    settings.save().map_err(|e| format!("{e:#}"))?;
+    drop(settings);
+    let _ = app.emit("status-changed", ());
     Ok(())
 }
 
@@ -470,6 +684,123 @@ fn get_thumbnail(state: State<AppState>, id: i64) -> Result<Option<String>, Stri
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("reading {thumb}: {e}")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Editor commands
+
+/// What the editor works on: the file, what ffprobe says about it, and the cut it already
+/// carries when that cut was measured against this very file.
+#[derive(Serialize, Clone)]
+struct EditSource {
+    path: String,
+    duration_ms: i64,
+    fps: f64,
+    width: u32,
+    height: u32,
+    has_audio: bool,
+    cut: Option<Vec<Segment>>,
+    /// True when `path` is the untouched recording, so a cut costs nothing and can be
+    /// changed again later. False means the encoded copy is all that is left and a cut is
+    /// baked into it for good.
+    original: bool,
+}
+
+/// The file an edit applies to: the original recording while it is still here, otherwise
+/// the best encoded copy. `None` when the clip has no video on this PC.
+fn edit_source_path(row: &ClipRow) -> Option<(String, bool)> {
+    if Path::new(&row.source_path).is_file() {
+        return Some((row.source_path.clone(), true));
+    }
+    [&row.h264_path, &row.av1_path]
+        .into_iter()
+        .flatten()
+        .find(|p| Path::new(p).is_file())
+        .map(|p| (p.clone(), false))
+}
+
+/// Probes the file the editor should load for a clip. Off the main thread: ffprobe.
+#[tauri::command]
+async fn edit_source(app: AppHandle, id: i64) -> Result<EditSource, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let row = queue_or_err(&state)?
+            .get(id)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("clip {id} not found"))?;
+        let (path, original) = edit_source_path(&row)
+            .ok_or_else(|| "this clip has no video on this PC to edit".to_string())?;
+        let bins = state
+            .ffmpeg
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "ffmpeg is not available".to_string())?;
+        let info = ffmpeg::probe(&bins, Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        Ok(EditSource {
+            path,
+            duration_ms: info.duration_ms,
+            fps: info.fps,
+            width: info.width,
+            height: info.height,
+            has_audio: info.has_audio,
+            // A cut only means something against the recording it was made on.
+            cut: if original { row.cut.clone() } else { None },
+            original,
+        })
+    })
+    .await
+}
+
+/// Stores the editor's cut and sends the clip back through the encoder. An empty list is
+/// the whole recording, which is how an earlier cut is undone. A cut identical to the one
+/// the outputs already carry is a no-op, so pressing Apply twice does not encode twice.
+#[tauri::command]
+async fn apply_cut(app: AppHandle, id: i64, segments: Vec<Segment>) -> Result<(), String> {
+    let emit_app = app.clone();
+    let changed = on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let queue = queue_or_err(&state)?;
+        let row = queue
+            .get(id)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("clip {id} not found"))?;
+        let (path, original) = edit_source_path(&row)
+            .ok_or_else(|| "this clip has no video on this PC to edit".to_string())?;
+        let bins = state
+            .ffmpeg
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "ffmpeg is not available".to_string())?;
+        let info = ffmpeg::probe(&bins, Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        let cut = Cut::normalize(&segments, info.duration_ms).map_err(|e| format!("{e:#}"))?;
+
+        let current = if original { row.cut.clone().unwrap_or_default() } else { Vec::new() };
+        let settled = matches!(row.status, ClipStatus::Encoded | ClipStatus::Done);
+        if settled && cut.segments == current {
+            log::info!("clip {id}: cut unchanged, nothing to re-encode");
+            return Ok(false);
+        }
+        let stored = if cut.is_whole() { None } else { Some(cut.segments.as_slice()) };
+        queue
+            .request_reencode(id, stored)
+            .map_err(|e| format!("{e:#}"))?;
+        log::info!(
+            "clip {id}: re-encode requested with {} kept part(s) from {}",
+            cut.segments.len(),
+            path
+        );
+        Ok(true)
+    })
+    .await?;
+    if changed {
+        let state = emit_app.state::<AppState>();
+        clear_progress(&emit_app, id);
+        state.wake_worker();
+        emit_clips_changed(&emit_app, Some(id));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -596,19 +927,64 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     // ffmpeg::av1_args - and clip encoding runs after the game has exited anyway.
     let encoders = ffmpeg::encoders_for(&probed, engine);
 
-    let source = Path::new(&row.source_path);
-    let (av1, h264, thumb) = storage::output_paths(source);
-    log::info!("encoding clip {} ({})", row.id, source.display());
+    // The outputs are always named after the recording, but what they are encoded *from* is
+    // the recording only while it is still here. After the Storage tab (or the setting) has
+    // dropped it, a re-encode - which only the editor asks for - reads the encoded copy
+    // instead, and the cut is then baked in rather than kept as an instruction.
+    let (source, original) = edit_source_path(row).with_context(|| {
+        format!("clip {}: the recording {} is gone and no encoded copy is left", row.id, row.source_path)
+    })?;
+    let source = Path::new(&source);
+    let (av1, h264, thumb) = storage::output_paths(Path::new(&row.source_path));
+    let cut = Cut {
+        segments: row.cut.clone().unwrap_or_default(),
+    };
+    if !original && !cut.is_whole() {
+        log::warn!(
+            "clip {}: cutting the encoded copy {} because the recording is gone; the cut will be permanent",
+            row.id,
+            source.display()
+        );
+    }
+    log::info!(
+        "encoding clip {} ({}){}",
+        row.id,
+        source.display(),
+        if cut.is_whole() { String::new() } else { format!(", {} kept part(s)", cut.segments.len()) }
+    );
+
+    // The source is probed rather than trusted from the row: an edited row's duration is the
+    // cut length, and a source that is the encoded copy is not the file the row describes.
+    let info = ffmpeg::probe(&bins, source).context("probing the source")?;
+    let cut = Cut::normalize(&cut.segments, info.duration_ms).context("checking the cut")?;
+    let kept_ms = cut.kept_ms(info.duration_ms);
 
     let t = Instant::now();
-    let at_ms = row.duration_ms / 4;
+    let at_ms = cut.source_time_at(0.25, info.duration_ms);
     ffmpeg::thumbnail(&bins, source, &thumb, at_ms)
         .with_context(|| format!("thumbnail for {}", source.display()))?;
     log::info!("clip {}: thumbnail in {:.1?}", row.id, t.elapsed());
 
+    // Both encodes read the same source, so the badge counts the AV1 pass as the first half of
+    // the clip and the H.264 pass as the second.
+    let on_av1 = |done: f32| set_progress(app, row.id, "encode", (done * 50.0) as u8);
+    let on_h264 = |done: f32| set_progress(app, row.id, "encode", (50.0 + done * 50.0) as u8);
+
     let t = Instant::now();
-    ffmpeg::encode_av1(&bins, &encoders.av1, quality, source, &av1, Trim::default())
-        .with_context(|| format!("AV1 encode with {}", encoders.av1))?;
+    ffmpeg::encode_av1(
+        &bins,
+        &encoders.av1,
+        quality,
+        source,
+        &av1,
+        &cut,
+        info.has_audio,
+        Some(&ffmpeg::Progress {
+            duration_ms: kept_ms,
+            on: &on_av1,
+        }),
+    )
+    .with_context(|| format!("AV1 encode with {}", encoders.av1))?;
     let size_av1 = file_size(&av1)?;
     log::info!(
         "clip {}: AV1 ({}) in {:.1?}, {} bytes",
@@ -619,8 +995,20 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     );
 
     let t = Instant::now();
-    ffmpeg::encode_h264(&bins, &encoders.h264, quality, source, &h264, Trim::default())
-        .with_context(|| format!("H.264 encode with {}", encoders.h264))?;
+    ffmpeg::encode_h264(
+        &bins,
+        &encoders.h264,
+        quality,
+        source,
+        &h264,
+        &cut,
+        info.has_audio,
+        Some(&ffmpeg::Progress {
+            duration_ms: kept_ms,
+            on: &on_h264,
+        }),
+    )
+    .with_context(|| format!("H.264 encode with {}", encoders.h264))?;
     let size_h264 = file_size(&h264)?;
     log::info!(
         "clip {}: H.264 ({}) in {:.1?}, {} bytes",
@@ -630,12 +1018,33 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
         size_h264
     );
 
+    // The length the row will show is what actually got written, not the arithmetic on the
+    // cut: keyframe placement can move an edge by a frame.
+    let duration_ms = match ffmpeg::probe(&bins, &av1) {
+        Ok(out) if out.duration_ms > 0 => Some(out.duration_ms),
+        Ok(_) => Some(kept_ms),
+        Err(e) => {
+            log::warn!("clip {}: could not probe the AV1 output: {e:#}", row.id);
+            Some(kept_ms)
+        }
+    };
+
+    if !original && !cut.is_whole() {
+        // Baked into the copy the next edit would read from, so it must not apply again.
+        if let Some(queue) = state.queue() {
+            if let Err(e) = queue.clear_cut(row.id) {
+                log::warn!("clip {}: could not clear the baked cut: {e:#}", row.id);
+            }
+        }
+    }
+
     Ok(Outputs {
         av1_path: av1.display().to_string(),
         h264_path: h264.display().to_string(),
         thumb_path: thumb.display().to_string(),
         size_av1,
         size_h264,
+        duration_ms,
     })
 }
 
@@ -649,31 +1058,90 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
     let thumb = row.thumb_path.as_deref().context("clip has no thumbnail")?;
 
     let t = Instant::now();
-    let created = api
-        .create_clip(&NewClipUpload {
+    // The backend signs each upload URL for the size declared here, so these come from the
+    // files themselves. The sizes the encode wrote to the queue are the same numbers in
+    // every ordinary case, but a re-encode or a half-written file would make them a lie the
+    // bucket rejects, and `stat` costs nothing next to the upload.
+    let size_av1 = file_size(Path::new(av1))?;
+    let size_h264 = file_size(Path::new(h264))?;
+    let size_thumb = file_size(Path::new(thumb))?;
+
+    // 503 is the backend missing its storage config, which someone may well fix while the
+    // clip waits, so it retries. 413 is this clip being too big or this account being out of
+    // quota: the same bytes will be refused every time, so it is marked `Refused` and the
+    // queue parks it for a manual retry rather than spending five backoffs on a certainty.
+    let explain = |e: anyhow::Error| match api::status_of(&e) {
+        Some(503) => e.context("the backend has no storage configured yet"),
+        Some(413) => {
+            e.context(Refused("the backend refused this clip: too large, or your storage quota is full"))
+        }
+        _ => e,
+    };
+    let create = || {
+        api.create_clip(&NewClipUpload {
             game: row.game.clone(),
             title: row.title.clone(),
             duration_ms: row.duration_ms,
             width: row.width,
             height: row.height,
             recorded_at: row.recorded_at.clone(),
-            size_av1: row.size_av1.unwrap_or(0),
-            size_h264: row.size_h264.unwrap_or(0),
+            size_av1,
+            size_h264,
+            size_thumb,
         })
-        .map_err(|e| match api::status_of(&e) {
-            Some(503) => e.context("the backend has no storage configured yet"),
-            _ => e,
-        })
-        .context("creating clip record")?;
-    log::info!("clip {}: remote id {}", row.id, created.id);
+        .map_err(explain)
+        .context("creating clip record")
+    };
+    // A clip the site already has is replaced under its own id, so the page URL and the
+    // Discord post keep working. If the site has since forgotten it (deleted from another
+    // device, say), it becomes a new clip rather than an error the queue retries forever.
+    // Only the backend's own `not_found` counts: a backend too old to have the route
+    // answers 404 as well, and turning that into a fresh upload would post the clip to
+    // Discord a second time.
+    let (created, replaced) = match row.remote_id.as_deref() {
+        Some(remote) => match api.replace_clip(
+            remote,
+            &ReplaceClipUpload {
+                duration_ms: row.duration_ms,
+                size_av1,
+                size_h264,
+                size_thumb,
+            },
+        ) {
+            Ok(c) => (c, true),
+            Err(e) if api::http_error(&e).is_some_and(|h| h.status == 404 && h.error == "not_found") => {
+                log::warn!("clip {}: the site no longer has {remote}, uploading as a new clip", row.id);
+                (create()?, false)
+            }
+            Err(e) => return Err(explain(e).context("replacing clip on the site")),
+        },
+        None => (create()?, false),
+    };
+    log::info!(
+        "clip {}: remote id {}{}",
+        row.id,
+        created.id,
+        if replaced { " (replacing)" } else { "" }
+    );
 
-    for (url, path, content_type) in [
-        (&created.uploads.av1, av1, "video/mp4"),
-        (&created.uploads.h264, h264, "video/mp4"),
-        (&created.uploads.thumb, thumb, "image/jpeg"),
+    // The three files go up back to back, so the percentage counts bytes against their sum
+    // rather than restarting at zero for each one.
+    let total = (size_av1 + size_h264 + size_thumb).max(1) as u64;
+    let mut uploaded: u64 = 0;
+    for (url, path, content_type, size) in [
+        (&created.uploads.av1, av1, "video/mp4", size_av1),
+        (&created.uploads.h264, h264, "video/mp4", size_h264),
+        (&created.uploads.thumb, thumb, "image/jpeg", size_thumb),
     ] {
-        api.put_file(url, Path::new(path), content_type)
+        let progress_app = app.clone();
+        let id = row.id;
+        let before = uploaded;
+        let on_bytes: api::OnBytes = Arc::new(move |sent| {
+            set_progress(&progress_app, id, "upload", ((before + sent) * 100 / total) as u8);
+        });
+        api.put_file(url, Path::new(path), content_type, Some(on_bytes))
             .with_context(|| format!("uploading {path}"))?;
+        uploaded += size as u64;
     }
 
     let done = api
@@ -686,7 +1154,7 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
         done.urls.page
     );
     if state.settings.lock().unwrap().notify_on_save {
-        show_toast(app, "Clip uploaded", &done.urls.page);
+        show_toast(app, if replaced { "Clip updated" } else { "Clip uploaded" }, &done.urls.page);
     }
     Ok(UploadResult {
         remote_id: done.id,
@@ -717,8 +1185,16 @@ fn encode_allowed(app: &AppHandle) -> bool {
 /// never race an encode. Both settings are off by default, and then this is one lock and a
 /// return.
 fn on_clip_changed(app: &AppHandle, id: i64) {
-    emit_clips_changed(app, Some(id));
     let state = app.state::<AppState>();
+    // A status change means the job that owned the percentage is over, one way or another.
+    // The next one sets its own before the first event arrives.
+    if !matches!(
+        state.queue().and_then(|q| q.get(id).ok()).flatten().map(|r| r.status),
+        Some(ClipStatus::Encoding) | Some(ClipStatus::Uploading)
+    ) {
+        clear_progress(app, id);
+    }
+    emit_clips_changed(app, Some(id));
     let (drop_sources, limit_gb, clip_dir) = {
         let s = state.settings.lock().unwrap();
         (
@@ -884,6 +1360,7 @@ fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedG
         duration_ms: info.duration_ms,
         width: info.width,
         height: info.height,
+        fps: info.fps,
         size_source: info.size as i64,
     };
     match queue.enqueue(clip) {
@@ -989,6 +1466,81 @@ fn play_save_sound() {
     let ok = unsafe { PlaySoundW(w!("SystemAsterisk"), None, SND_ALIAS | SND_ASYNC) };
     if !ok.as_bool() {
         log::debug!("PlaySoundW returned false");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OBS runtime bootstrap
+
+/// Feeds the bootstrapper's progress to the first-run screen. Throttled to whole percents:
+/// the download reports far more often than a progress bar can use.
+#[derive(Debug)]
+struct BootstrapReporter {
+    app: AppHandle,
+    last_download: f32,
+    last_extract: f32,
+}
+
+impl ObsBootstrapStatusHandler for BootstrapReporter {
+    type Error = std::convert::Infallible;
+
+    fn handle_downloading(&mut self, progress: f32, message: String) -> Result<(), Self::Error> {
+        if progress - self.last_download >= 0.01 || progress >= 1.0 {
+            self.last_download = progress;
+            set_bootstrap(&self.app, Bootstrap::Downloading { progress, message });
+        }
+        Ok(())
+    }
+
+    fn handle_extraction(&mut self, progress: f32, message: String) -> Result<(), Self::Error> {
+        if progress - self.last_extract >= 0.01 || progress >= 1.0 {
+            self.last_extract = progress;
+            set_bootstrap(&self.app, Bootstrap::Extracting { progress, message });
+        }
+        Ok(())
+    }
+}
+
+fn set_bootstrap(app: &AppHandle, next: Bootstrap) {
+    *app.state::<AppState>().bootstrap.lock().unwrap() = next.clone();
+    let _ = app.emit("obs-bootstrap", next);
+}
+
+/// Installs the OBS runtime if this machine does not have it, then starts the recorder.
+///
+/// This runs inside the app rather than before it so the first-run screen can show the
+/// download; on every later launch the bootstrapper finds a valid installation and returns at
+/// once. The exe links `obs.dll` at load time and starts against the dummy the installer
+/// ships, so a fresh runtime can only take effect after a restart: the bootstrapper leaves an
+/// updater behind that waits for this process to exit, swaps the dll and launches us again.
+async fn bootstrap_and_start_recorder(app: AppHandle) {
+    let options = libobs_bootstrapper::ObsBootstrapperOptions::default();
+    let reporter = Box::new(BootstrapReporter {
+        app: app.clone(),
+        last_download: 0.0,
+        last_extract: 0.0,
+    });
+    match libobs_bootstrapper::ObsBootstrapper::bootstrap_with_handler(&options, reporter).await {
+        Ok(libobs_bootstrapper::ObsBootstrapperResult::Restart) => {
+            log::info!("OBS runtime installed, restarting");
+            set_bootstrap(&app, Bootstrap::Restarting);
+            // Give the screen a moment to say so before the process disappears.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            app.exit(0);
+        }
+        Ok(libobs_bootstrapper::ObsBootstrapperResult::None) => {
+            set_bootstrap(&app, Bootstrap::Ready);
+            // libobs startup is blocking and slow; keep it off the async runtime.
+            std::thread::spawn(move || start_recorder(&app));
+        }
+        Err(e) => {
+            let message = format!("{e}");
+            log::error!("OBS bootstrap failed: {message}");
+            *app.state::<AppState>().last_error.lock().unwrap() =
+                Some(format!("the recording engine could not be installed: {message}"));
+            set_bootstrap(&app, Bootstrap::Failed { message });
+            let _ = app.emit("status-changed", ());
+        }
     }
 }
 
@@ -1148,6 +1700,10 @@ fn unregister_hotkey(app: &AppHandle, hotkey: &str) {
 fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()> {
     new.hotkey = new.hotkey.trim().to_string();
     new.validate()?;
+    // Checked here rather than in `validate` because it touches the disk: a settings file
+    // whose folder has since been unplugged still has to load at startup, it just cannot be
+    // saved again until the folder is back. The folder picker always returns one that exists.
+    settings::validate_clip_dir(&new.clip_dir)?;
     parse_hotkey(&new.hotkey)?;
 
     let state = app.state::<AppState>();
@@ -1173,9 +1729,16 @@ fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()>
         new.device_token = live.device_token.clone();
         new.account = live.account.clone();
     }
+    // The UI never edits these either; they belong to the shell.
+    new.first_run_done = old.first_run_done;
+    new.tray_hint_shown = old.tray_hint_shown;
+
     // Persist before touching the recorder so a libobs failure does not lose the change.
     new.save().context("saving settings")?;
     *state.settings.lock().unwrap() = new.clone();
+    if new.clip_dir != old.clip_dir {
+        allow_clip_dir(app, &new.clip_dir);
+    }
     if new.auto_upload && !old.auto_upload {
         state.wake_worker();
     }
@@ -1238,6 +1801,27 @@ fn quote_autostart_entry() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Tray and app shell
 
+/// The first time the window is closed, say where the app went. Closing hides to the tray and
+/// keeps recording, which is a surprise exactly once.
+fn explain_tray_once(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    {
+        let mut settings = state.settings.lock().unwrap();
+        if settings.tray_hint_shown {
+            return;
+        }
+        settings.tray_hint_shown = true;
+        if let Err(e) = settings.save() {
+            log::warn!("saving the tray hint flag: {e:#}");
+        }
+    }
+    show_toast(
+        app,
+        "Still recording in the tray",
+        "Cos Nostra keeps running. Quit it from the tray icon.",
+    );
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let clip = MenuItem::with_id(app, "clip", "Save clip", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Open", true, None::<&str>)?;
@@ -1271,24 +1855,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // OBS binaries are downloaded on first launch. If the bootstrapper had to install them
-    // it relaunches the process itself, so we simply exit here.
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let bootstrap = runtime.block_on(libobs_bootstrapper::ObsBootstrapper::bootstrap(
-        &libobs_bootstrapper::ObsBootstrapperOptions::default(),
-    ));
-    match bootstrap {
-        Ok(libobs_bootstrapper::ObsBootstrapperResult::Restart) => {
-            log::info!("OBS runtime installed, restarting");
-            return;
-        }
-        Ok(libobs_bootstrapper::ObsBootstrapperResult::None) => {}
-        Err(e) => {
-            log::error!("OBS bootstrap failed: {e}");
-            return;
-        }
-    }
-
     let settings = Settings::load();
     let _ = settings.save();
 
@@ -1316,6 +1882,8 @@ pub fn run() {
             queue: Mutex::new(None),
             worker: Mutex::new(None),
             login: Mutex::new(None),
+            bootstrap: Mutex::new(Bootstrap::default()),
+            progress: Mutex::new(std::collections::HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -1327,7 +1895,9 @@ pub fn run() {
             list_clips,
             delete_clip,
             set_clip_game,
+            rename_game,
             retry_clip,
+            clip_progress,
             open_clip_folder,
             get_thumbnail,
             storage_stats,
@@ -1335,10 +1905,14 @@ pub fn run() {
             open_clip_dir,
             get_encoders,
             reprobe_encoders,
+            edit_source,
+            apply_cut,
             start_login,
             cancel_login,
             logout,
-            get_account
+            get_account,
+            get_bootstrap,
+            finish_first_run
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1354,9 +1928,11 @@ pub fn run() {
             if let Err(e) = apply_autostart(&handle, settings.start_with_windows) {
                 log::warn!("{e:#}");
             }
-            // libobs startup takes a moment; keep the window responsive.
+            allow_clip_dir(&handle, &settings.clip_dir);
+            // Install the OBS runtime if it is missing, then start the recorder. Both take a
+            // moment, so the window is already up and showing progress by then.
             let recorder_handle = handle.clone();
-            std::thread::spawn(move || start_recorder(&recorder_handle));
+            tauri::async_runtime::spawn(bootstrap_and_start_recorder(recorder_handle));
             // A stored device token is checked against the backend off the main thread.
             if settings.logged_in() {
                 let verify_handle = handle.clone();
@@ -1372,8 +1948,80 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+                explain_tray_once(window.app_handle());
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_verification_url_must_belong_to_the_backend() {
+        let prod = "https://cosnostra.benja.ar";
+        check_verify_url(prod, "https://cosnostra.benja.ar/link?code=ABCD").unwrap();
+        // Case and path shape do not matter; host and scheme do.
+        check_verify_url(prod, "https://CosNostra.Benja.AR/link").unwrap();
+        check_verify_url(prod, "https://cosnostra.benja.ar").unwrap();
+
+        // A different host, however it is dressed up.
+        assert!(check_verify_url(prod, "https://evil.example/link").is_err());
+        assert!(check_verify_url(prod, "https://cosnostra.benja.ar.evil.example/").is_err());
+        assert!(check_verify_url(prod, "https://cosnostra.benja.ar@evil.example/").is_err());
+        // Right host, wrong port is still a different origin.
+        assert!(check_verify_url(prod, "https://cosnostra.benja.ar:8443/link").is_err());
+        // A downgrade to plain http against a public backend.
+        assert!(check_verify_url(prod, "http://cosnostra.benja.ar/link").is_err());
+
+        // The shapes that made this check necessary: the Windows opener shells out to
+        // `Start-Process -FilePath`, which runs local and UNC paths.
+        for bad in [
+            r"C:\Windows\System32\calc.exe",
+            r"\\evil.example\share\payload.bat",
+            "file:///C:/Users/Public/payload.hta",
+            "ms-msdt:/id PCWDiagnostic",
+            "javascript:alert(1)",
+            r"https://cosnostra.benja.ar\@evil.example/",
+            " https://cosnostra.benja.ar/link",
+            "https://cosnostra.benja.ar/link\r\nX: y",
+            "",
+        ] {
+            assert!(check_verify_url(prod, bad).is_err(), "should be refused: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_local_backend_may_answer_over_http() {
+        check_verify_url("http://localhost:3000", "http://localhost:3000/link?code=A").unwrap();
+        check_verify_url("http://127.0.0.1:3000", "http://127.0.0.1:3000/link").unwrap();
+        // Still the same host: a local backend cannot send the browser somewhere else.
+        assert!(check_verify_url("http://localhost:3000", "http://localhost:9/x").is_err());
+        assert!(check_verify_url("http://localhost:3000", "http://evil.example/x").is_err());
+        // And "localhost" in the verification URL does not excuse a remote backend.
+        assert!(check_verify_url("https://cosnostra.benja.ar", "http://localhost/x").is_err());
+    }
+
+    /// `get_settings` is the only way settings reach the webview, and the device token is the
+    /// one field that must not make the trip.
+    #[test]
+    fn settings_sent_to_the_webview_carry_no_device_token() {
+        let stored = Settings {
+            device_token: Some("device-token".into()),
+            account: Some(Account {
+                discord_id: "123".into(),
+                username: "benja".into(),
+                avatar: None,
+            }),
+            ..Settings::default()
+        };
+        // The same shape `get_settings` builds; it needs a running app to call directly.
+        let sent = Settings { device_token: None, ..stored.clone() };
+        assert!(sent.device_token.is_none());
+        assert_eq!(sent.account, stored.account, "the account still identifies the login");
+        let json = serde_json::to_string(&sent).unwrap();
+        assert!(!json.contains("device-token"), "{json}");
+    }
 }

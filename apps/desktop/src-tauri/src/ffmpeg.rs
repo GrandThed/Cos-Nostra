@@ -39,13 +39,133 @@ pub struct MediaInfo {
     pub height: u32,
     pub fps: f64,
     pub size: u64,
+    /// The multi-part cut builds a filter graph per stream, so it has to know whether there
+    /// is an audio stream to trim at all.
+    pub has_audio: bool,
 }
 
-/// Optional cut points in milliseconds. `None` keeps that end of the clip.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Trim {
-    pub start_ms: Option<i64>,
-    pub end_ms: Option<i64>,
+/// One kept range of the source, in milliseconds. Serialised as-is into the clip database
+/// and across the Tauri bridge, so the field names are part of the UI contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Segment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Which parts of the source to keep, in order. Empty keeps everything, which is what every
+/// clip starts as; one segment is a trim; more than one is a cut with the middles removed
+/// and the rest joined back together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cut {
+    pub segments: Vec<Segment>,
+}
+
+/// Shortest kept part the editor may ask for. Below this a part is a few frames that the
+/// encoder's keyframe placement cannot represent sensibly.
+pub const MIN_SEGMENT_MS: i64 = 100;
+
+/// How close to the ends a single segment may be and still count as "the whole clip". The
+/// editor measures the duration from the browser's decoder, ffprobe from the container,
+/// and the two disagree by a frame or two.
+const WHOLE_TOLERANCE_MS: i64 = 60;
+
+impl Cut {
+    pub fn whole() -> Cut {
+        Cut::default()
+    }
+
+    pub fn is_whole(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Checks and tidies segments against the source they apply to: clamped to the clip,
+    /// sorted, each at least `MIN_SEGMENT_MS` long, none overlapping (touching ones merge).
+    /// A cut that keeps the whole clip comes back as `whole`, so "no cut" has one spelling.
+    pub fn normalize(segments: &[Segment], duration_ms: i64) -> Result<Cut> {
+        // No parts at all is how the editor spells "the whole recording".
+        if segments.is_empty() {
+            return Ok(Cut::whole());
+        }
+        let mut segs: Vec<Segment> = segments
+            .iter()
+            .map(|s| Segment {
+                start_ms: s.start_ms.max(0),
+                end_ms: s.end_ms.min(duration_ms),
+            })
+            .collect();
+        segs.sort_by_key(|s| (s.start_ms, s.end_ms));
+        let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
+        for s in segs {
+            if s.end_ms - s.start_ms < MIN_SEGMENT_MS {
+                bail!(
+                    "a kept part must be at least {MIN_SEGMENT_MS} ms long, got {} ms at {} ms",
+                    s.end_ms - s.start_ms,
+                    s.start_ms
+                );
+            }
+            if let Some(last) = out.last_mut() {
+                if s.start_ms < last.end_ms {
+                    bail!("kept parts overlap at {} ms", s.start_ms);
+                }
+                if s.start_ms == last.end_ms {
+                    last.end_ms = s.end_ms;
+                    continue;
+                }
+            }
+            out.push(s);
+        }
+        if out.is_empty() {
+            bail!("a cut has to keep at least one part");
+        }
+        let whole = out.len() == 1
+            && out[0].start_ms <= WHOLE_TOLERANCE_MS
+            && out[0].end_ms >= duration_ms - WHOLE_TOLERANCE_MS;
+        Ok(if whole { Cut::whole() } else { Cut { segments: out } })
+    }
+
+    /// How much of a `duration_ms` source survives this cut.
+    pub fn kept_ms(&self, duration_ms: i64) -> i64 {
+        if self.is_whole() {
+            duration_ms
+        } else {
+            self.segments.iter().map(|s| s.end_ms - s.start_ms).sum()
+        }
+    }
+
+    /// The source time that is `fraction` of the way through the kept footage, which is where
+    /// the thumbnail is taken so it shows a frame that is actually in the clip.
+    pub fn source_time_at(&self, fraction: f64, duration_ms: i64) -> i64 {
+        let fraction = fraction.clamp(0.0, 1.0);
+        if self.is_whole() {
+            return (duration_ms as f64 * fraction) as i64;
+        }
+        let mut left = (self.kept_ms(duration_ms) as f64 * fraction) as i64;
+        for s in &self.segments {
+            let len = s.end_ms - s.start_ms;
+            if left < len {
+                return s.start_ms + left;
+            }
+            left -= len;
+        }
+        self.segments.last().map(|s| s.end_ms).unwrap_or(0)
+    }
+}
+
+/// Where an encode reports its progress. `on` is called with 0.0..=1.0 on the calling thread,
+/// roughly twice a second, and `duration_ms` is what that fraction is measured against.
+pub struct Progress<'a> {
+    pub duration_ms: i64,
+    pub on: &'a dyn Fn(f32),
+}
+
+/// One encode: which file, where it goes, which parts of it, and who is watching.
+struct Job<'a> {
+    src: &'a Path,
+    dst: &'a Path,
+    cut: &'a Cut,
+    /// Whether `src` has an audio stream; see `MediaInfo::has_audio`.
+    audio: bool,
+    progress: Option<&'a Progress<'a>>,
 }
 
 const SOFTWARE_AV1: &str = "libsvtav1";
@@ -117,6 +237,55 @@ fn threads() -> String {
     (cores / 2).max(1).to_string()
 }
 
+/// Runs an encode while feeding `-progress` output to the caller.
+///
+/// ffmpeg writes key=value lines to stdout with `-progress pipe:1`, of which only the elapsed
+/// output time interests us. stderr is drained on its own thread: with both pipes open, a full
+/// one would block the child forever.
+fn run_progress(mut cmd: Command, what: &str, progress: &Progress<'_>) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read};
+
+    cmd.args(["-progress", "pipe:1", "-nostats"]);
+    log::debug!("{what}: {cmd:?}");
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("{what}: failed to spawn {:?}", cmd.get_program()))?;
+
+    let mut errors = child.stderr.take().expect("stderr is piped");
+    let drain = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = errors.read_to_string(&mut text);
+        text
+    });
+
+    let total = progress.duration_ms.max(1) as f64;
+    for line in BufReader::new(child.stdout.take().expect("stdout is piped")).lines() {
+        let Ok(line) = line else { break };
+        // `out_time_us` is microseconds. `out_time_ms` is a misnomer for the same unit, kept
+        // as a fallback for builds that do not print the newer key.
+        let Some(micros) = line
+            .strip_prefix("out_time_us=")
+            .or_else(|| line.strip_prefix("out_time_ms="))
+        else {
+            continue;
+        };
+        if let Ok(micros) = micros.trim().parse::<i64>() {
+            (progress.on)((micros as f64 / 1000.0 / total).clamp(0.0, 1.0) as f32);
+        }
+    }
+
+    let status = child.wait().with_context(|| format!("{what}: waiting for ffmpeg"))?;
+    let stderr = drain.join().unwrap_or_default();
+    if !status.success() {
+        return Err(anyhow!("{}", stderr_tail(&stderr)))
+            .with_context(|| format!("{what}: ffmpeg exited with {status}"));
+    }
+    (progress.on)(1.0);
+    Ok(())
+}
+
 /// Runs the command, returning its output or an error carrying the tail of stderr.
 fn run(mut cmd: Command, what: &str) -> Result<Output> {
     log::debug!("{what}: {cmd:?}");
@@ -127,11 +296,16 @@ fn run(mut cmd: Command, what: &str) -> Result<Output> {
         .with_context(|| format!("{what}: failed to spawn {:?}", cmd.get_program()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
-        return Err(anyhow!("{}", tail.join("\n")))
+        return Err(anyhow!("{}", stderr_tail(&stderr)))
             .with_context(|| format!("{what}: ffmpeg exited with {}", output.status));
     }
     Ok(output)
+}
+
+/// The last lines of a failed run's stderr, which is where ffmpeg says what went wrong.
+fn stderr_tail(stderr: &str) -> String {
+    let tail: Vec<&str> = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
+    tail.join("\n")
 }
 
 /// Runs a two second test encode with each hardware AV1 encoder (nvenc, amf, qsv in that
@@ -232,12 +406,17 @@ pub fn probe(bins: &Binaries, src: &Path) -> Result<MediaInfo> {
         .and_then(|d| d.parse().ok())
         .with_context(|| format!("probe {}: no duration", src.display()))?;
     let size = parsed.format.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let has_audio = parsed
+        .streams
+        .iter()
+        .any(|s| s.codec_type.as_deref() == Some("audio"));
     Ok(MediaInfo {
         duration_ms: (duration * 1000.0).round() as i64,
         width: video.width.unwrap_or(0),
         height: video.height.unwrap_or(0),
         fps: parse_fraction(video.r_frame_rate.as_deref().unwrap_or("0/1")),
         size,
+        has_audio,
     })
 }
 
@@ -261,15 +440,61 @@ fn seconds(ms: i64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
 }
 
-/// Input options: seek before `-i` so unused footage is never decoded.
-fn input_args(cmd: &mut Command, src: &Path, trim: Trim) {
-    if let Some(start) = trim.start_ms {
-        cmd.args(["-ss", &seconds(start)]);
+/// Input options for a cut: seek before `-i` so footage outside the kept range is never
+/// decoded. `-ss` on the input is frame accurate (ffmpeg decodes from the previous keyframe
+/// and drops what comes before the point), and resets timestamps so the seek point is zero.
+///
+/// One segment is just `-ss`/`-to`. Several seek to the first start and stop at the last
+/// end, then a filter graph trims each kept part out of that span and concatenates them, so
+/// the middles disappear in the same pass that encodes. The trim times are relative to the
+/// seek point because that is where the decoded timestamps now start.
+fn input_args(cmd: &mut Command, src: &Path, cut: &Cut, audio: bool) {
+    match cut.segments.as_slice() {
+        [] => {
+            cmd.arg("-i").arg(src);
+        }
+        [one] => {
+            cmd.args(["-ss", &seconds(one.start_ms), "-to", &seconds(one.end_ms)]);
+            cmd.arg("-i").arg(src);
+        }
+        many => {
+            let base = many[0].start_ms;
+            let end = many[many.len() - 1].end_ms;
+            cmd.args(["-ss", &seconds(base), "-to", &seconds(end)]);
+            cmd.arg("-i").arg(src);
+            cmd.args(["-filter_complex", &concat_graph(many, base, audio)]);
+            cmd.args(["-map", "[v]"]);
+            if audio {
+                cmd.args(["-map", "[a]"]);
+            }
+        }
     }
-    if let Some(end) = trim.end_ms {
-        cmd.args(["-to", &seconds(end)]);
+}
+
+/// `trim`/`atrim` each part out of the decoded span, restart its timestamps, and `concat`
+/// them in order. Without an audio stream the graph only carries video: naming `[0:a]` on a
+/// silent file is a hard error, not an empty stream.
+fn concat_graph(segments: &[Segment], base_ms: i64, audio: bool) -> String {
+    let mut graph = String::new();
+    let mut inputs = String::new();
+    for (i, s) in segments.iter().enumerate() {
+        let (a, b) = (seconds(s.start_ms - base_ms), seconds(s.end_ms - base_ms));
+        graph.push_str(&format!("[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}];"));
+        inputs.push_str(&format!("[v{i}]"));
+        if audio {
+            graph.push_str(&format!("[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}];"));
+            inputs.push_str(&format!("[a{i}]"));
+        }
     }
-    cmd.arg("-i").arg(src);
+    graph.push_str(&format!(
+        "{inputs}concat=n={}:v=1:a={}[v]",
+        segments.len(),
+        u8::from(audio)
+    ));
+    if audio {
+        graph.push_str("[a]");
+    }
+    graph
 }
 
 /// Video encoder settings, measured with `scripts/bench-encoders.mjs`.
@@ -389,10 +614,9 @@ fn encode(
     encoder: &str,
     video_args: &[&str],
     audio_args: &[&str],
-    src: &Path,
-    dst: &Path,
-    trim: Trim,
+    job: Job<'_>,
 ) -> Result<()> {
+    let Job { src, dst, cut, audio, progress } = job;
     let part = part_path(dst);
     let _ = fs::remove_file(&part);
     if let Some(parent) = dst.parent() {
@@ -404,13 +628,17 @@ fn encode(
     if is_software(encoder) {
         cmd.args(["-threads", &threads()]);
     }
-    input_args(&mut cmd, src, trim);
+    input_args(&mut cmd, src, cut, audio);
     cmd.args(["-c:v", encoder]).args(video_args).args(["-g", GOP]);
     cmd.args(audio_args);
     cmd.args(["-movflags", "+faststart", "-f", "mp4"]).arg(&part);
 
     let started = Instant::now();
-    let result = run(cmd, &format!("encode {encoder} {}", src.display()));
+    let what = format!("encode {encoder} {}", src.display());
+    let result = match progress {
+        Some(p) => run_progress(cmd, &what, p),
+        None => run(cmd, &what).map(drop),
+    };
     if let Err(e) = result {
         let _ = fs::remove_file(&part);
         return Err(e);
@@ -431,22 +659,24 @@ fn part_path(dst: &Path) -> PathBuf {
 }
 
 /// AV1 in MP4 with Opus audio, at the user's chosen quality. Keyframe every two seconds.
+/// `audio` says whether `src` has an audio stream (`MediaInfo::has_audio`); a multi-part
+/// `cut` needs it to build its filter graph.
 pub fn encode_av1(
     bins: &Binaries,
     encoder: &str,
     quality: Quality,
     src: &Path,
     dst: &Path,
-    trim: Trim,
+    cut: &Cut,
+    audio: bool,
+    progress: Option<&Progress<'_>>,
 ) -> Result<()> {
     encode(
         bins,
         encoder,
         &av1_args(encoder, quality),
         &["-c:a", "libopus", "-b:a", "128k"],
-        src,
-        dst,
-        trim,
+        Job { src, dst, cut, audio, progress },
     )
 }
 
@@ -459,16 +689,16 @@ pub fn encode_h264(
     quality: Quality,
     src: &Path,
     dst: &Path,
-    trim: Trim,
+    cut: &Cut,
+    audio: bool,
+    progress: Option<&Progress<'_>>,
 ) -> Result<()> {
     encode(
         bins,
         encoder,
         &h264_args(encoder, quality),
         &["-c:a", "aac", "-b:a", "160k"],
-        src,
-        dst,
-        trim,
+        Job { src, dst, cut, audio, progress },
     )
 }
 
@@ -539,6 +769,53 @@ mod tests {
         assert_eq!(part_path(Path::new("C:/x/clip.mp4")), PathBuf::from("C:/x/clip.mp4.part"));
     }
 
+    fn seg(start_ms: i64, end_ms: i64) -> Segment {
+        Segment { start_ms, end_ms }
+    }
+
+    #[test]
+    fn cuts_normalize() {
+        // The whole clip, however it is spelled, is "no cut".
+        assert!(Cut::normalize(&[], 30_000).unwrap().is_whole());
+        assert!(Cut::normalize(&[seg(0, 30_000)], 30_000).unwrap().is_whole());
+        assert!(Cut::normalize(&[seg(20, 29_980)], 30_000).unwrap().is_whole());
+        assert!(Cut::normalize(&[seg(-5, 99_999)], 30_000).unwrap().is_whole());
+
+        // Sorted, clamped, touching parts merged.
+        let cut = Cut::normalize(&[seg(20_000, 40_000), seg(1_000, 5_000), seg(5_000, 8_000)], 30_000).unwrap();
+        assert_eq!(cut.segments, vec![seg(1_000, 8_000), seg(20_000, 30_000)]);
+        assert_eq!(cut.kept_ms(30_000), 17_000);
+
+        // Rejections: too short, overlapping, nothing kept.
+        assert!(Cut::normalize(&[seg(1_000, 1_050)], 30_000).is_err());
+        assert!(Cut::normalize(&[seg(1_000, 5_000), seg(4_000, 9_000)], 30_000).is_err());
+        assert!(Cut::normalize(&[seg(31_000, 32_000)], 30_000).is_err());
+
+        // A thumbnail at a quarter of the kept footage lands inside a kept part.
+        let cut = Cut { segments: vec![seg(10_000, 12_000), seg(20_000, 26_000)] };
+        assert_eq!(cut.kept_ms(30_000), 8_000);
+        assert_eq!(cut.source_time_at(0.0, 30_000), 10_000);
+        // A quarter of the 8 s kept is exactly the end of the first part, so it is the start of the next.
+        assert_eq!(cut.source_time_at(0.25, 30_000), 20_000);
+        assert_eq!(cut.source_time_at(0.5, 30_000), 22_000);
+        assert_eq!(cut.source_time_at(1.0, 30_000), 26_000);
+        assert_eq!(Cut::whole().source_time_at(0.25, 30_000), 7_500);
+
+        // The graph names one chain per part and only touches audio when there is some.
+        let graph = concat_graph(&cut.segments, 10_000, true);
+        assert_eq!(
+            graph,
+            "[0:v]trim=start=0.000:end=2.000,setpts=PTS-STARTPTS[v0];\
+             [0:a]atrim=start=0.000:end=2.000,asetpts=PTS-STARTPTS[a0];\
+             [0:v]trim=start=10.000:end=16.000,setpts=PTS-STARTPTS[v1];\
+             [0:a]atrim=start=10.000:end=16.000,asetpts=PTS-STARTPTS[a1];\
+             [v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+        );
+        let silent = concat_graph(&cut.segments, 10_000, false);
+        assert!(!silent.contains("[0:a]"));
+        assert!(silent.ends_with("[v0][v1]concat=n=2:v=1:a=0[v]"));
+    }
+
     #[test]
     fn end_to_end() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -558,14 +835,14 @@ mod tests {
         let encoders = probe_encoders(&bins);
         println!("probe_encoders: {encoders:?} in {:.1} s", started.elapsed().as_secs_f64());
 
-        let trim = Trim {
-            start_ms: Some(500),
-            end_ms: Some(2500),
+        assert!(info.has_audio, "the sample carries a sine tone");
+        let trim = Cut {
+            segments: vec![seg(500, 2500)],
         };
 
         let av1 = dir.join("out_av1.mp4");
         let started = Instant::now();
-        encode_av1(&bins, &encoders.av1, Quality::Balanced, &src, &av1, trim).unwrap();
+        encode_av1(&bins, &encoders.av1, Quality::Balanced, &src, &av1, &trim, true, None).unwrap();
         let av1_info = probe(&bins, &av1).unwrap();
         println!(
             "av1 ({}): {:.1} s, {} bytes, {:?}",
@@ -581,7 +858,18 @@ mod tests {
 
         let h264 = dir.join("out_h264.mp4");
         let started = Instant::now();
-        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &h264, trim).unwrap();
+        // Same encode, watched: the clip cards show this fraction as "Encoding · N%".
+        let seen = std::cell::RefCell::new(Vec::new());
+        let watch = Progress {
+            duration_ms: 2000,
+            on: &|p| seen.borrow_mut().push(p),
+        };
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &h264, &trim, true, Some(&watch)).unwrap();
+        let seen = seen.into_inner();
+        assert!(seen.len() > 1, "ffmpeg reported no progress: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "progress went backwards: {seen:?}");
+        assert!(seen.iter().all(|p| (0.0..=1.0).contains(p)), "out of range: {seen:?}");
+        assert_eq!(seen.last(), Some(&1.0), "progress did not finish: {seen:?}");
         let h264_info = probe(&bins, &h264).unwrap();
         println!(
             "h264 ({}): {:.1} s, {} bytes, {:?}",
@@ -600,11 +888,75 @@ mod tests {
         println!("thumbnail: {thumb_len} bytes");
         assert!(thumb_len > 1024);
 
-        // A bad encoder name fails cleanly and leaves no .part behind.
+        // A cut with two middles removed: three parts of the 3 s sample, 2 s kept, joined by
+        // the filter graph. Progress is measured against the kept length and still reaches 1.
+        let cut = Cut {
+            segments: vec![seg(0, 800), seg(1_200, 1_800), seg(2_400, 3_000)],
+        };
+        let joined = dir.join("out_cut.mp4");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let watch = Progress {
+            duration_ms: cut.kept_ms(info.duration_ms),
+            on: &|p| seen.borrow_mut().push(p),
+        };
+        let started = Instant::now();
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &joined, &cut, true, Some(&watch)).unwrap();
+        let joined_info = probe(&bins, &joined).unwrap();
+        println!(
+            "cut ({}): {:.1} s, {} bytes, {:?}",
+            encoders.h264,
+            started.elapsed().as_secs_f64(),
+            joined_info.size,
+            joined_info
+        );
+        assert_eq!(codecs(&bins, &joined), ("h264".to_string(), "aac".to_string()));
+        assert!((joined_info.duration_ms - 2000).abs() <= 100, "cut duration {}", joined_info.duration_ms);
+        assert!(joined_info.has_audio, "the joined clip keeps its audio");
+        let seen = seen.into_inner();
+        assert_eq!(seen.last(), Some(&1.0), "cut progress did not finish: {seen:?}");
+
+        // The same cut on a silent source builds a video-only graph rather than failing on
+        // a missing audio stream.
+        let silent_src = dir.join("silent.mp4");
+        let mut cmd = ffmpeg_command(&bins);
+        cmd.args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-t", "3"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+            .arg(&silent_src);
+        run(cmd, "silent sample").unwrap();
+        let silent_info = probe(&bins, &silent_src).unwrap();
+        assert!(!silent_info.has_audio);
+        let silent_out = dir.join("out_silent_cut.mp4");
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &silent_src, &silent_out, &cut, false, None).unwrap();
+        let silent_out_info = probe(&bins, &silent_out).unwrap();
+        assert!((silent_out_info.duration_ms - 2000).abs() <= 100, "silent cut duration {}", silent_out_info.duration_ms);
+        assert!(!silent_out_info.has_audio);
+
+        // A bad encoder name fails cleanly and leaves no .part behind, watched or not: a
+        // failure has to carry ffmpeg's stderr even though nothing was read from stdout.
         let bad = dir.join("bad.mp4");
-        let err = encode_av1(&bins, "no_such_encoder", Quality::Balanced, &src, &bad, Trim::default()).unwrap_err();
+        let reached = std::cell::Cell::new(0.0f32);
+        let watch = Progress {
+            duration_ms: 2000,
+            on: &|p| reached.set(p),
+        };
+        let err = encode_av1(
+            &bins,
+            "no_such_encoder",
+            Quality::Balanced,
+            &src,
+            &bad,
+            &Cut::whole(),
+            true,
+            Some(&watch),
+        )
+        .unwrap_err();
         println!("expected failure: {err:#}");
         assert!(!bad.exists() && !part_path(&bad).exists());
+        assert!(reached.get() < 1.0, "a failed encode must not report itself finished");
+        assert!(
+            format!("{err:#}").contains("no_such_encoder"),
+            "the failure lost ffmpeg's stderr: {err:#}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,0 +1,666 @@
+/** The player, which doubles as the clip detail view.
+ *
+ *  Prev and Next step through whatever the library is currently showing, so a filter or a
+ *  search narrows the player too. */
+
+import { badgeFor, canEdit, cutLabel, gameLabel, isReleased, mediaFor, UNKNOWN } from "./clips";
+import { confirming, editInline, fill, h } from "./dom";
+import { fmtBytes, fmtClock, fmtDuration, fmtWhen, fmtWhenLong, hueFor } from "./format";
+import * as ipc from "./ipc";
+import { copyLinkButton, selectionLabel, visibleClips } from "./library";
+import { go } from "./router";
+import { data, loadClips, on } from "./store";
+import type { ClipRow } from "./types";
+
+const SPEEDS = [0.5, 1, 1.5, 2];
+/** Old clips have no recorded frame rate; 60 is what the recorder has always captured. */
+const FALLBACK_FPS = 60;
+
+interface Live {
+  id: number;
+  video: HTMLVideoElement;
+  preview: HTMLVideoElement | null;
+  /** The frame of the transport that is cheap to redraw on every timeupdate. */
+  played: HTMLElement;
+  buffered: HTMLElement;
+  knob: HTMLElement;
+  time: HTMLElement;
+  playButton: HTMLElement;
+  scrubber: HTMLElement;
+  previewBox: HTMLElement;
+  previewAt: HTMLElement;
+  root: HTMLElement;
+  message: HTMLElement;
+  /** The Trim & cut strip under the transport, redrawn with the rail. */
+  strip: HTMLElement;
+  onKey: (e: KeyboardEvent) => void;
+}
+
+let live: Live | null = null;
+let theatre = false;
+
+export function initPlayer(): void {
+  // A clip that changes while it is open (encode finishes, upload lands) redraws the rail,
+  // but never interrupts what is playing. A clip that only now arrived builds the player.
+  on("clips", () => {
+    if (live) renderRail();
+    else show();
+  });
+  on("progress", () => {
+    if (live) renderRail();
+  });
+}
+
+/** What the route asked for, which is not always something the store has yet. */
+let wanted: { root: HTMLElement; id: number } | null = null;
+
+export function mountPlayer(root: HTMLElement, id: number): void {
+  wanted = { root, id };
+  show();
+}
+
+/** Builds the player if the clip is known, and says why not if it is not. The queue opens a
+ *  moment after the window does, so an empty list this early means "not yet", not "gone". */
+function show(): void {
+  if (!wanted || live) return;
+  const clip = data.clips.find((c) => c.id === wanted?.id);
+  if (!clip) {
+    fill(
+      wanted.root,
+      h("div", {
+        class: "empty-state",
+        text: data.clips.length ? "That clip is gone." : "Opening the clip library…",
+      }),
+    );
+    return;
+  }
+  build(wanted.root, clip);
+}
+
+function build(root: HTMLElement, clip: ClipRow): void {
+  const id = clip.id;
+  const media = mediaFor(clip, data.settings);
+  const list = siblings(id);
+  const index = list.findIndex((c) => c.id === id);
+
+  const video = h("video", {
+    preload: "metadata",
+    playsinline: true,
+    src: media?.url ?? "",
+  }) as HTMLVideoElement;
+
+  // A second decoder, seeked to wherever the pointer is on the scrubber. Only for local
+  // files: doing this against the site would re-request the clip on every mouse move.
+  const preview =
+    media && !media.streaming
+      ? (h("video", { preload: "metadata", muted: true, src: media.url }) as HTMLVideoElement)
+      : null;
+
+  const played = h("span", { class: "played" });
+  const buffered = h("span", { class: "buffered" });
+  const knob = h("span", { class: "knob" });
+  const previewAt = h("span", { class: "at" });
+  const previewBox = h("div", { class: "preview", hidden: true }, preview, previewAt);
+  const scrubber = h("div", { class: "scrubber" }, buffered, played, knob, previewBox);
+  const time = h("span", { class: "time" });
+  const playButton = h("button", { class: "play", type: "button", text: "▶", title: "Play" });
+  const message = h("div", { class: "rail-msg" });
+  const strip = h("div", { class: "trim-slot" });
+
+  const bigPlay = h(
+    "button",
+    { type: "button", class: "big-play", title: "Play" },
+    h("span", { text: "▶" }),
+  );
+
+  const player = h(
+    "div",
+    { class: `player${theatre ? " theatre" : ""}`, style: `--hue:${hueFor(clip.id)}` },
+    h(
+      "div",
+      { class: "player-head" },
+      h(
+        "button",
+        { type: "button", class: "back", onclick: () => go({ view: "library" }) },
+        "← ",
+        h("b", { text: gameLabel(clip.game) }),
+        ` / ${fmtWhen(clip.recorded_at)}`,
+      ),
+      h("span", { class: "grow" }),
+      h("span", {
+        class: "position",
+        text:
+          index >= 0
+            ? `clip ${index + 1} of ${list.length} ${selectionLabel()}`
+            : `${list.length} clips`,
+      }),
+      h(
+        "div",
+        { class: "steps" },
+        h("button", {
+          type: "button",
+          class: "btn small",
+          text: "‹ Prev",
+          disabled: index <= 0,
+          onclick: () => go({ view: "player", id: list[index - 1].id }),
+        }),
+        h("button", {
+          type: "button",
+          class: "btn small",
+          text: "Next ›",
+          disabled: index < 0 || index >= list.length - 1,
+          onclick: () => go({ view: "player", id: list[index + 1].id }),
+        }),
+      ),
+    ),
+    h(
+      "div",
+      { class: "player-body" },
+      h(
+        "div",
+        { class: "stage" },
+        h(
+          "div",
+          { class: "video" },
+          media ? video : null,
+          media?.streaming
+            ? h("span", { class: "source-note", text: "Streaming from the site — local video freed" })
+            : null,
+          media ? bigPlay : h("div", { class: "trouble", text: "This clip has no video to play." }),
+        ),
+        h(
+          "div",
+          { class: "transport" },
+          scrubber,
+          h(
+            "div",
+            { class: "controls" },
+            playButton,
+            time,
+            frameStep(video, clip),
+            h("span", { class: "grow" }),
+            volume(video),
+            speed(video),
+            loopToggle(video),
+            h("button", {
+              type: "button",
+              title: "Theatre (F)",
+              text: "⛶",
+              onclick: () => toggleTheatre(),
+            }),
+          ),
+          h(
+            "div",
+            { class: "keys" },
+            h("span", { text: "Space play" }),
+            h("span", { text: "←/→ 5 s" }),
+            h("span", { text: "J/L 10 s · K pause" }),
+            h("span", { text: ",/. frame" }),
+            h("span", { text: "M mute" }),
+            h("span", { text: "F theatre" }),
+            h("span", { text: "E trim & cut" }),
+          ),
+        ),
+        strip,
+      ),
+      h("aside", { class: "rail" }),
+    ),
+  );
+
+  fill(root, player);
+
+  const onKey = (e: KeyboardEvent) => handleKey(e, video, clip);
+  live = {
+    id,
+    video,
+    preview,
+    played,
+    buffered,
+    knob,
+    time,
+    playButton,
+    scrubber,
+    previewBox,
+    previewAt,
+    root: player,
+    message,
+    strip,
+    onKey,
+  };
+
+  wireVideo(video, media?.streaming ?? false);
+  wireScrubber(scrubber, video, preview, previewBox, previewAt);
+  playButton.addEventListener("click", () => togglePlay(video));
+  bigPlay.addEventListener("click", () => togglePlay(video));
+  document.addEventListener("keydown", onKey);
+
+  renderRail();
+  paint();
+  if (media) void video.play().catch(() => undefined);
+}
+
+export function unmountPlayer(): void {
+  wanted = null;
+  railKey = "";
+  if (!live) return;
+  document.removeEventListener("keydown", live.onKey);
+  // Both are decoders holding a file open; the scrub preview is easy to forget.
+  for (const video of [live.video, live.preview]) {
+    if (!video) continue;
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
+  live = null;
+}
+
+/** The clips the library is showing, so Prev and Next honour the current game and filters. */
+function siblings(id: number): ClipRow[] {
+  const shown = visibleClips();
+  return shown.some((c) => c.id === id) ? shown : data.clips;
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+
+function togglePlay(video: HTMLVideoElement): void {
+  if (video.paused) void video.play().catch(() => undefined);
+  else video.pause();
+}
+
+function wireVideo(video: HTMLVideoElement, streaming: boolean): void {
+  for (const event of ["timeupdate", "durationchange", "progress", "seeked", "play", "pause"]) {
+    video.addEventListener(event, paint);
+  }
+  video.addEventListener("error", () => {
+    if (!live) return;
+    const why = streaming
+      ? "The site would not send this clip. Check your connection."
+      : "That file could not be played. It may have been moved or deleted.";
+    const box = live.root.querySelector(".video");
+    if (box && !box.querySelector(".trouble")) {
+      box.appendChild(h("div", { class: "trouble", text: why }));
+    }
+  });
+  video.addEventListener("play", () => {
+    const big = live?.root.querySelector<HTMLElement>(".big-play");
+    if (big) big.hidden = true;
+  });
+  video.addEventListener("pause", () => {
+    const big = live?.root.querySelector<HTMLElement>(".big-play");
+    if (big) big.hidden = false;
+  });
+}
+
+function paint(): void {
+  if (!live) return;
+  const { video } = live;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+  const at = duration ? Math.min(video.currentTime / duration, 1) : 0;
+  live.played.style.width = `${at * 100}%`;
+  live.knob.style.left = `${at * 100}%`;
+  const end = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0;
+  live.buffered.style.width = duration ? `${Math.min(end / duration, 1) * 100}%` : "0";
+  fill(
+    live.time,
+    fmtClock(video.currentTime || 0),
+    h("span", { class: "total", text: ` / ${fmtClock(duration)}` }),
+  );
+  live.playButton.textContent = video.paused ? "▶" : "⏸";
+  live.playButton.title = video.paused ? "Play" : "Pause";
+}
+
+function wireScrubber(
+  scrubber: HTMLElement,
+  video: HTMLVideoElement,
+  preview: HTMLVideoElement | null,
+  previewBox: HTMLElement,
+  previewAt: HTMLElement,
+): void {
+  const fraction = (e: PointerEvent | MouseEvent): number => {
+    const box = scrubber.getBoundingClientRect();
+    return Math.min(Math.max((e.clientX - box.left) / box.width, 0), 1);
+  };
+  const seek = (e: PointerEvent) => {
+    if (!Number.isFinite(video.duration)) return;
+    video.currentTime = fraction(e) * video.duration;
+  };
+
+  scrubber.addEventListener("pointerdown", (e) => {
+    scrubber.setPointerCapture(e.pointerId);
+    seek(e);
+  });
+  scrubber.addEventListener("pointermove", (e) => {
+    if (scrubber.hasPointerCapture(e.pointerId)) seek(e);
+    if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+    const at = fraction(e) * video.duration;
+    previewBox.hidden = false;
+    previewBox.style.left = `${fraction(e) * 100}%`;
+    previewAt.textContent = fmtClock(at);
+    if (preview && Math.abs(preview.currentTime - at) > 0.2) preview.currentTime = at;
+  });
+  scrubber.addEventListener("pointerleave", () => {
+    previewBox.hidden = true;
+  });
+  scrubber.addEventListener("pointerup", (e) => scrubber.releasePointerCapture(e.pointerId));
+}
+
+/** The frame-step, volume and loop widgets are shared with the editor, which has the same
+ *  transport under a different timeline. */
+export function frameStep(video: HTMLVideoElement, clip: { fps: number | null }): HTMLElement {
+  const step = 1 / (clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS);
+  const move = (by: number) => {
+    video.pause();
+    video.currentTime = Math.max(0, video.currentTime + by * step);
+  };
+  return h(
+    "span",
+    { class: "frames", title: "One frame back or forward (, and .)" },
+    h("button", { type: "button", text: "‹", onclick: () => move(-1) }),
+    "frame",
+    h("button", { type: "button", text: "›", onclick: () => move(1) }),
+  );
+}
+
+export function volume(video: HTMLVideoElement): HTMLElement {
+  const slider = h("input", {
+    type: "range",
+    min: "0",
+    max: "1",
+    step: "0.05",
+    value: "1",
+    title: "Volume (M mutes)",
+    oninput: (e: Event) => {
+      video.volume = Number((e.target as HTMLInputElement).value);
+      video.muted = video.volume === 0;
+    },
+  }) as HTMLInputElement;
+  const icon = h("button", {
+    type: "button",
+    text: "🔊",
+    title: "Mute (M)",
+    onclick: () => {
+      video.muted = !video.muted;
+    },
+  });
+  video.addEventListener("volumechange", () => {
+    slider.value = String(video.muted ? 0 : video.volume);
+    icon.textContent = video.muted || video.volume === 0 ? "🔈" : "🔊";
+  });
+  return h("span", { class: "volume" }, icon, slider);
+}
+
+function speed(video: HTMLVideoElement): HTMLElement {
+  const button = h("button", { type: "button", class: "speed", text: "1.0×", title: "Playback speed" });
+  button.addEventListener("click", () => {
+    const next = SPEEDS[(SPEEDS.indexOf(video.playbackRate) + 1) % SPEEDS.length];
+    video.playbackRate = next;
+    button.textContent = `${next.toFixed(1)}×`;
+  });
+  return button;
+}
+
+export function loopToggle(video: HTMLVideoElement): HTMLElement {
+  const button = h("button", {
+    type: "button",
+    class: "loop",
+    text: "Loop",
+    "aria-pressed": "false",
+  });
+  button.addEventListener("click", () => {
+    video.loop = !video.loop;
+    button.setAttribute("aria-pressed", String(video.loop));
+  });
+  return button;
+}
+
+function toggleTheatre(): void {
+  theatre = !theatre;
+  live?.root.classList.toggle("theatre", theatre);
+}
+
+function handleKey(e: KeyboardEvent, video: HTMLVideoElement, clip: ClipRow): void {
+  const target = e.target as HTMLElement | null;
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) {
+    return;
+  }
+  const step = 1 / (clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS);
+  const seek = (by: number) => {
+    video.currentTime = Math.max(0, Math.min(video.currentTime + by, video.duration || 0));
+  };
+  switch (e.key) {
+    case " ":
+      togglePlay(video);
+      break;
+    case "ArrowLeft":
+      seek(-5);
+      break;
+    case "ArrowRight":
+      seek(5);
+      break;
+    case "j":
+    case "J":
+      seek(-10);
+      break;
+    case "l":
+    case "L":
+      seek(10);
+      break;
+    case "k":
+    case "K":
+      video.pause();
+      break;
+    case ",":
+      video.pause();
+      seek(-step);
+      break;
+    case ".":
+      video.pause();
+      seek(step);
+      break;
+    case "m":
+    case "M":
+      video.muted = !video.muted;
+      break;
+    case "f":
+    case "F":
+      toggleTheatre();
+      break;
+    case "e":
+    case "E": {
+      const now = data.clips.find((c) => c.id === clip.id);
+      if (now && canEdit(now)) go({ view: "editor", id: clip.id });
+      break;
+    }
+    case "Escape":
+      if (theatre) toggleTheatre();
+      else go({ view: "library" });
+      break;
+    default:
+      return;
+  }
+  e.preventDefault();
+}
+
+/** The way into the editor: a sketch of the clip's current cut (or its whole length) that
+ *  opens the timeline. Disabled, with the reason, while there is nothing here to cut. */
+function cutStrip(clip: ClipRow): HTMLElement {
+  const editable = canEdit(clip);
+  const cut = clip.cut;
+  // The sketch is in source time, and after a cut the row's duration is the kept length, so
+  // the last segment's end is the better guess at how long the recording is.
+  const scale = Math.max(clip.duration_ms, cut?.[cut.length - 1]?.end_ms ?? 0, 1);
+  const keeps = (cut ?? [{ start_ms: 0, end_ms: scale }]).map((s) =>
+    h("span", {
+      class: "keep",
+      style: `left:${(s.start_ms / scale) * 100}%;width:${((s.end_ms - s.start_ms) / scale) * 100}%`,
+    }),
+  );
+  const note = !editable
+    ? isReleased(clip)
+      ? "The video is only on the site, so there is nothing here to cut."
+      : "Wait for the current job to finish."
+    : cut
+      ? `${cutLabel(cut)} — open to change the cut`
+      : "Trim the ends or take out the middle, then it re-uploads in place.";
+  return h(
+    "button",
+    {
+      type: "button",
+      class: "trim",
+      disabled: !editable,
+      title: "Trim & cut (E)",
+      onclick: () => go({ view: "editor", id: clip.id }),
+    },
+    h("span", { class: `tag${cut ? " cut" : ""}`, text: cut ? "CUT" : "TRIM" }),
+    h("span", { class: "strip" }, ...keeps),
+    h("span", { class: "note", text: note }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rail
+
+/** What the rail is currently showing, so a poll that changed nothing does not rebuild it.
+ *  Rebuilding would also disarm a Delete waiting for its second click. */
+let railKey = "";
+
+function renderRail(): void {
+  if (!live) return;
+  const rail = live.root.querySelector<HTMLElement>(".rail");
+  const clip = data.clips.find((c) => c.id === live?.id);
+  if (!rail || !clip) return;
+
+  const badge = badgeFor(clip, data.progress.get(clip.id), data.status, data.settings);
+  const released = isReleased(clip);
+
+  const key = [
+    clip.game,
+    clip.title,
+    clip.size_source,
+    clip.size_av1,
+    clip.size_h264,
+    clip.page_url,
+    clip.status,
+    badge.label,
+    released,
+    clip.duration_ms,
+    JSON.stringify(clip.cut),
+  ].join("");
+  if (key === railKey) return;
+  railKey = key;
+
+  fill(live.strip, cutStrip(clip));
+  const editable = canEdit(clip);
+
+  const name = h("button", {
+    type: "button",
+    class: "game-name",
+    text: `${gameLabel(clip.game)} ✎`,
+    title: "Click to rename just this clip's game",
+  });
+  name.addEventListener("click", () =>
+    editInline(name, clip.game ?? "", (value) => void ipc.setClipGame(clip.id, value).then(loadClips), {
+      class: "game-edit",
+      placeholder: UNKNOWN,
+    }),
+  );
+
+  const openFolder = h("button", {
+    type: "button",
+    class: "btn",
+    text: released ? "Open folder — video is on the site only" : "Open folder",
+    disabled: released,
+    onclick: () => void ipc.openClipFolder(clip.id),
+  }) as HTMLButtonElement;
+
+  fill(
+    rail,
+    h(
+      "div",
+      { class: "game-block" },
+      h("span", { class: "label", text: "Game — click to edit" }),
+      name,
+      clip.title ? h("span", { class: "window-title", text: `window was “${clip.title}”` }) : null,
+    ),
+    h("span", { class: `badge ${badge.kind}`, text: badge.label, title: badge.title }),
+    h(
+      "div",
+      { class: "facts" },
+      h("span", { class: "k", text: "Recorded" }),
+      h("span", { class: "v", text: fmtWhenLong(clip.recorded_at) }),
+      h("span", { class: "k", text: "Length" }),
+      h("span", { class: "v mono", text: fmtDuration(clip.duration_ms) }),
+      h("span", { class: "k", text: "Video" }),
+      h("span", { class: "v mono", text: videoLine(clip) }),
+      h("span", { class: "k", text: "Original" }),
+      h("span", {
+        class: "v mono",
+        text: released ? `${fmtBytes(clip.size_source)} — freed` : fmtBytes(clip.size_source),
+      }),
+      h("span", { class: "k", text: "AV1 / H.264" }),
+      h("span", {
+        class: "v mono",
+        text: `${fmtBytes(clip.size_av1)} / ${fmtBytes(clip.size_h264)}`,
+      }),
+      clip.cut ? h("span", { class: "k", text: "Cut" }) : null,
+      clip.cut ? h("span", { class: "v", text: cutLabel(clip.cut) }) : null,
+    ),
+    h(
+      "div",
+      { class: "buttons" },
+      clip.page_url
+        ? copyLinkButton(clip.page_url, "btn primary")
+        : h("button", { type: "button", class: "btn", text: "Copy link", disabled: true, title: "Not on the site yet" }),
+      h("button", {
+        type: "button",
+        class: "btn",
+        text: "Trim & cut",
+        disabled: !editable,
+        title: editable ? "Open the editor (E)" : "Nothing here to cut right now",
+        onclick: () => go({ view: "editor", id: clip.id }),
+      }),
+      openFolder,
+      clip.status === "failed"
+        ? h("button", {
+            type: "button",
+            class: "btn",
+            text: "Retry",
+            onclick: () => void ipc.retryClip(clip.id),
+          })
+        : null,
+      confirming(
+        h("button", { type: "button", class: "btn danger" }) as HTMLButtonElement,
+        "Delete everywhere…",
+        "Confirm delete",
+        () => void deleteClip(clip.id),
+      ),
+    ),
+    live.message,
+    h("span", { class: "grow" }),
+    h("span", {
+      class: "note",
+      text: clip.remote_id
+        ? "Deleting removes the clip from this PC and from the site. The Discord post stays, but its video stops working."
+        : "Deleting removes the clip and every file it owns from this PC.",
+    }),
+  );
+}
+
+function videoLine(clip: ClipRow): string {
+  const size = clip.width && clip.height ? `${clip.width}×${clip.height}` : "unknown size";
+  return clip.fps ? `${size} · ${Math.round(clip.fps)} fps` : size;
+}
+
+async function deleteClip(id: number): Promise<void> {
+  if (!live) return;
+  live.message.textContent = "Deleting…";
+  live.message.className = "rail-msg";
+  try {
+    await ipc.deleteClip(id);
+    go({ view: "library" });
+  } catch (e) {
+    live.message.textContent = ipc.errorText(e);
+    live.message.className = "rail-msg err";
+  }
+}

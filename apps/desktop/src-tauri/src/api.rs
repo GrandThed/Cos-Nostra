@@ -50,6 +50,11 @@ pub fn status_of(e: &anyhow::Error) -> Option<u16> {
 pub struct DeviceStart {
     pub code: String,
     pub verify_url: String,
+    /// Proves to the backend that whoever polls the code is the device that asked for it.
+    /// It is a bearer for `GET /auth/device/:code` only. It never reaches settings.json and
+    /// never reaches the webview: the code alone is short and guessable, so without this
+    /// whoever polls first would walk away with the device token.
+    pub poll_secret: String,
 }
 
 /// Unknown fields (`id`, `expiresIn`, ...) are ignored by serde.
@@ -105,8 +110,23 @@ pub struct NewClipUpload {
     pub height: u32,
     /// RFC 3339.
     pub recorded_at: String,
+    /// The three sizes are what the backend signs each upload URL for, so they have to be
+    /// the real byte length of the file that is about to be PUT, not what the encode
+    /// recorded earlier. A wrong number fails the signature check at the bucket.
     pub size_av1: i64,
     pub size_h264: i64,
+    pub size_thumb: i64,
+}
+
+/// Body of `POST /clips/:id/replace`: the new files for a clip the site already has. The
+/// record keeps its id, page URL and Discord post; only the objects and the length change.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceClipUpload {
+    pub duration_ms: i64,
+    pub size_av1: i64,
+    pub size_h264: i64,
+    pub size_thumb: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +152,28 @@ pub struct ClipUrls {
 pub struct CompletedClip {
     pub id: String,
     pub urls: ClipUrls,
+}
+
+/// Callback for upload progress: the total bytes handed to the socket so far. Shared rather
+/// than borrowed because reqwest requires the request body to own everything it reads from.
+pub type OnBytes = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// A file that reports how much of itself has been read.
+struct Counting {
+    inner: File,
+    sent: u64,
+    on_bytes: OnBytes,
+}
+
+impl std::io::Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.sent += n as u64;
+            (self.on_bytes)(self.sent);
+        }
+        Ok(n)
+    }
 }
 
 pub struct Api {
@@ -197,9 +239,16 @@ impl Api {
     }
 
     /// One poll. `Ok(None)` when the backend no longer knows the code (404: expired or used).
-    pub fn poll_device_login(&self, code: &str) -> Result<Option<DevicePoll>> {
+    ///
+    /// Carries the poll secret as its bearer, never the device token: this is the call that
+    /// earns the device token, so at this point there is none. A wrong or missing secret is
+    /// a 401, which the caller treats as fatal rather than transient.
+    pub fn poll_device_login(&self, code: &str, poll_secret: &str) -> Result<Option<DevicePoll>> {
         let what = format!("GET /auth/device/{code}");
-        let req = self.client.get(self.url(&format!("/auth/device/{code}")));
+        let req = self
+            .client
+            .get(self.url(&format!("/auth/device/{code}")))
+            .bearer_auth(poll_secret);
         let body: DevicePollBody = match Self::send_json(req, &what) {
             Ok(b) => b,
             Err(e) if status_of(&e) == Some(404) => return Ok(None),
@@ -231,16 +280,54 @@ impl Api {
         Self::send_json(req, "POST /clips")
     }
 
+    /// Asks for fresh upload URLs for a clip that is already on the site, so an edited clip
+    /// replaces its own video rather than becoming a second clip. Followed by the same three
+    /// PUTs and `complete_clip` as a first upload.
+    pub fn replace_clip(&self, id: &str, clip: &ReplaceClipUpload) -> Result<CreatedClip> {
+        let what = format!("POST /clips/{id}/replace");
+        let req = self.auth(self.client.post(self.url(&format!("/clips/{id}/replace"))).json(clip))?;
+        Self::send_json(req, &what)
+    }
+
     /// Streams a file to a presigned URL. No auth header: the signature is in the URL.
-    pub fn put_file(&self, url: &str, path: &Path, content_type: &str) -> Result<()> {
+    ///
+    /// `on_bytes` is called with the running total as the body is read, on whatever thread
+    /// reqwest reads it from, so the clip card can count the megabytes up.
+    pub fn put_file(
+        &self,
+        url: &str,
+        path: &Path,
+        content_type: &str,
+        on_bytes: Option<OnBytes>,
+    ) -> Result<()> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("sizing {}", path.display()))?
+            .len();
+        // A counting reader has to declare its length or reqwest falls back to chunked
+        // transfer encoding, which a presigned S3 PUT rejects.
+        let body = match on_bytes {
+            Some(on_bytes) => {
+                reqwest::blocking::Body::sized(Counting { inner: file, sent: 0, on_bytes }, len)
+            }
+            None => reqwest::blocking::Body::from(file),
+        };
         let req = self
             .client
             .put(url)
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .timeout(PUT_TIMEOUT)
-            .body(file);
+            .body(body);
         Self::send(req, &format!("PUT {}", path.display())).map(drop)
+    }
+
+    /// Removes a clip's video from the bucket. The backend keeps the row, because the Discord
+    /// post and its reactions point at it, so the link survives and the video does not.
+    pub fn delete_clip(&self, id: &str) -> Result<()> {
+        let what = format!("DELETE /clips/{id}");
+        let req = self.auth(self.client.delete(self.url(&format!("/clips/{id}"))))?;
+        Self::send(req, &what).map(drop)
     }
 
     pub fn complete_clip(&self, id: &str) -> Result<CompletedClip> {
@@ -355,7 +442,7 @@ mod tests {
         let (base, seen) = stub(|base| {
             let s = |x: &str| x.to_string();
             vec![
-                ("200 OK", s(r#"{"code":"ABCD","verifyUrl":"https://x/verify?code=ABCD","expiresIn":600}"#)),
+                ("200 OK", s(r#"{"code":"ABCD","verifyUrl":"https://x/verify?code=ABCD","pollSecret":"s3cr3t","expiresIn":600}"#)),
                 ("200 OK", s(r#"{"status":"pending"}"#)),
                 ("200 OK", s(r#"{"status":"ready","token":"tok","user":{"id":"u1","discordId":"123","username":"benja","avatar":null}}"#)),
                 ("200 OK", s(r#"{"user":{"id":"u1","discordId":"123","username":"benja"},"device":{"id":"d1"}}"#)),
@@ -376,8 +463,12 @@ mod tests {
         let start = api.start_device_login("PC").unwrap();
         assert_eq!(start.code, "ABCD");
         assert_eq!(start.verify_url, "https://x/verify?code=ABCD");
-        assert!(matches!(api.poll_device_login("ABCD").unwrap(), Some(DevicePoll::Pending)));
-        let token = match api.poll_device_login("ABCD").unwrap() {
+        assert_eq!(start.poll_secret, "s3cr3t");
+        assert!(matches!(
+            api.poll_device_login("ABCD", &start.poll_secret).unwrap(),
+            Some(DevicePoll::Pending)
+        ));
+        let token = match api.poll_device_login("ABCD", &start.poll_secret).unwrap() {
             Some(DevicePoll::Ready { token, user }) => {
                 assert_eq!(user.username, "benja");
                 assert_eq!(user.discord_id, "123");
@@ -400,13 +491,22 @@ mod tests {
                 recorded_at: "2026-09-10T10:00:00Z".into(),
                 size_av1: 3000,
                 size_h264: 2000,
+                size_thumb: 100,
             })
             .unwrap();
         assert_eq!(created.id, "clip1");
         assert!(created.uploads.av1.starts_with(&base));
-        api.put_file(&created.uploads.av1, &av1, "video/mp4").unwrap();
-        api.put_file(&created.uploads.h264, &h264, "video/mp4").unwrap();
-        api.put_file(&created.uploads.thumb, &thumb, "image/jpeg").unwrap();
+        // The AV1 upload is watched, which swaps the plain file body for the counting one;
+        // the content-length assertions below are what prove that stayed a sized request.
+        let counted = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&counted);
+        let on_bytes: OnBytes = Arc::new(move |sent| sink.lock().unwrap().push(sent));
+        api.put_file(&created.uploads.av1, &av1, "video/mp4", Some(on_bytes)).unwrap();
+        api.put_file(&created.uploads.h264, &h264, "video/mp4", None).unwrap();
+        api.put_file(&created.uploads.thumb, &thumb, "image/jpeg", None).unwrap();
+        let counted = counted.lock().unwrap().clone();
+        assert_eq!(counted.last(), Some(&3000), "the whole file was counted: {counted:?}");
+        assert!(counted.windows(2).all(|w| w[0] < w[1]), "counts must rise: {counted:?}");
 
         let err = api.complete_clip("clip1").unwrap_err();
         let http = http_error(&err).expect("http error in chain");
@@ -419,7 +519,7 @@ mod tests {
 
         let err = api.me().unwrap_err();
         assert_eq!(status_of(&err), Some(401));
-        assert!(api.poll_device_login("ZZZZ").unwrap().is_none(), "404 is None");
+        assert!(api.poll_device_login("ZZZZ", "s3cr3t").unwrap().is_none(), "404 is None");
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 12);
@@ -429,12 +529,17 @@ mod tests {
         assert!(seen[0].header("user-agent").unwrap().starts_with("cos-nostra-desktop/"));
         assert_eq!(seen[0].header("authorization"), None);
         assert_eq!(seen[1].path, "/auth/device/ABCD");
+        // Both polls prove who asked for the code with the poll secret.
+        assert_eq!(seen[1].header("authorization"), Some("Bearer s3cr3t"));
+        assert_eq!(seen[2].path, "/auth/device/ABCD");
+        assert_eq!(seen[2].header("authorization"), Some("Bearer s3cr3t"));
         assert_eq!(seen[3].path, "/auth/me");
         assert_eq!(seen[3].header("authorization"), Some("Bearer tok"));
         assert_eq!((seen[4].method.as_str(), seen[4].path.as_str()), ("POST", "/clips"));
         let clip_body: serde_json::Value = serde_json::from_slice(&seen[4].body).unwrap();
         assert_eq!(clip_body["durationMs"], 30_000);
         assert_eq!(clip_body["sizeAv1"], 3000);
+        assert_eq!(clip_body["sizeThumb"], 100);
         assert_eq!(clip_body["recordedAt"], "2026-09-10T10:00:00Z");
 
         for (i, (path, len, ct)) in [
@@ -456,8 +561,59 @@ mod tests {
         assert_eq!(seen[8].path, "/clips/clip1/complete");
         assert_eq!(seen[8].header("authorization"), Some("Bearer tok"));
         assert_eq!(seen[11].path, "/auth/device/ZZZZ");
+        // That last poll ran on a client that *has* a device token. The poll route still
+        // sends the poll secret, which is the whole point: it must not spend the token.
+        assert_eq!(seen[11].header("authorization"), Some("Bearer s3cr3t"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_reuses_the_clip_id() {
+        let (base, seen) = stub(|base| {
+            vec![
+                ("200 OK", format!(
+                    r#"{{"id":"clip1","uploads":{{"av1":"{base}/s3/av1?sig=9","h264":"{base}/s3/h264?sig=9","thumb":"{base}/s3/thumb?sig=9"}},"expiresIn":900}}"#
+                )),
+                ("404 Not Found", r#"{"error":"not_found"}"#.to_string()),
+            ]
+        });
+        let api = Api::new(&base, Some("tok".into())).unwrap();
+        let body = ReplaceClipUpload {
+            duration_ms: 12_000,
+            size_av1: 10,
+            size_h264: 20,
+            size_thumb: 3,
+        };
+        let replaced = api.replace_clip("clip1", &body).unwrap();
+        assert_eq!(replaced.id, "clip1");
+        assert!(replaced.uploads.h264.ends_with("/s3/h264?sig=9"));
+        // A clip the site has since deleted is a 404 the caller can fall back from.
+        let err = api.replace_clip("clip1", &body).unwrap_err();
+        assert_eq!(status_of(&err), Some(404));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].method.as_str(), seen[0].path.as_str()), ("POST", "/clips/clip1/replace"));
+        assert_eq!(seen[0].header("authorization"), Some("Bearer tok"));
+        let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+        assert_eq!(sent["durationMs"], 12_000);
+        assert_eq!(sent["sizeThumb"], 3);
+    }
+
+    /// The backend answers 401 when the poll secret is missing or wrong. That must not look
+    /// like "still pending" (the loop would spin for ten minutes) nor like "expired" (`None`).
+    #[test]
+    fn a_poll_with_the_wrong_secret_is_a_401() {
+        let (base, seen) = stub(|_| {
+            vec![("401 Unauthorized", r#"{"error":"bad_poll_secret"}"#.to_string())]
+        });
+        let api = Api::new(&base, Some("device-token".into())).unwrap();
+        let err = api.poll_device_login("ABCD", "wrong").unwrap_err();
+        assert_eq!(status_of(&err), Some(401));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].path, "/auth/device/ABCD");
+        assert_eq!(seen[0].header("authorization"), Some("Bearer wrong"));
     }
 
     #[test]

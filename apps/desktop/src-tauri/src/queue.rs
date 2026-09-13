@@ -10,16 +10,19 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
+use crate::ffmpeg::Segment;
+
 pub const MAX_ATTEMPTS: i32 = 5;
 
 /// Current schema, stored in `PRAGMA user_version` so later phases can migrate.
-/// 1: initial. 2: `stage`, `remote_id`, `page_url` for uploads.
-const SCHEMA_VERSION: i32 = 2;
+/// 1: initial. 2: `stage`, `remote_id`, `page_url` for uploads. 3: `fps`, which the player
+/// needs to step a frame at a time. 4: `cut`, the kept parts the editor chose.
+const SCHEMA_VERSION: i32 = 4;
 
 /// How often the worker polls when nobody calls `wake`.
 #[cfg(not(test))]
@@ -112,6 +115,8 @@ pub struct NewClip {
     pub duration_ms: i64,
     pub width: u32,
     pub height: u32,
+    /// Frames per second the source was captured at, as ffprobe read it.
+    pub fps: f64,
     pub size_source: i64,
 }
 
@@ -140,6 +145,16 @@ pub struct ClipRow {
     pub remote_id: Option<String>,
     /// Public player page once uploaded.
     pub page_url: Option<String>,
+    /// Capture frame rate. `None` on clips saved before the column existed, which is why the
+    /// player falls back to a sensible step when it frame-steps.
+    pub fps: Option<f64>,
+    /// The parts of the original recording the editor chose to keep, in order. `None` is the
+    /// whole recording. Measured against `source_path`; once that file is gone and a cut has
+    /// been baked into the outputs, the processor clears this so the next edit starts fresh.
+    pub cut: Option<Vec<Segment>>,
+    /// When the row last changed. The UI keys its thumbnail cache on it, since a re-encode
+    /// rewrites the thumbnail in place under the same path.
+    pub updated_at: String,
 }
 
 /// Files the processor produced for a clip.
@@ -150,6 +165,9 @@ pub struct Outputs {
     pub thumb_path: String,
     pub size_av1: i64,
     pub size_h264: i64,
+    /// Length of what was written, when a cut made it differ from the recording. `None`
+    /// leaves the row's duration alone.
+    pub duration_ms: Option<i64>,
 }
 
 /// What the uploader hands back for a finished upload.
@@ -157,6 +175,27 @@ pub struct Outputs {
 pub struct UploadResult {
     pub remote_id: String,
     pub page_url: String,
+}
+
+/// Attached by the uploader (with `.context(Refused(..))`) to a failure that retrying cannot
+/// fix: the backend turned the clip down on its merits rather than failing to hear it. The
+/// same three files will be refused again in thirty seconds and in thirty minutes, so the row
+/// parks as `failed` with no next attempt instead of grinding through all `MAX_ATTEMPTS`. The
+/// Retry button still works, which is the point — the user fixes the cause (frees quota) and
+/// asks again. The inner string is the whole of what the user is told, so write it for them.
+#[derive(Debug, Clone, Copy)]
+pub struct Refused(pub &'static str);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// True when a `Refused` sits anywhere in the chain. `anyhow`'s downcast searches through
+/// every `.context()` layer, so the marker survives the contexts added above it.
+pub fn is_refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>().is_some()
 }
 
 /// Does the encoding work for one clip. Runs on the worker thread.
@@ -178,6 +217,7 @@ CREATE TABLE IF NOT EXISTS clips (
     duration_ms INTEGER NOT NULL,
     width INTEGER,
     height INTEGER,
+    fps REAL,
     size_source INTEGER NOT NULL,
     size_av1 INTEGER,
     size_h264 INTEGER,
@@ -192,22 +232,26 @@ CREATE TABLE IF NOT EXISTS clips (
     updated_at TEXT NOT NULL,
     stage TEXT NOT NULL DEFAULT 'encode',
     remote_id TEXT,
-    page_url TEXT
+    page_url TEXT,
+    cut TEXT
 );
 CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 ";
 
-/// Columns added in schema version 2, applied with ALTER TABLE to version-1 databases.
-const V2_COLUMNS: [(&str, &str); 3] = [
+/// Columns added after version 1, applied with ALTER TABLE to databases that predate them.
+/// Every one is nullable or has a default, so an older row needs no backfill.
+const ADDED_COLUMNS: [(&str, &str); 5] = [
     ("stage", "TEXT NOT NULL DEFAULT 'encode'"),
     ("remote_id", "TEXT"),
     ("page_url", "TEXT"),
+    ("fps", "REAL"),
+    ("cut", "TEXT"),
 ];
 
 /// Column list shared by every SELECT so `row_from` stays in sync.
 const COLUMNS: &str = "id, source_path, game, title, recorded_at, duration_ms, width, height, \
     size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts, \
-    stage, remote_id, page_url";
+    stage, remote_id, page_url, fps, cut, updated_at";
 
 pub struct Queue {
     conn: Mutex<Connection>,
@@ -237,8 +281,8 @@ impl Queue {
             .context("reading schema version")?;
         if version < SCHEMA_VERSION {
             if version >= 1 {
-                // A version-1 table already exists; the CREATE above did not add the new columns.
-                migrate_to_v2(&conn)?;
+                // An older table already exists; the CREATE above did not add the new columns.
+                add_missing_columns(&conn)?;
             }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("writing schema version")?;
@@ -278,8 +322,8 @@ impl Queue {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO clips (source_path, game, title, recorded_at, duration_ms, width, height, \
-             size_source, status, attempts, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'saved', 0, ?9, ?9)",
+             fps, size_source, status, attempts, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10)",
             params![
                 clip.source_path,
                 clip.game,
@@ -288,6 +332,7 @@ impl Queue {
                 clip.duration_ms,
                 clip.width,
                 clip.height,
+                clip.fps,
                 clip.size_source,
                 now,
             ],
@@ -349,6 +394,64 @@ impl Queue {
             params![id, game, now_rfc3339()],
         )
         .with_context(|| format!("setting game on clip {id}"))?;
+        Ok(())
+    }
+
+    /// Moves every clip of one game to another name, and returns how many moved. `None` on
+    /// either side is the "no game detected" pile, which is why the match cannot just be
+    /// `game = ?1`. Renaming onto a name that already exists merges the two.
+    pub fn rename_game(&self, from: Option<&str>, to: Option<&str>) -> Result<usize> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE clips SET game = ?2, updated_at = ?3 WHERE game IS ?1",
+                params![from, to, now_rfc3339()],
+            )
+            .with_context(|| format!("renaming game {from:?} to {to:?}"))?;
+        Ok(changed)
+    }
+
+    /// Sends a clip back through the encoder with a new cut (`None` for the whole recording),
+    /// from wherever it was: an encoded or uploaded clip is re-encoded and, when the site
+    /// already has it, re-uploaded in place. Refused while a job is running on the clip, since
+    /// the worker would be writing the outputs this one is about to replace.
+    pub fn request_reencode(&self, id: i64, cut: Option<&[Segment]>) -> Result<()> {
+        let json = cut
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding cut")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting re-encode transaction")?;
+        let status: Option<String> = tx
+            .query_row("SELECT status FROM clips WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .with_context(|| format!("reading clip {id}"))?;
+        match status.as_deref() {
+            None => bail!("clip {id} not found"),
+            Some("encoding") | Some("uploading") => {
+                bail!("this clip is busy right now; wait for the current job to finish")
+            }
+            Some(_) => {}
+        }
+        tx.execute(
+            "UPDATE clips SET cut = ?2, status = 'saved', stage = 'encode', attempts = 0, \
+             error = NULL, next_attempt_at = NULL, updated_at = ?3 WHERE id = ?1",
+            params![id, json, now_rfc3339()],
+        )
+        .with_context(|| format!("requesting re-encode of clip {id}"))?;
+        tx.commit().context("committing re-encode request")?;
+        Ok(())
+    }
+
+    /// Forgets a clip's cut after it was baked into the outputs from a file that no longer
+    /// exists as the original, so the segments are not applied twice.
+    pub fn clear_cut(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET cut = NULL, updated_at = ?2 WHERE id = ?1",
+            params![id, now_rfc3339()],
+        )
+        .with_context(|| format!("clearing cut of clip {id}"))?;
         Ok(())
     }
 
@@ -444,7 +547,14 @@ impl Queue {
     }
 
     pub fn mark_upload_failed(&self, id: i64, error: &str) -> Result<()> {
-        self.mark_failed_in(id, Stage::Upload, error)
+        self.mark_failed_in(id, Stage::Upload, error, true)
+    }
+
+    /// Records an upload the backend refused outright (see `Refused`). Identical to
+    /// `mark_upload_failed` except that no next attempt is scheduled, so the worker leaves
+    /// the row alone until somebody presses Retry.
+    pub fn mark_upload_refused(&self, id: i64, error: &str) -> Result<()> {
+        self.mark_failed_in(id, Stage::Upload, error, false)
     }
 
     pub(crate) fn mark_encoded(&self, id: i64, out: &Outputs) -> Result<()> {
@@ -452,7 +562,7 @@ impl Queue {
         conn.execute(
             "UPDATE clips SET status = 'encoded', error = NULL, next_attempt_at = NULL, \
              av1_path = ?2, h264_path = ?3, thumb_path = ?4, size_av1 = ?5, size_h264 = ?6, \
-             updated_at = ?7 WHERE id = ?1",
+             duration_ms = COALESCE(?8, duration_ms), updated_at = ?7 WHERE id = ?1",
             params![
                 id,
                 out.av1_path,
@@ -461,6 +571,7 @@ impl Queue {
                 out.size_av1,
                 out.size_h264,
                 now_rfc3339(),
+                out.duration_ms,
             ],
         )
         .with_context(|| format!("marking clip {id} encoded"))?;
@@ -469,10 +580,12 @@ impl Queue {
 
     /// Records an encode failure, bumps attempts and schedules the next try (or none at the cap).
     pub(crate) fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
-        self.mark_failed_in(id, Stage::Encode, error)
+        self.mark_failed_in(id, Stage::Encode, error, true)
     }
 
-    fn mark_failed_in(&self, id: i64, stage: Stage, error: &str) -> Result<()> {
+    /// `schedule_retry` false parks the row with no `next_attempt_at` however many attempts it
+    /// has left, which is how a refused upload stops without pretending it ran out of tries.
+    fn mark_failed_in(&self, id: i64, stage: Stage, error: &str, schedule_retry: bool) -> Result<()> {
         let error: String = error.chars().take(MAX_ERROR_CHARS).collect();
         let now = Utc::now();
         let mut conn = self.lock();
@@ -485,7 +598,7 @@ impl Queue {
             )
             .with_context(|| format!("reading attempts of clip {id}"))?
             + 1;
-        let next_attempt_at = if attempts < MAX_ATTEMPTS {
+        let next_attempt_at = if schedule_retry && attempts < MAX_ATTEMPTS {
             Some(format_rfc3339(now + backoff_for(attempts)))
         } else {
             None
@@ -511,9 +624,9 @@ impl Queue {
     }
 }
 
-/// Adds the version-2 columns that are missing. Idempotent, so a half-applied migration
-/// (crash between ALTERs) finishes on the next open.
-fn migrate_to_v2(conn: &Connection) -> Result<()> {
+/// Adds whichever of the later columns this database does not have yet. Idempotent, so a
+/// half-applied migration (crash between ALTERs) finishes on the next open.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(clips)")
         .context("reading clips columns")?;
@@ -522,7 +635,7 @@ fn migrate_to_v2(conn: &Connection) -> Result<()> {
         .context("listing clips columns")?
         .collect::<rusqlite::Result<_>>()
         .context("reading clips columns")?;
-    for (name, decl) in V2_COLUMNS {
+    for (name, decl) in ADDED_COLUMNS {
         if !existing.iter().any(|c| c == name) {
             conn.execute(&format!("ALTER TABLE clips ADD COLUMN {name} {decl}"), [])
                 .with_context(|| format!("adding column {name}"))?;
@@ -552,6 +665,15 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         )
     })?;
     let stage_text: String = r.get(17)?;
+    let cut = r
+        .get::<_, Option<String>>(21)?
+        .map(|json| serde_json::from_str::<Vec<Segment>>(&json))
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(21, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        // An empty list would mean the same as no cut; keep one spelling.
+        .filter(|segments| !segments.is_empty());
     Ok(ClipRow {
         id: r.get(0)?,
         source_path: r.get(1)?,
@@ -579,6 +701,9 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         })?,
         remote_id: r.get(18)?,
         page_url: r.get(19)?,
+        fps: r.get(20)?,
+        cut,
+        updated_at: r.get(22)?,
     })
 }
 
@@ -724,6 +849,11 @@ fn run_upload(queue: &Queue, row: &ClipRow, uploader: &Uploader, on_change: &OnC
             log::info!("clip {id} uploaded: {}", done.page_url);
             queue.mark_done(id, &done.remote_id, &done.page_url)
         }
+        Err(e) if is_refused(&e) => {
+            let text = format!("{e:#}");
+            log::error!("clip {id} refused by the backend, not retrying: {text}");
+            queue.mark_upload_refused(id, &text)
+        }
         Err(e) => {
             let text = format!("{e:#}");
             log::error!("clip {id} upload failed: {text}");
@@ -797,6 +927,7 @@ mod tests {
             duration_ms: 30_000,
             width: 1920,
             height: 1080,
+            fps: 60.0,
             size_source: 12_345,
         }
     }
@@ -824,7 +955,63 @@ mod tests {
             thumb_path: "t.jpg".into(),
             size_av1: 1,
             size_h264: 2,
+            duration_ms: None,
         }
+    }
+
+    fn seg(start_ms: i64, end_ms: i64) -> Segment {
+        Segment { start_ms, end_ms }
+    }
+
+    /// The editor's path: a finished clip goes back to `saved` carrying its cut, the encode
+    /// records the shorter length, and a clip mid-job is refused.
+    #[test]
+    fn reencode_request_carries_the_cut_and_is_refused_mid_job() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let id = q.enqueue(clip("c", "2026-09-10T10:00:00.000Z")).unwrap();
+        q.mark_encoded(id, &outputs()).unwrap();
+        q.mark_uploading(id).unwrap();
+        q.mark_done(id, "r1", "https://x/c/r1").unwrap();
+        let before = q.get(id).unwrap().unwrap();
+        assert_eq!(before.cut, None);
+
+        let cut = vec![seg(1_000, 5_000), seg(9_000, 12_000)];
+        q.request_reencode(id, Some(&cut)).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!(row.stage, Stage::Encode);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.cut, Some(cut.clone()));
+        assert_eq!(row.remote_id.as_deref(), Some("r1"), "the site's copy is still known");
+        assert_eq!(row.av1_path.as_deref(), Some("a.mp4"), "old outputs stay until replaced");
+        assert!(row.updated_at >= before.updated_at);
+
+        // The encode that applies it records the new length; a plain encode leaves it alone.
+        q.mark_encoded(id, &Outputs { duration_ms: Some(7_000), ..outputs() }).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.duration_ms, 7_000);
+        assert_eq!(row.cut, Some(cut), "the cut stays for the next edit of the original");
+        q.mark_encoded(id, &outputs()).unwrap();
+        assert_eq!(q.get(id).unwrap().unwrap().duration_ms, 7_000);
+
+        // Baked from a copy: the cut is consumed.
+        q.clear_cut(id).unwrap();
+        assert_eq!(q.get(id).unwrap().unwrap().cut, None);
+
+        // Back to the whole recording is a re-encode too.
+        q.request_reencode(id, None).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!(row.cut, None);
+
+        for busy in ["encoding", "uploading"] {
+            q.lock()
+                .execute("UPDATE clips SET status = ?2 WHERE id = ?1", params![id, busy])
+                .unwrap();
+            let err = q.request_reencode(id, None).unwrap_err();
+            assert!(format!("{err:#}").contains("busy"), "{busy}: {err:#}");
+        }
+        assert!(q.request_reencode(9999, None).is_err());
     }
 
     #[test]
@@ -1106,6 +1293,55 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    /// A refused upload (413: too large, or the account is out of quota) must stop on the
+    /// first try. Retrying cannot change the answer, so the five backoffs an ordinary failure
+    /// spends would only delay telling the user, and `Retry` has to keep working for after
+    /// they have freed some space.
+    #[test]
+    fn a_refused_upload_parks_without_retrying() {
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let uploader: Uploader = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_row| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("HTTP 413: quota_exceeded"))
+                    .context(Refused("your storage quota is full"))
+                    .context("creating clip record")
+            })
+        };
+        let worker = start_worker(
+            Arc::clone(&q),
+            Arc::new(|_row| Ok(outputs())),
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            Arc::new(|| true),
+        );
+        let id = q.enqueue(clip("r", "2026-09-10T10:00:00.000Z")).unwrap();
+        worker.wake();
+
+        let parked = wait_until(&q, id, |r| r.status == ClipStatus::Failed && r.attempts > 0);
+        assert_eq!(parked.stage, Stage::Upload);
+        assert_eq!(parked.attempts, 1, "stopped on the first answer, not at the cap");
+        assert!(
+            q.next_attempt_at(id).unwrap().is_none(),
+            "a refused clip schedules no next attempt",
+        );
+        // The message the card's tooltip shows has to name the cause, not just the status.
+        let error = parked.error.unwrap_or_default();
+        assert!(error.contains("your storage quota is full"), "unhelpful error: {error}");
+
+        // Long enough that any scheduled backoff would have fired.
+        std::thread::sleep(POLL_INTERVAL * 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "never retried on its own");
+
+        // The user frees space and presses Retry: the queue picks it straight back up.
+        q.retry(id).unwrap();
+        worker.wake();
+        wait_until(&q, id, |_| calls.load(Ordering::SeqCst) > 1);
+    }
+
     #[test]
     fn upload_failure_is_not_re_encoded_and_retry_resumes_at_upload() {
         let q = Arc::new(Queue::open(&temp_db()).unwrap());
@@ -1227,6 +1463,8 @@ mod tests {
         assert_eq!(row.status, ClipStatus::Encoded, "interrupted upload goes back to encoded");
         assert_eq!(row.stage, Stage::Encode);
         assert_eq!(row.remote_id, None);
+        assert_eq!(row.fps, None, "a row that predates the column has no frame rate");
+        assert_eq!(row.cut, None, "and no cut");
         let version: i32 = q
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1235,6 +1473,43 @@ mod tests {
         // Reopening a migrated database is a no-op.
         drop(q);
         Queue::open(&path).unwrap();
+    }
+
+    /// Renaming a whole game is also how the library merges two, and how the "Unknown game"
+    /// pile is emptied, so all three directions get a clip each.
+    #[test]
+    fn renaming_a_game_moves_every_clip_of_it() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let named = |name: &str, file: &str| NewClip {
+            game: Some(name.into()),
+            ..clip(file, "2026-09-10T10:00:00.000Z")
+        };
+        let a = q.enqueue(named("HELLDIVERS2", "a")).unwrap();
+        let b = q.enqueue(named("HELLDIVERS2", "b")).unwrap();
+        let c = q.enqueue(named("Rocket League", "c")).unwrap();
+        let unknown = q
+            .enqueue(NewClip {
+                game: None,
+                ..clip("d", "2026-09-10T10:00:00.000Z")
+            })
+            .unwrap();
+
+        let game_of = |id| q.get(id).unwrap().unwrap().game;
+
+        // Merge: the odd spelling joins a name that already has clips.
+        assert_eq!(q.rename_game(Some("HELLDIVERS2"), Some("Helldivers 2")).unwrap(), 2);
+        assert_eq!(game_of(a).as_deref(), Some("Helldivers 2"));
+        assert_eq!(game_of(b).as_deref(), Some("Helldivers 2"));
+        assert_eq!(game_of(c).as_deref(), Some("Rocket League"), "other games are untouched");
+
+        // The unknown pile is addressed by NULL, not by a name.
+        assert_eq!(q.rename_game(None, Some("Lethal Company")).unwrap(), 1);
+        assert_eq!(game_of(unknown).as_deref(), Some("Lethal Company"));
+
+        // And back again.
+        assert_eq!(q.rename_game(Some("Lethal Company"), None).unwrap(), 1);
+        assert_eq!(game_of(unknown), None);
+        assert_eq!(q.rename_game(Some("Nothing Here"), Some("x")).unwrap(), 0);
     }
 
     #[test]

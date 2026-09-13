@@ -12,7 +12,48 @@ Windows clipper built with Tauri. Capture and encoding run on embedded libobs.
   available hardware H.264 encoder (NVENC, AMF, QSV) or x264 as fallback.
 - A global hotkey (default `Alt+F10`), the tray menu, or the window button flush the buffer to
   `%USERPROFILE%\Videos\Cos Nostra`.
-- Settings live in `%APPDATA%\Cos Nostra\settings.json`.
+- Settings live in `%APPDATA%\Cos Nostra\settings.json`, clip metadata in `clips.db` beside it.
+
+## The window
+
+Plain HTML, CSS and TypeScript modules in `src/`, no framework. `main.ts` is the wiring: it
+mounts one of four screens, keeps `store.ts` fed from a five second poll and the events Rust
+pushes, and nothing renders from an event payload directly.
+
+| | |
+|---|---|
+| `shell.ts` | title bar, toolbar, alarm banners, the status panel behind the recording pill |
+| `library.ts` | game sidebar, filters, the clip grid that becomes rows under 840 px |
+| `player.ts` | the clip detail view, which is also the player |
+| `editor.ts` | trim & cut: the timeline with handles, split, undo, and Apply, which sends the clip back through the queue |
+| `storage.ts`, `settings.ts`, `firstrun.ts` | the other three screens |
+| `clips.ts` | what a clip row means: its badge, its meta line, where its video is |
+| `styles/tokens.css` | the one token set both themes run on |
+
+The window is undecorated, so `.titlebar` is the title bar and the window buttons call the
+Tauri window API; that needs the `core:window:allow-*` permissions in
+`capabilities/default.json`. Light and dark follow `prefers-color-scheme`, which WebView2 fixes
+when the window is created — changing the system theme only takes effect on the next launch.
+
+Fonts are self-hosted in `src/assets/fonts/` so the app looks the same offline. They are
+variable-weight subsets of Bricolage Grotesque, Rubik and JetBrains Mono, all OFL-1.1 (see
+`OFL.txt` beside them); `node scripts/fetch-fonts.mjs src/assets/fonts` regenerates them.
+
+The player reads clip files through Tauri's asset protocol. `lib.rs` widens its scope to the
+clip folder at startup and whenever the folder setting changes, so a clip outside that folder
+will not play.
+
+## Trim & cut
+
+A cut is a list of kept ranges (`ffmpeg::Segment`) stored on the clip row (`cut`, schema v4)
+and measured against the original recording. Apply puts the row back to `saved`; the worker
+re-encodes both outputs from the recording with the cut applied (one segment is `-ss`/`-to`,
+several are a `trim`/`concat` filter graph in one pass), regenerates the thumbnail from inside
+the kept footage, records the new length, and re-uploads under the same clip id through
+`POST /clips/:id/replace`. While the recording is on disk the cut is non-destructive: the
+editor reopens on the whole recording with the cut drawn on it. Once the recording has been
+dropped, the encoded H.264 copy is the source, the cut is baked into it and the row's `cut` is
+cleared afterwards, and the editor warns and asks for a second click on Apply.
 
 ## ffmpeg
 

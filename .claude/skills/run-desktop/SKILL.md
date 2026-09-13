@@ -7,6 +7,8 @@ description: Build, launch, test and stop the Cos Nostra Tauri desktop clipper i
 
 ## Launch
 
+**Before launching, check what the queue will do.** A dev build shares `%APPDATA%\Cos Nostra\settings.json` with the installed build, so if the account is linked and `auto_upload` is on, the queue worker uploads every encoded clip to **production** a few seconds after the recorder starts, and the bot posts it to Discord. Nobody has to press anything. Read `settings.json` first: if `device_token` is set and `"auto_upload": true`, either set `auto_upload` to `false` in the file before launching, or set `backend_url` to `http://localhost:3000` with a local backend running. A clip that got up anyway comes down with `DELETE /clips/:id` using the device token (CLAUDE.md, gotchas).
+
 From `apps/desktop`, with `RUST_LOG=info` so the capture layer logs:
 
 ```powershell

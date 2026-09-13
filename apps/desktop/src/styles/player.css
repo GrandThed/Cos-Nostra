@@ -1,0 +1,540 @@
+/* The player, which is also the clip detail view: video and transport on the left, everything
+   the library card could not fit on the right. */
+
+.player {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.player-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: none;
+  height: 48px;
+  padding: 0 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.player-head .back {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--mut);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-head .back b {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.player-head .position {
+  color: var(--mut);
+  white-space: nowrap;
+}
+
+.player-head .steps {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.player-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow-y: auto;
+}
+
+.stage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* --- Video --------------------------------------------------------------- */
+
+.video {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 10px;
+  overflow: hidden;
+  background: linear-gradient(140deg, hsl(var(--hue) 26% 22%), hsl(var(--hue) 40% 8%));
+}
+
+.video video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.video .source-note {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--overVideo);
+  color: var(--rel);
+}
+
+.video .big-play {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+}
+
+.video .big-play span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  padding-left: 5px;
+  font-size: 22px;
+  border-radius: 50%;
+  background: rgba(12, 9, 4, 0.72);
+  border: 1.5px solid rgba(241, 234, 219, 0.5);
+  color: var(--overVideoInk);
+}
+
+.video .trouble {
+  position: absolute;
+  inset: auto 12px 12px;
+  padding: 8px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  background: var(--overVideo);
+  color: var(--err);
+}
+
+/* --- Transport ----------------------------------------------------------- */
+
+.transport {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scrubber {
+  position: relative;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--panel2);
+  cursor: pointer;
+}
+
+/* A comfortable grab area without a fat bar. */
+.scrubber::before {
+  content: "";
+  position: absolute;
+  inset: -7px 0;
+}
+
+.scrubber .buffered,
+.scrubber .played {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.scrubber .buffered {
+  background: var(--mut);
+  opacity: 0.4;
+}
+
+.scrubber .played {
+  background: var(--acc);
+}
+
+.scrubber .knob {
+  position: absolute;
+  top: 50%;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--acc);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(226, 121, 79, 0.25);
+  pointer-events: none;
+}
+
+.scrubber .preview {
+  position: absolute;
+  bottom: 16px;
+  width: 128px;
+  aspect-ratio: 16 / 9;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel2);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
+.scrubber .preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.scrubber .preview .at {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 0;
+  background: var(--overVideo);
+  color: var(--overVideoInk);
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--mut);
+}
+
+.controls button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--mut);
+}
+
+.controls .play {
+  color: var(--ink);
+  font-size: 15px;
+  width: 18px;
+}
+
+.controls .time {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.controls .time .total {
+  color: var(--mut);
+}
+
+.controls .frames {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 7px;
+}
+
+.controls .frames button {
+  font-family: var(--mono);
+}
+
+.controls .volume {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.controls .volume input {
+  width: 64px;
+  accent-color: var(--mut);
+}
+
+.controls .speed {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.controls .loop {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.controls .loop[aria-pressed="true"] {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+.keys {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mut);
+}
+
+/* --- Trim & cut: the way into the editor --------------------------------- */
+
+.trim {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: inherit;
+  text-align: left;
+}
+
+.trim:hover:not(:disabled) {
+  border-color: var(--acc);
+}
+
+.trim:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.trim .tag {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--mut);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+.trim .tag.cut {
+  color: var(--acc);
+  border-color: var(--acc);
+}
+
+.trim .strip {
+  position: relative;
+  flex: 1;
+  height: 30px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: repeating-linear-gradient(
+    90deg,
+    hsl(var(--hue) 20% 18%) 0 46px,
+    hsl(var(--hue) 24% 13%) 46px 48px
+  );
+}
+
+/* The kept ranges; whatever the strip shows outside them is what a cut removed. */
+.trim .keep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border: 2px solid var(--acc);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--acc) 20%, transparent);
+}
+
+.trim .note {
+  flex: none;
+  max-width: 200px;
+  color: var(--mut);
+  font-size: 12px;
+  text-wrap: pretty;
+}
+
+/* --- Rail ---------------------------------------------------------------- */
+
+.rail {
+  width: var(--rail);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+}
+
+.rail .game-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A column flex item would otherwise stretch the pill across the whole rail. */
+.rail > .badge {
+  align-self: flex-start;
+}
+
+.rail .label {
+  color: var(--mut);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.rail .game-name {
+  width: fit-content;
+  max-width: 100%;
+  border: 0;
+  background: none;
+  padding: 0 0 3px;
+  text-align: left;
+  font-family: var(--display);
+  font-size: 19px;
+  font-weight: 600;
+  color: inherit;
+  border-bottom: 1.5px dashed var(--line);
+  overflow-wrap: anywhere;
+}
+
+.rail .game-name:hover {
+  border-bottom-color: var(--acc);
+}
+
+.rail .game-edit {
+  width: 100%;
+  border: 2px solid var(--acc);
+  border-radius: 7px;
+  padding: 4px 10px;
+  background: var(--bg);
+  font-family: var(--display);
+  font-size: 17px;
+  font-weight: 600;
+  outline: none;
+}
+
+.rail .window-title {
+  color: var(--mut);
+  font-size: 11.5px;
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+}
+
+.rail .facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 14px;
+  font-size: 12.5px;
+}
+
+.rail .facts .k {
+  color: var(--mut);
+}
+
+.rail .facts .v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rail .facts .mono {
+  font-size: 12px;
+}
+
+.rail .buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.rail .buttons .btn {
+  justify-content: center;
+  padding: 8px 14px;
+}
+
+.rail .note {
+  color: var(--mut);
+  font-size: 11.5px;
+  text-wrap: pretty;
+}
+
+.rail .rail-msg {
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.rail .rail-msg.ok {
+  color: var(--ok);
+}
+
+.rail .rail-msg.err {
+  color: var(--err);
+}
+
+/* Theatre: the video takes the window and everything else steps aside. */
+.player.theatre .player-head,
+.player.theatre .rail,
+.player.theatre .keys,
+.player.theatre .trim {
+  display: none;
+}
+
+.player.theatre .stage {
+  padding: 0;
+  gap: 0;
+  justify-content: center;
+}
+
+.player.theatre .video {
+  border-radius: 0;
+  aspect-ratio: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.player.theatre .transport {
+  padding: 10px 16px 14px;
+  background: var(--panel);
+}
+
+@media (max-width: 840px) {
+  .player-body {
+    flex-direction: column;
+  }
+
+  .rail {
+    width: auto;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .player-head .position {
+    display: none;
+  }
+
+  .stage {
+    padding: 12px;
+  }
+
+  .trim {
+    display: none;
+  }
+}

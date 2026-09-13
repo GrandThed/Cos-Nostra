@@ -1,5 +1,6 @@
 //! User settings for the clipper. Persisted as JSON under %APPDATA%\Cos Nostra.
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -98,6 +99,14 @@ pub struct Settings {
     /// Keep the clip folder under this many gigabytes, 0 for no limit. Enforced by dropping the
     /// local video of the oldest clips the backend already has, never anything only stored here.
     pub storage_limit_gb: u32,
+    /// Set once the first-run flow (runtime download, encoder probe, Discord link) has been
+    /// seen through or skipped. Until then the window shows that flow instead of the library.
+    ///
+    /// Defaults to `true` so that upgrading an install whose `settings.json` predates the flow
+    /// does not replay it; `load` clears it only when there is no settings file at all.
+    pub first_run_done: bool,
+    /// Set after the one-time "still recording in the tray" toast on the first window close.
+    pub tray_hint_shown: bool,
 }
 
 impl Default for Settings {
@@ -125,6 +134,8 @@ impl Default for Settings {
             auto_upload: true,
             delete_source_after_encode: false,
             storage_limit_gb: 0,
+            first_run_done: true,
+            tray_hint_shown: false,
         }
     }
 }
@@ -143,12 +154,26 @@ impl Settings {
     /// Loads the saved settings. A missing file is normal; an unreadable one is logged and
     /// replaced with defaults on the next save. A UTF-8 BOM (PowerShell's `-Encoding utf8`
     /// writes one) is stripped so hand edits do not silently reset everything.
+    ///
+    /// No file at all is the one case that means "nobody has run this app here yet", so it is
+    /// also the only thing that arms the first-run flow. A file that exists but cannot be read
+    /// or parsed keeps the flow away: those users have used the app, they just lost a setting.
     pub fn load() -> Self {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    first_run_done: false,
+                    ..Self::default()
+                }
+            }
+            Err(e) => {
+                log::warn!("{} could not be read, using defaults: {e}", path.display());
+                return Self::default();
+            }
         };
         match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
             Ok(s) => s,
@@ -212,18 +237,57 @@ impl Settings {
     }
 }
 
-/// Accepts `http://host[:port][/path]` or `https://...`; no query, fragment or trailing slash.
+/// Accepts `https://host[:port][/path]`; no query, fragment or trailing slash.
+///
+/// Plain `http://` is allowed only for `localhost` and `127.0.0.1`, which is how the local dev
+/// backend is used. Everything else has to be https: the device token, every clip and the
+/// verification URL the app opens in a browser all travel over this URL, so a cleartext one
+/// hands all three to anyone on the network.
 pub fn validate_backend_url(url: &str) -> anyhow::Result<()> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| anyhow::anyhow!("backend URL must start with http:// or https://"))?;
+    let (plain, rest) = match url.strip_prefix("https://") {
+        Some(rest) => (false, rest),
+        None => match url.strip_prefix("http://") {
+            Some(rest) => (true, rest),
+            None => anyhow::bail!("backend URL must start with https://"),
+        },
+    };
     let host = rest.split('/').next().unwrap_or("");
     if host.is_empty() || host.contains(char::is_whitespace) {
         anyhow::bail!("backend URL needs a host");
     }
+    if plain && !is_local_host(host) {
+        anyhow::bail!("backend URL must be https:// (http:// only for localhost)");
+    }
     if url.ends_with('/') || url.contains('?') || url.contains('#') {
         anyhow::bail!("backend URL must not end with / or contain ? or #");
+    }
+    Ok(())
+}
+
+/// True for the host part (port optional) of a backend running on this machine.
+fn is_local_host(host: &str) -> bool {
+    let name = host.split(':').next().unwrap_or(host);
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1"
+}
+
+/// The clip folder is more than a preference: `lib.rs` widens the asset protocol scope to it
+/// so the player can read videos out of it, and the Storage tab hands it to the shell. Both
+/// mean the webview must not be able to name an arbitrary string here, so a folder has to be
+/// a full path that already exists rather than anything non-empty.
+pub fn validate_clip_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    if dir.as_os_str().is_empty() {
+        anyhow::bail!("clip folder must not be empty");
+    }
+    if !dir.is_absolute() {
+        anyhow::bail!(
+            "clip folder must be a full path, like C:\\Users\\you\\Videos\\Cos Nostra (got {})",
+            dir.display()
+        );
+    }
+    let meta = std::fs::metadata(dir)
+        .with_context(|| format!("clip folder {} cannot be read", dir.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!("clip folder {} is not a folder", dir.display());
     }
     Ok(())
 }
@@ -235,12 +299,45 @@ mod tests {
     #[test]
     fn backend_url_validation() {
         assert!(validate_backend_url(DEFAULT_BACKEND_URL).is_ok());
-        assert!(validate_backend_url("http://localhost:3000").is_ok());
         assert!(validate_backend_url("https://x.example/api").is_ok());
         assert!(validate_backend_url("cosnostra.benja.ar").is_err());
         assert!(validate_backend_url("https://").is_err());
         assert!(validate_backend_url("https://x.example/").is_err());
         assert!(validate_backend_url("ftp://x.example").is_err());
+    }
+
+    #[test]
+    fn only_a_local_backend_may_be_plain_http() {
+        // How the dev backend is pointed at; see the note in CLAUDE.md.
+        assert!(validate_backend_url("http://localhost:3000").is_ok());
+        assert!(validate_backend_url("http://127.0.0.1:3000").is_ok());
+        assert!(validate_backend_url("http://LOCALHOST:3000").is_ok());
+        // Everything else carries the device token and the clips, so it has to be https.
+        assert!(validate_backend_url("http://cosnostra.benja.ar").is_err());
+        assert!(validate_backend_url("http://192.168.1.5:3000").is_err());
+        // Not a loopback host, just one that starts like one.
+        assert!(validate_backend_url("http://localhost.evil.example").is_err());
+    }
+
+    #[test]
+    fn the_clip_folder_must_be_an_existing_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("cos-nostra-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        validate_clip_dir(&dir).unwrap();
+
+        assert!(validate_clip_dir(std::path::Path::new("")).is_err());
+        assert!(validate_clip_dir(std::path::Path::new("clips")).is_err(), "relative");
+        assert!(validate_clip_dir(std::path::Path::new(r"..\clips")).is_err(), "relative");
+        assert!(
+            validate_clip_dir(&dir.join("does-not-exist")).is_err(),
+            "a folder that is not there"
+        );
+
+        let file = dir.join("not-a-folder.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(validate_clip_dir(&file).is_err(), "a file is not a folder");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -272,6 +369,9 @@ mod tests {
         // The storage settings arrived later still, and both defaults mean "behave as before".
         assert!(!s.delete_source_after_encode);
         assert_eq!(s.storage_limit_gb, 0);
+        // A settings file is proof the app has run here, so the first-run flow stays away
+        // even though the key that records it was only added with the new window.
+        assert!(s.first_run_done);
     }
 
     #[test]
