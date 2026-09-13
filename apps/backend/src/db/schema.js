@@ -6,6 +6,7 @@
 
 import {
   bigint,
+  boolean,
   index,
   integer,
   pgTable,
@@ -37,6 +38,24 @@ export const devices = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('devices_user_idx').on(t.userId)],
+);
+
+// A browser session from the "Login with Discord" web flow, the same shape as `devices`: a
+// random token shown once, only its hash kept, so it can be revoked (logout) by deleting the
+// row - which a sealed cookie or a bare JWT could not do.
+export const browserSessions = pgTable(
+  'browser_sessions',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    tokenHash: text('token_hash').notNull().unique(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    lastSeen: timestamp('last_seen', { withTimezone: true }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [index('browser_sessions_user_idx').on(t.userId)],
 );
 
 // Pending device logins. Row lives from POST /auth/device until the desktop polls the
@@ -81,6 +100,12 @@ export const clips = pgTable(
     uploadedAt: timestamp('uploaded_at', { withTimezone: true }),
     // pending -> ready (after /complete) -> deleted
     status: text('status').notNull().default('pending'),
+    // Discord user ids who were in the owner's voice channel when the clip was captured, as a
+    // JSON array string - the same convention as guild_settings.seed_emojis, so the column stays
+    // plain text and only the route layer ever sees the parsed array. The bot @mentions these
+    // people on the post. Never part of the public clip JSON: who you were playing with is not
+    // something the player page or the listing should hand out.
+    participants: text('participants').notNull().default('[]'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -143,10 +168,27 @@ export const events = pgTable(
 // which emojis the bot seeds on each post. `seed_emojis` is a JSON array string so the
 // column stays plain text (the routes parse it before it reaches the wire). `locale` is the
 // language the bot replies in for that guild; defaults to Spanish, the community's language.
-export const guildSettings = pgTable('guild_settings', {
-  guildId: text('guild_id').primaryKey(),
-  channelId: text('channel_id').notNull(),
-  seedEmojis: text('seed_emojis').notNull().default('["🔥","😂","💀"]'),
-  locale: text('locale').notNull().default('es'),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+//
+// `name`, `icon` and `slug` back the public per-guild clip site (docs/PLAN.md phase 5) and
+// are nullable because every guild configured before that feature has none of them yet.
+// `icon` is a bare Discord CDN hash, the same convention as `users.avatar`, never a URL.
+// `slug` is the human-readable URL segment (e.g. "famafia"); set once by a human running
+// `/clips setup` again, never derived automatically from `name`.
+export const guildSettings = pgTable(
+  'guild_settings',
+  {
+    guildId: text('guild_id').primaryKey(),
+    channelId: text('channel_id').notNull(),
+    seedEmojis: text('seed_emojis').notNull().default('["🔥","😂","💀"]'),
+    locale: text('locale').notNull().default('es'),
+    // Whether the bot @mentions the people who were in voice with the clip owner at capture
+    // time. On by default: the whole point of the tag is that the people in the play get to see
+    // it, and a guild that finds it noisy turns it off with `/clips config`.
+    tagVoiceMembers: boolean('tag_voice_members').notNull().default(true),
+    name: text('name'),
+    icon: text('icon'),
+    slug: text('slug'),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('guild_settings_slug_idx').on(t.slug)],
+);

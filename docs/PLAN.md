@@ -342,7 +342,7 @@ What this needed from the Rust side, all of it small:
   The window is up and reporting progress while it runs, and on `Restart` the app says so and
   exits for the updater.
 
-### Match recording and the game timeline. Base and Valorant phase 1 done 2026-09-13.
+### Match recording and the game timeline. Base and Valorant phase 1 done 2026-09-13; Teamfight Tactics, Counter-Strike GSI, Valorant phase 2 and match storage added the same day.
 
 Not in the original plan. The hotkey only catches what the player remembers to save; this
 records every match of Valorant, League of Legends and Counter-Strike so clips can be made
@@ -427,17 +427,58 @@ against hand-written snapshots, including a match joined midway, a post-game scr
 the API up, and a new game without an end; **not yet run against a real match**, and Riot's
 event field names are from its sample events rather than a capture.
 
+Teamfight Tactics, Counter-Strike GSI, Valorant phase 2 and match storage, added 2026-09-13:
+
+- **Teamfight Tactics** (`TFTClient-Win64-Shipping.exe`) is a `SessionGame` now, with no
+  provider, so it behaves exactly like Counter-Strike did before its own provider existed:
+  the whole session is kept and renamed once, `provider_reached` never true.
+- **Counter-Strike: Game State Integration** (`providers/counter_strike.rs`). CS2 POSTs its
+  match state to a local HTTP endpoint named by a `.cfg` dropped in the game's `csgo/cfg/`
+  folder; `tiny_http` (Apache-2.0/MIT) runs that receiver on its own thread and feeds a channel
+  `poll` drains, since this provider is push- rather than poll-based like the other two. A
+  `round.phase` of `"over"` is a round end, `map.phase` of `"gameover"` the match's end, scores
+  from `map.team_ct`/`map.team_t` oriented by `player.team`. `reached()` only flips once a POST
+  has actually produced a timeline event, not on the first POST: CS2's heartbeat (30 s in the
+  shipped `.cfg`) would otherwise mark a quiet main-menu session reached with nothing played,
+  which `cutter.rs` discards outright. The port is `providers::counter_strike::GSI_PORT`
+  (51122); the `.cfg` is `src-tauri/resources/gamestate_integration_cosnostra.cfg` and is
+  **not** copied into the game automatically — it has to be placed in
+  `<Steam library>\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg\` by hand.
+  Tested only against hand-written GSI POST bodies shaped like Valve's documented examples;
+  **no real CS2 install has exercised this.**
+- **Valorant phase 2** (`providers/valorant.rs`): once a match ends with a real result, the
+  local Riot Client's `/entitlements/v1/token` gives an access token and entitlements JWT, and
+  `GET pd.<shard>.a.pvp.net/match-details/v1/matches/<id>` gives the full match, whose
+  `kills[]` (`killer`, `victim`, `timeSinceGameStartMillis`) become `Kill`/`Death` events
+  anchored on the match's start the same way League's game clock is. The match id itself is
+  read from a `matchId` field the presence blob is *hoped* to carry (`Presence::match_id`);
+  the shard is a new setting, `Settings::valorant_shard` (default `na`; `eu`, `ap`, `kr` are the
+  other values used in the wild), since nothing in the local API names it reliably. Every part
+  of this — the `matchId` field's very existence, the match-details shape, all of it — is
+  **UNVERIFIED against a real match**; weapon and headshot are left out rather than guessed,
+  since the documented shape puts them behind a weapon-asset id this file has no table for.
+- **Matches in the Storage tab, and a cap on kept session footage.** `storage::scan_matches`
+  sums every session's match files (a fresh `stat`, same rule as the rest of that module) into
+  a new `StorageStats::matches` bucket, separate from `published`/`local_only` since matches
+  have no AV1/H264 step and are never uploaded. A new setting, `session_storage_limit_gb`
+  (default 0, off, mirroring `storage_limit_gb`), is enforced by `storage::enforce_session_limit`
+  after every batch of sessions finishes cutting: unlike clips, a match is never backed up
+  anywhere, so the oldest ones are deleted outright via `SessionStore::delete_match` rather than
+  having a local copy released. A currently-recording session's raw (not yet cut) footage is
+  not part of `scan_matches`' total, only match files that have already been cut or renamed —
+  the number can lag slightly behind actual disk usage while a session is live.
+
 Next:
 
 - Play a League match with this build and check that kills land where they happened. The log
   line `league: match on (...)` shows the mode, the map and which names count as the player; if
   kills never show up, the names in events differ from the active player's.
-- Valorant phase 2: after `match_end`, fetch the match details (`pd.<shard>.a.pvp.net`,
-  entitlement token from the local API) and add each kill with `timeSinceGameStartMillis`,
-  anchored on the round ends already in the timeline.
-- Counter-Strike: Game State Integration, which needs a `.cfg` in the game's folder.
-- Teamfight Tactics runs as `TFTClient-Win64-Shipping.exe`, which is not a session game yet.
-- Matches in the Storage tab, and a limit on how much session footage is kept.
+- Play a real Counter-Strike match with the `.cfg` installed and check that `counter_strike:
+  match on (...)` and round/match events actually appear; the GSI shape and the `reached()`
+  eagerness rule are both unverified against the real game.
+- Play a real Valorant match through to the end and check the log line naming the shard and
+  match id; if `matchId` never appears in the presence blob, kills silently never populate,
+  which is the whole reason `Presence::match_id` and everything downstream of it is UNVERIFIED.
 
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
@@ -526,6 +567,81 @@ whatever the next one fixed.
 - The binary itself is still unsigned (SmartScreen still warns on a fresh install); this only
   signs the *update payload* so the app can trust it came from this pipeline, which is a
   separate, cheaper guarantee than an EV code-signing certificate.
+
+### Discord bot: manage menu, mentions and voice auto-tag. Done 2026-09-13.
+
+Not in the original plan. A posted clip named its owner in plain text (no notification) and
+could only be deleted or hidden from the desktop app; managing a clip from Discord meant
+leaving Discord. Four additions, built together since they all touch `post.js` and
+`guild_settings`:
+
+- **Real `@mentions`.** The owner, and everyone who was in the owner's voice channel at the
+  moment they pressed the hotkey, are now pinged. `allowedMentions` on every post is an
+  explicit id allow-list (`{ parse: [], users: [...] }`) rather than the old blanket
+  `parse: []`, so a clip's free-text title or game still cannot ping anyone outside that list
+  even if it contains raw `<@id>` syntax - the allow-list is what actually gates a notification,
+  not what appears in the message content.
+- **Voice auto-tag is a capture-time snapshot, not a post-time lookup.** Encoding and upload
+  can take minutes after a game closes, so who is in voice by the time a clip posts is not who
+  was there when it was recorded. The desktop asks `POST /discord/voice-snapshot` (device
+  token; resolves the caller's own Discord id server-side, so a device cannot ask about anyone
+  else) on a background thread immediately after the hotkey saves, before encoding even starts,
+  and writes the answer onto the local queue row (`clips.db` schema v5, new nullable
+  `participants` column) so it survives however long the clip sits in the queue. The backend
+  proxies the question to the bot's own `POST /voice-snapshot`, which reads `channelId` off
+  `guild.voiceStates.cache` - deliberately without the `GuildMembers` intent, since a raw
+  `<@id>` mention resolves client-side with no cached member needed, so this cost no privileged
+  intent. Every failure on this path (bot unreachable, user not in voice, timeout) resolves to
+  an empty participant list rather than an error; a clip must never fail to save over a Discord
+  lookup. A guild can turn this off (`guild_settings.tag_voice_members`, default on) without
+  losing the owner mention.
+- **A private manage menu on every post.** A `⚙️ Manage` button sits on every clip message.
+  Clicking it is an ephemeral reply visible only to the clicker - Discord's own mechanism, nothing
+  custom - so the public post carries no indication of who has access or what they saw. The
+  owner or anyone with Manage Server gets a real panel (Hide / Delete, re-checked on every
+  click rather than trusted from the opening click); anyone else gets a private "not yours"
+  reply. Hide deletes the Discord message only - the clip stays fully live on the player page,
+  in rankings and in `/clips top|latest|mine`. Delete is delete-everywhere, the same operation
+  the desktop's own "Delete everywhere" performs, reached through a new bot-authenticated
+  `DELETE /internal/clips/:id` (the device-authed `DELETE /clips/:id` a user's own token allows
+  cannot be used here, since a moderator managing someone else's clip has no token for it); both
+  routes now share one `purgeClip()` helper instead of duplicating the storage-then-row-status
+  sequence.
+- **`/clips config`.** Seed emojis and the voice-tag toggle, gated on Manage Guild at runtime
+  like `/clips setup`. Calling it with no options echoes the guild's current settings rather
+  than performing a no-op write.
+
+What changed from how this was scoped:
+
+- Considered logging voice-state history so a post-time lookup could reconstruct who was
+  present at an arbitrary past instant, rejected for a capture-time snapshot instead: the
+  desktop already knows the instant that matters, so asking then and carrying the answer
+  through the queue needed no new table, no retention question and no clock-skew reasoning.
+- `manageRow()`'s button label is fixed and locale-neutral (Discord does not localize a
+  component label per viewer the way an ephemeral reply's text can be); everything the panel
+  says after a click goes through the same `t(locale, ...)` / `localeForGuild()` path as every
+  other reply.
+
+Verified: 173 bot tests, 60 backend tests, 19 `packages/shared` tests and 107 desktop
+`cargo test`s (`cargo check` clean) all green, covering the authorization branches (owner /
+Manage Guild / neither), the allow-list mention behavior, `set_participants`'s round trip, the
+v4→v5 migration, and every new route's auth and error paths - none of it touching a gateway or
+a real Discord API call.
+
+Not verified, and what would:
+
+- Whether a message's `components` (the manage button) suppress Discord's own `type=video`
+  link unfurl the way `embeds[]` does - `post.js` was already changed once for exactly that
+  reason (see Phase 4 above) and this adds a *different* message field, which should be
+  independent of it, but that has not been checked against a real channel. Post one clip and
+  read it back with `GET /channels/:id/messages/:id`, same method the discord-bot skill already
+  documents, and confirm `embeds[].type` is still `video` with `components[]` also present.
+- The whole hotkey-to-mention loop end to end: press the hotkey while actually sitting in a
+  real Discord voice channel with a second account, and confirm both accounts are pinged on
+  the eventual post.
+- `/clips config` is a new subcommand and is not live in any guild until
+  `npm run deploy-commands -w apps/bot` is run again - registration is a separate step from
+  deploying, same as every other command change.
 
 ## 5. Cross-cutting work
 

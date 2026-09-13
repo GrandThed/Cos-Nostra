@@ -11,7 +11,17 @@ const auth = { authorization: `Bearer ${testEnv.BOT_SHARED_SECRET}` };
 const CLIP = 'abcdefghijkl';
 const postBody = { clipId: CLIP, guildId: 'g1', channelId: 'c1', messageId: 'm1' };
 
-async function seed(app, { status = 'ready' } = {}) {
+// Fake bucket credentials, for the routes that need app.storage to exist. Presigning is pure
+// computation and deleteMany is stubbed per test, so nothing is ever reached over the network.
+const s3Env = {
+  S3_ENDPOINT: 'http://127.0.0.1:9',
+  S3_BUCKET: 'test-bucket',
+  S3_ACCESS_KEY_ID: 'AKIATEST',
+  S3_SECRET_ACCESS_KEY: 'secret-test',
+  S3_URL_STYLE: 'path',
+};
+
+async function seed(app, { status = 'ready', participants } = {}) {
   const [user] = await app.db
     .insert(users)
     .values({ discordId: '111', username: 'ben' })
@@ -28,6 +38,8 @@ async function seed(app, { status = 'ready' } = {}) {
     keyThumb: 'k/thumb.jpg',
     recordedAt: new Date('2026-01-02T03:04:05Z'),
     status,
+    // Left to the column default ('[]') unless a test says otherwise.
+    ...(participants === undefined ? {} : { participants }),
   });
 }
 
@@ -161,6 +173,7 @@ test('GET /internal/clips/:id for the bot', async () => {
       sizeH264: 12345,
       recordedAt: '2026-01-02T03:04:05.000Z',
       owner: { discordId: '111', username: 'ben' },
+      participants: [],
       urls: {
         h264: `http://localhost:3000/clips/${CLIP}/h264`,
         thumb: `http://localhost:3000/clips/${CLIP}/thumb`,
@@ -169,6 +182,130 @@ test('GET /internal/clips/:id for the bot', async () => {
     });
     const missing = await app.inject({ method: 'GET', url: '/internal/clips/zzz', headers: auth });
     assert.equal(missing.statusCode, 404);
+  } finally {
+    await app.close();
+  }
+});
+
+test('GET /internal/clips/:id returns participants as a parsed array', async () => {
+  const app = await testApp();
+  try {
+    await seed(app, { participants: '["555","666"]' });
+    const res = await app.inject({ method: 'GET', url: `/internal/clips/${CLIP}`, headers: auth });
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json().participants, ['555', '666']);
+    assert.ok(Array.isArray(res.json().participants));
+    // The public clip JSON must not carry it: who you were playing with is the bot's business.
+    const [row] = await app.db.select().from(clips);
+    assert.equal(row.participants, '["555","666"]', 'the column holds JSON text, not an array');
+  } finally {
+    await app.close();
+  }
+});
+
+test('GET /internal/clips/:id degrades to no participants on malformed stored JSON', async () => {
+  const app = await testApp();
+  try {
+    // Only this route writes the column, so this can only happen by hand - but the bot still
+    // has to be able to post the clip.
+    await seed(app, { participants: 'not json' });
+    let res = await app.inject({ method: 'GET', url: `/internal/clips/${CLIP}`, headers: auth });
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json().participants, []);
+
+    await app.db.update(clips).set({ participants: '{"not":"an array"}' });
+    res = await app.inject({ method: 'GET', url: `/internal/clips/${CLIP}`, headers: auth });
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json().participants, []);
+  } finally {
+    await app.close();
+  }
+});
+
+// ---- the manage menu's delete ----------------------------------------------------------
+//
+// Same outcome as the owner's own DELETE /clips/:id, because both go through purgeClip.
+
+test('DELETE /internal/clips/:id rejects a missing or wrong secret', async () => {
+  const app = await testApp(s3Env);
+  try {
+    await seed(app);
+    let res = await app.inject({ method: 'DELETE', url: `/internal/clips/${CLIP}` });
+    assert.equal(res.statusCode, 401);
+    res = await app.inject({
+      method: 'DELETE',
+      url: `/internal/clips/${CLIP}`,
+      headers: { authorization: 'Bearer wrong-secret-0123456789' },
+    });
+    assert.equal(res.statusCode, 401);
+
+    const [row] = await app.db.select().from(clips);
+    assert.equal(row.status, 'ready', 'an unauthenticated call must not touch the clip');
+  } finally {
+    await app.close();
+  }
+});
+
+test('DELETE /internal/clips/:id removes the objects and keeps the row', async () => {
+  const app = await testApp(s3Env);
+  try {
+    await seed(app);
+    const deleted = [];
+    app.storage.deleteMany = async (keys) => deleted.push(...keys);
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/internal/clips/${CLIP}`,
+      headers: auth,
+    });
+    assert.equal(res.statusCode, 204);
+    assert.deepEqual(deleted.sort(), ['k/av1.mp4', 'k/h264.mp4', 'k/thumb.jpg']);
+
+    const rows = await app.db.select().from(clips);
+    assert.equal(rows.length, 1, 'the row is kept: posts and reactions reference it');
+    assert.equal(rows[0].status, 'deleted');
+  } finally {
+    await app.close();
+  }
+});
+
+test('DELETE /internal/clips/:id is 404 for an unknown or already deleted clip', async () => {
+  const app = await testApp(s3Env);
+  try {
+    await seed(app, { status: 'deleted' });
+    let called = false;
+    app.storage.deleteMany = async () => {
+      called = true;
+    };
+
+    let res = await app.inject({ method: 'DELETE', url: '/internal/clips/zzz', headers: auth });
+    assert.equal(res.statusCode, 404);
+    assert.deepEqual(res.json(), { error: 'unknown_clip' });
+
+    res = await app.inject({ method: 'DELETE', url: `/internal/clips/${CLIP}`, headers: auth });
+    assert.equal(res.statusCode, 404);
+    assert.deepEqual(res.json(), { error: 'unknown_clip' });
+    assert.equal(called, false, 'nothing to delete twice');
+  } finally {
+    await app.close();
+  }
+});
+
+test('DELETE /internal/clips/:id is 503 without storage', async () => {
+  const app = await testApp();
+  try {
+    assert.equal(app.storage, null);
+    await seed(app);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/internal/clips/${CLIP}`,
+      headers: auth,
+    });
+    assert.equal(res.statusCode, 503);
+    assert.deepEqual(res.json(), { error: 'storage_unavailable' });
+
+    const [row] = await app.db.select().from(clips);
+    assert.equal(row.status, 'ready', 'the row must not be marked deleted if nothing was');
   } finally {
     await app.close();
   }

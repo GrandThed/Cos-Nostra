@@ -10,11 +10,13 @@
 // levels down would otherwise never reach the root instance the clips routes see.
 
 import { timingSafeEqual } from 'node:crypto';
-import { and, asc, count, eq, isNull } from 'drizzle-orm';
+import { and, asc, count, eq, isNull, ne } from 'drizzle-orm';
 import { z } from 'zod';
 
 import botPlugin from '../plugins/bot.js';
 import { clips, guildSettings, posts, reactions, users } from '../db/schema.js';
+import { purgeClip } from '../lib/clip-purge.js';
+import { RESERVED_SLUGS } from './guildSite.js';
 
 const postBody = z.object({
   clipId: z.string().min(1),
@@ -37,7 +39,40 @@ const guildBody = z.object({
   channelId: z.string().regex(/^[0-9]+$/),
   seedEmojis: z.array(z.string().min(1)).min(1).max(5).optional(),
   locale: z.enum(['en', 'es']).optional(),
+  // Whether the bot @mentions everyone who was in voice with the clip owner. `/clips config`
+  // toggles it; omitted means "leave it alone", like the two fields above.
+  tagVoiceMembers: z.boolean().optional(),
+  // Back the public clip site (docs/PLAN.md phase 5). `name`/`icon` are pushed by `/clips
+  // setup` every time it runs, since a guild can rename or re-icon itself at any point; `icon`
+  // is nullable so a removed custom icon can be cleared, not just left stale. `slug` is set
+  // once by a human and is the URL segment (e.g. "famafia") - never derived automatically.
+  name: z.string().trim().min(1).max(100).optional(),
+  icon: z.string().trim().max(64).nullable().optional(),
+  slug: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?$/, 'must be lowercase letters, digits and hyphens')
+    .refine((s) => !RESERVED_SLUGS.has(s), 'reserved')
+    .optional(),
 });
+
+/**
+ * A column that holds a JSON array as plain text (clips.participants, guild_settings.
+ * seed_emojis). Anything unparsable degrades to an empty array: only these routes write those
+ * columns, so bad text means someone edited the row by hand, and that must not 500 the request
+ * the bot needs to post at all.
+ * @param {string | null | undefined} text
+ * @returns {string[]}
+ */
+function safeParseJsonArray(text) {
+  try {
+    const parsed = JSON.parse(text ?? '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Fallback for when plugins/auth.js has not landed yet: the same check the auth package
@@ -72,20 +107,17 @@ async function countOpen(app, postId) {
  * @param {typeof guildSettings.$inferSelect} row
  */
 function guildToJson(row) {
-  let seedEmojis = [];
-  try {
-    const parsed = JSON.parse(row.seedEmojis);
-    if (Array.isArray(parsed)) seedEmojis = parsed;
-  } catch {
-    // Only this route writes the column, so unparsable text means someone edited the row
-    // by hand. Degrade to no seed reactions rather than 500 the listing the bot needs to
-    // post anything at all.
-  }
   return {
     guildId: row.guildId,
     channelId: row.channelId,
-    seedEmojis,
+    // Unparsable text degrades to no seed reactions rather than 500 the listing the bot
+    // needs to post anything at all. See safeParseJsonArray.
+    seedEmojis: safeParseJsonArray(row.seedEmojis),
     locale: row.locale,
+    tagVoiceMembers: row.tagVoiceMembers,
+    name: row.name,
+    icon: row.icon,
+    slug: row.slug,
   };
 }
 
@@ -173,6 +205,7 @@ async function internalRoutes(app) {
         sizeH264: clips.sizeH264,
         recordedAt: clips.recordedAt,
         status: clips.status,
+        participants: clips.participants,
         discordId: users.discordId,
         username: users.username,
       })
@@ -190,12 +223,36 @@ async function internalRoutes(app) {
       sizeH264: row.sizeH264,
       recordedAt: row.recordedAt,
       owner: { discordId: row.discordId, username: row.username },
+      // Discord ids of whoever was in voice with the owner at capture time. Only the bot ever
+      // sees these; the public clip JSON has no such field.
+      participants: safeParseJsonArray(row.participants),
       urls: {
         h264: `${base}/clips/${id}/h264`,
         thumb: `${base}/clips/${id}/thumb`,
         page: `${base}/c/${id}`,
       },
     };
+  });
+
+  // The manage menu on a Discord post: the bot deletes a clip on the owner's behalf, so the
+  // request carries the shared secret rather than the owner's device token. The bot decides
+  // who is allowed to press the button (it knows the post's owner); the backend's job is to
+  // take the clip down exactly as DELETE /clips/:id would.
+  app.delete('/internal/clips/:id', opts, async (req, reply) => {
+    if (!app.storage) return reply.code(503).send({ error: 'storage_unavailable' });
+    const [row] = await app.db
+      .select({
+        id: clips.id,
+        keyAv1: clips.keyAv1,
+        keyH264: clips.keyH264,
+        keyThumb: clips.keyThumb,
+        status: clips.status,
+      })
+      .from(clips)
+      .where(eq(clips.id, req.params.id));
+    if (!row || row.status === 'deleted') return reply.code(404).send({ error: 'unknown_clip' });
+    await purgeClip(app, row);
+    return reply.code(204).send();
   });
 
   // ---- guild settings -----------------------------------------------------------------
@@ -225,9 +282,9 @@ async function internalRoutes(app) {
     if (!/^[0-9]+$/.test(guildId)) {
       return reply.code(400).send({ error: 'bad_request', issues: [{ path: ['guildId'], message: 'must be a snowflake' }] });
     }
-    const { channelId, seedEmojis, locale } = parsed.data;
-    // Omitting seedEmojis or locale means "leave it alone": a new row falls back to the
-    // column default, an existing row keeps whatever the guild configured earlier.
+    const { channelId, seedEmojis, locale, tagVoiceMembers, name, icon, slug } = parsed.data;
+    // Omitting a field means "leave it alone": a new row falls back to the column default, an
+    // existing row keeps whatever the guild configured earlier.
     const values = { guildId, channelId, updatedAt: new Date() };
     const set = { channelId, updatedAt: new Date() };
     if (seedEmojis) {
@@ -238,6 +295,35 @@ async function internalRoutes(app) {
       values.locale = locale;
       set.locale = locale;
     }
+    // Tested against undefined, not truthiness: `false` is the whole point of this toggle.
+    if (tagVoiceMembers !== undefined) {
+      values.tagVoiceMembers = tagVoiceMembers;
+      set.tagVoiceMembers = tagVoiceMembers;
+    }
+    if (name !== undefined) {
+      values.name = name;
+      set.name = name;
+    }
+    // 'icon' in req.body, not truthiness: a guild that removed its custom icon sends null to
+    // clear the stored hash, which is different from not mentioning icon at all.
+    if ('icon' in (req.body ?? {})) {
+      values.icon = icon;
+      set.icon = icon;
+    }
+    if (slug !== undefined) {
+      // Checked ahead of the write, rather than by catching the unique index's constraint
+      // violation, because the two supported drivers (pg, PGlite) do not surface that error
+      // the same way and this route cannot tell PGlite's shape from pg's reliably. A guild
+      // renaming its own slug back to itself is not a conflict, hence the guildId exclusion.
+      const [taken] = await app.db
+        .select({ guildId: guildSettings.guildId })
+        .from(guildSettings)
+        .where(and(eq(guildSettings.slug, slug), ne(guildSettings.guildId, guildId)));
+      if (taken) return reply.code(409).send({ error: 'slug_taken', slug });
+      values.slug = slug;
+      set.slug = slug;
+    }
+
     const [row] = await app.db
       .insert(guildSettings)
       .values(values)

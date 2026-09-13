@@ -19,7 +19,9 @@ import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { clips, posts, reactions, users } from '../db/schema.js';
+import { purgeClip } from '../lib/clip-purge.js';
 import { newClipId } from '../lib/ids.js';
+import { bearer } from '../plugins/auth.js';
 import { clipKeys } from '../plugins/storage.js';
 
 const MEDIA = {
@@ -54,6 +56,12 @@ const createSchema = z.object({
   sizeAv1: z.number().int().positive(),
   sizeH264: z.number().int().positive(),
   sizeThumb: z.number().int().positive(),
+  // Who was in the owner's voice channel when the hotkey was pressed, as Discord user ids.
+  // The desktop asks POST /discord/voice-snapshot for these at capture time and hands them
+  // back here; the bot @mentions them on the post. Capped so one clip cannot make the bot
+  // write a mention storm, and nullish for the same reason the other optional fields are:
+  // the desktop serialises a Rust None as null.
+  participantDiscordIds: z.array(z.string().min(1)).max(50).nullish(),
 });
 
 // A clip the desktop edited: same record, new files. Only what a cut can change is accepted;
@@ -64,6 +72,15 @@ const replaceSchema = createSchema.pick({
   sizeH264: true,
   sizeThumb: true,
 });
+
+// The clip site's rename / change-game form (routes/guildSite.js links here indirectly
+// through the player page). At least one field must be present, or there is nothing to do.
+const updateSchema = z
+  .object({
+    title: z.string().trim().max(200).nullable().optional(),
+    game: z.string().trim().max(200).nullable().optional(),
+  })
+  .refine((v) => v.title !== undefined || v.game !== undefined, 'nothing to update');
 
 const idSchema = z.object({ id: z.string().regex(/^[0-9A-Za-z]{12}$/) });
 
@@ -241,6 +258,20 @@ export default async function clipRoutes(app) {
     return app.authenticateDevice(request, reply, done);
   }
 
+  // The clip site's management panel (routes/guildSite.js / routes/player.js) authenticates
+  // with the browser session cookie instead of a device token; both decorators normalize to
+  // the same request.user shape (plugins/auth.js, plugins/session.js), so everything below
+  // this point - ownership checks included - does not need to know which one was used. A
+  // Bearer header, when present, always means the desktop app, so it takes priority.
+  async function deviceOrSessionAuth(request, reply) {
+    if (bearer(request)) return deviceAuth(request, reply, () => {});
+    if (typeof app.authenticateSession !== 'function') {
+      app.log.error('authenticateSession decorator missing');
+      return reply.code(503).send({ error: 'auth_unavailable' });
+    }
+    return app.authenticateSession(request, reply);
+  }
+
   const requireStorage = (reply) => {
     if (app.storage) return true;
     reply.code(503).send({ error: 'storage_unavailable' });
@@ -307,6 +338,7 @@ export default async function clipRoutes(app) {
       keyAv1: keys.av1,
       keyH264: keys.h264,
       keyThumb: keys.thumb,
+      participants: JSON.stringify(body.participantDiscordIds ?? []),
       recordedAt: new Date(body.recordedAt),
       status: 'pending',
     });
@@ -487,17 +519,36 @@ export default async function clipRoutes(app) {
     };
   });
 
+  // ---- update -------------------------------------------------------------------------
+  //
+  // Rename or re-tag a clip's game. This is the clip site's management panel (routes/
+  // guildSite.js / routes/player.js) as well as anything the desktop might add later; both
+  // use the exact same route and ownership check, just with a different credential.
+
+  app.patch('/clips/:id', { preHandler: deviceOrSessionAuth }, async (request, reply) => {
+    const found = await loadOwned(request, reply);
+    if (!found) return;
+    const parsed = updateSchema.safeParse(request.body);
+    if (!parsed.success) return badRequest(reply, parsed.error.issues);
+    const { clip } = found;
+    const set = {};
+    if (parsed.data.title !== undefined) set.title = parsed.data.title || null;
+    if (parsed.data.game !== undefined) set.game = parsed.data.game || null;
+
+    const [updated] = await app.db.update(clips).set(set).where(eq(clips.id, clip.id)).returning();
+    request.log.info({ clipId: clip.id, userId: request.user.id, fields: Object.keys(set) }, 'clip updated');
+    return clipToJson(app, updated, found.owner, found.reactions);
+  });
+
   // ---- delete -------------------------------------------------------------------------
 
-  app.delete('/clips/:id', { preHandler: deviceAuth }, async (request, reply) => {
+  app.delete('/clips/:id', { preHandler: deviceOrSessionAuth }, async (request, reply) => {
     if (!requireStorage(reply)) return;
     const found = await loadOwned(request, reply);
     if (!found) return;
-    const { clip } = found;
-    await app.storage.deleteMany([clip.keyAv1, clip.keyH264, clip.keyThumb]);
-    // Keep the row: posts and reactions reference it and the recap replays history.
-    await app.db.update(clips).set({ status: 'deleted' }).where(eq(clips.id, clip.id));
-    request.log.info({ clipId: clip.id }, 'clip deleted');
+    // Same helper the bot's manage menu calls through DELETE /internal/clips/:id, so a clip
+    // deleted from Discord and one deleted from here end up in exactly the same state.
+    await purgeClip(app, found.clip);
     return reply.code(204).send();
   });
 

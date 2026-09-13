@@ -7,6 +7,7 @@ export const testEnv = {
   DATABASE_URL: 'pglite://memory',
   JWT_SECRET: 'test-jwt-secret-0123456789',
   BOT_SHARED_SECRET: 'test-bot-secret-0123456789',
+  SESSION_COOKIE_SECRET: 'test-session-cookie-secret-0123456789',
   DISCORD_CLIENT_ID: 'client-id',
   DISCORD_CLIENT_SECRET: 'client-secret',
   LOG_LEVEL: 'silent',

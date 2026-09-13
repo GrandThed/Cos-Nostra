@@ -22,7 +22,23 @@ const CSS =
   '.card{background:#1c1c1c;border-radius:8px;overflow:hidden;color:inherit}' +
   '.card img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}' +
   '.card div{padding:8px 10px}.card small{display:block;color:#aaa}' +
-  '.empty{color:#aaa;text-align:center;padding:48px 0}';
+  '.empty{color:#aaa;text-align:center;padding:48px 0}' +
+  // Guild site additions (docs/PLAN.md phase 5): a header banner with the guild's icon, a
+  // breadcrumb trail back to it, round-avatar user cards, and a small owner-only panel.
+  '.guild-header{display:flex;align-items:center;gap:12px;margin-bottom:16px}' +
+  '.guild-header img{width:48px;height:48px;border-radius:50%;background:#222}' +
+  '.guild-header h1{margin:0}' +
+  '.crumbs{color:#aaa;font-size:.9rem;margin-bottom:12px}' +
+  '.crumbs a{color:#8ab4f8}' +
+  '.user-card{display:flex;align-items:center;gap:10px;background:#1c1c1c;border-radius:8px;padding:10px;color:inherit}' +
+  '.user-card img{width:40px;height:40px;border-radius:50%;background:#222}' +
+  '.panel{margin-top:16px;padding:12px;background:#1c1c1c;border-radius:8px}' +
+  '.panel label{display:block;margin:8px 0 4px;color:#aaa;font-size:.85rem}' +
+  '.panel input{width:100%;box-sizing:border-box;padding:6px 8px;background:#111;color:#eee;border:1px solid #333;border-radius:4px;font:inherit}' +
+  '.panel .row{display:flex;gap:8px;margin-top:10px}' +
+  '.panel button{font:inherit;padding:.4rem 1rem;border:0;border-radius:4px;cursor:pointer}' +
+  '.panel .save{background:#5865f2;color:#fff}.panel .danger{background:#a33;color:#fff}' +
+  '.panel .err{color:#f28b82;font-size:.85rem;margin-top:6px;display:none}';
 
 /**
  * Wrap a page body in the shared document shell.
@@ -52,4 +68,59 @@ export function formatDuration(ms) {
 export function formatDate(date) {
   const d = date instanceof Date ? date : new Date(date);
   return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+}
+
+/**
+ * A Discord avatar CDN URL, or null with no avatar hash. Bare hashes are the only thing ever
+ * stored (`users.avatar`, `guild_settings.icon`); the URL is built only at render time.
+ * @param {'avatars' | 'icons'} kind
+ * @param {string} id  discordId for a user, guildId for a guild
+ * @param {string | null | undefined} hash
+ * @param {number} [size]
+ */
+export function discordCdnUrl(kind, id, hash, size = 64) {
+  if (!hash) return null;
+  return `https://cdn.discordapp.com/${kind}/${encodeURIComponent(id)}/${encodeURIComponent(hash)}.png?size=${size}`;
+}
+
+/** @param {string} discordId @param {string | null | undefined} avatarHash @param {number} [size] */
+export function avatarUrl(discordId, avatarHash, size = 64) {
+  return discordCdnUrl('avatars', discordId, avatarHash, size);
+}
+
+/** @param {string} guildId @param {string | null | undefined} iconHash @param {number} [size] */
+export function guildIconUrl(guildId, iconHash, size = 96) {
+  return discordCdnUrl('icons', guildId, iconHash, size);
+}
+
+/** `<span><img>username</span>`, reused by the player page and the guild site's cards. */
+export function ownerHtml(discordId, avatarHash, username) {
+  const avatar = avatarUrl(discordId, avatarHash);
+  const img = avatar ? `<img src="${escapeHtml(avatar)}" alt="" width="24" height="24">` : '';
+  return `<span>${img}${escapeHtml(username)}</span>`;
+}
+
+/**
+ * One clip card for a `.grid`, linking to `href`.
+ * @param {{ id: string, title: string | null, game: string | null, username: string, thumbUrl: string, recordedAt: Date | string }} clip
+ * @param {string} href
+ */
+export function clipCard(clip, href) {
+  const label = clip.title || clip.game || 'Clip';
+  return (
+    `<a class="card" href="${escapeHtml(href)}">` +
+    `<img src="${escapeHtml(clip.thumbUrl)}" alt="" loading="lazy">` +
+    `<div><strong>${escapeHtml(label)}</strong>` +
+    `<small>${escapeHtml(clip.username)} · ${escapeHtml(formatDate(clip.recordedAt))}</small></div>` +
+    '</a>'
+  );
+}
+
+/** One user card for a `.grid`, linking to `href`. */
+export function userCard(discordId, avatarHash, username, href) {
+  const avatar = avatarUrl(discordId, avatarHash, 80);
+  const img = avatar
+    ? `<img src="${escapeHtml(avatar)}" alt="">`
+    : '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="">';
+  return `<a class="user-card" href="${escapeHtml(href)}">${img}<strong>${escapeHtml(username)}</strong></a>`;
 }

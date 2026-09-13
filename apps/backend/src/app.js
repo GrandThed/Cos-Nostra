@@ -4,6 +4,7 @@
 // Route files register themselves; each owns one resource:
 //   routes/auth.js      device login, Discord OAuth
 //   routes/clips.js     clip records, presigned uploads, media redirects, listing, rankings
+//   routes/discord.js   desktop -> bot lookups (voice snapshot at capture time)
 //   routes/internal.js  bot -> backend: posts and reactions (shared secret)
 //   routes/player.js    GET /c/:id player page
 // Cross-cutting concerns are plugins under plugins/.
@@ -59,10 +60,14 @@ export async function buildApp(opts = {}) {
   const modules = [
     './plugins/auth.js',
     './plugins/storage.js',
+    './plugins/session.js',
     './routes/auth.js',
+    './routes/login.js',
     './routes/clips.js',
+    './routes/discord.js',
     './routes/internal.js',
     './routes/player.js',
+    './routes/guildSite.js',
   ];
   const here = path.dirname(fileURLToPath(import.meta.url));
   for (const m of modules) {

@@ -8,22 +8,31 @@
  * @property {string | null} avatar
  */
 
-/** @param {import('../config.js').Config} config */
-export function redirectUri(config) {
-  return `${config.PUBLIC_URL}/auth/discord/callback`;
+// The device-login flow's callback. The browser-login flow (routes/login.js) uses a distinct
+// path, `/login/callback`, so the two flows never share a redirect URI - each is registered
+// separately in the Discord application's OAuth2 settings.
+const DEFAULT_CALLBACK_PATH = '/auth/discord/callback';
+
+/**
+ * @param {import('../config.js').Config} config
+ * @param {string} [path]
+ */
+export function redirectUri(config, path = DEFAULT_CALLBACK_PATH) {
+  return `${config.PUBLIC_URL}${path}`;
 }
 
 /**
  * URL the browser is sent to so the user can approve the login.
  * @param {import('../config.js').Config} config
  * @param {string} state
+ * @param {string} [callbackPath]
  */
-export function authorizeUrl(config, state) {
+export function authorizeUrl(config, state, callbackPath = DEFAULT_CALLBACK_PATH) {
   const params = new URLSearchParams({
     client_id: config.DISCORD_CLIENT_ID,
     response_type: 'code',
     scope: 'identify',
-    redirect_uri: redirectUri(config),
+    redirect_uri: redirectUri(config, callbackPath),
     state,
   });
   return `https://discord.com/oauth2/authorize?${params}`;
@@ -33,15 +42,16 @@ export function authorizeUrl(config, state) {
  * Exchanges the authorization code for an access token.
  * @param {import('../config.js').Config} config
  * @param {string} code
+ * @param {string} [callbackPath] must match the one passed to authorizeUrl for this code
  * @returns {Promise<{ accessToken: string, tokenType: string }>}
  */
-export async function exchangeCode(config, code) {
+export async function exchangeCode(config, code, callbackPath = DEFAULT_CALLBACK_PATH) {
   const body = new URLSearchParams({
     client_id: config.DISCORD_CLIENT_ID,
     client_secret: config.DISCORD_CLIENT_SECRET,
     grant_type: 'authorization_code',
     code,
-    redirect_uri: redirectUri(config),
+    redirect_uri: redirectUri(config, callbackPath),
   });
   const res = await fetch(`${config.DISCORD_API_BASE}/oauth2/token`, {
     method: 'POST',

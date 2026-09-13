@@ -16,6 +16,9 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1),
   JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 characters'),
   BOT_SHARED_SECRET: z.string().min(16, 'BOT_SHARED_SECRET must be at least 16 characters'),
+  // Signs the browser-login session cookie (@fastify/cookie). Separate from JWT_SECRET so
+  // rotating the short-lived OAuth `state` secret never logs every browser session out.
+  SESSION_COOKIE_SECRET: z.string().min(32, 'SESSION_COOKIE_SECRET must be at least 32 characters'),
   DISCORD_CLIENT_ID: z.string().min(1),
   DISCORD_CLIENT_SECRET: z.string().min(1),
   // Base of the Discord REST API. Tests point it at a local stub server.

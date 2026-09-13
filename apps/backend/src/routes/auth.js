@@ -29,6 +29,7 @@ import { z } from 'zod';
 
 import { schema } from '../db/index.js';
 import { authorizeUrl, exchangeCode, fetchUser } from '../lib/discord.js';
+import { upsertDiscordUser } from '../lib/users.js';
 import { bearer } from '../plugins/auth.js';
 import {
   CODE_ALPHABET,
@@ -278,18 +279,7 @@ export default async function authRoutes(app) {
 
     const token = newToken();
     await db.transaction(async (tx) => {
-      const [user] = await tx
-        .insert(schema.users)
-        .values({
-          discordId: discordUser.id,
-          username: discordUser.username,
-          avatar: discordUser.avatar,
-        })
-        .onConflictDoUpdate({
-          target: schema.users.discordId,
-          set: { username: discordUser.username, avatar: discordUser.avatar },
-        })
-        .returning({ id: schema.users.id });
+      const user = await upsertDiscordUser(tx, discordUser);
       const [device] = await tx
         .insert(schema.devices)
         .values({ userId: user.id, name: login.deviceName, tokenHash: hashToken(token) })

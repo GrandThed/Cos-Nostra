@@ -470,6 +470,70 @@ test('a clip with no game uploads: null means absent, not invalid', async () => 
   }
 });
 
+test('POST /clips stores participantDiscordIds as a JSON array, and [] when absent', async () => {
+  // Who was in voice with the owner when the hotkey was pressed. Stored as JSON text like
+  // guild_settings.seed_emojis, read back only by the bot through GET /internal/clips/:id.
+  const app = await clipApp();
+  try {
+    await makeUser(app, '160', 'voice', 'tok-voice');
+    const create = (payload) =>
+      app.inject({ method: 'POST', url: '/clips', headers: auth('tok-voice'), payload });
+    const stored = async (id) => {
+      const [row] = await app.db.select().from(clips).where(eq(clips.id, id));
+      return row.participants;
+    };
+
+    const withIds = await create({ ...validBody, participantDiscordIds: ['111', '222'] });
+    assert.equal(withIds.statusCode, 201, withIds.body);
+    assert.equal(await stored(withIds.json().id), '["111","222"]');
+
+    // Absent, explicitly null and an empty list all mean "tag nobody" - the desktop sends
+    // null for a Rust None, and the column is NOT NULL, so all three land as '[]'.
+    for (const payload of [
+      validBody,
+      { ...validBody, participantDiscordIds: null },
+      { ...validBody, participantDiscordIds: [] },
+    ]) {
+      const res = await create(payload);
+      assert.equal(res.statusCode, 201, res.body);
+      assert.equal(await stored(res.json().id), '[]');
+    }
+
+    for (const bad of [
+      { ...validBody, participantDiscordIds: ['ok', ''] },
+      { ...validBody, participantDiscordIds: 'everyone' },
+      { ...validBody, participantDiscordIds: [1, 2] },
+      // Capped so one clip cannot make the bot write a mention storm.
+      { ...validBody, participantDiscordIds: Array.from({ length: 51 }, (_, i) => String(i)) },
+    ]) {
+      const res = await create(bad);
+      assert.equal(res.statusCode, 400, `expected 400 for ${JSON.stringify(bad.participantDiscordIds).slice(0, 40)}`);
+    }
+  } finally {
+    await app.close();
+  }
+});
+
+test('a clip read publicly never exposes its participants', async () => {
+  const app = await clipApp();
+  try {
+    const user = await makeUser(app, '161', 'private', 'tok-private');
+    const clip = await insertReadyClip(app, user, {
+      participants: '["999"]',
+      game: 'Doom',
+      recordedAt: new Date('2026-01-02T03:04:05Z'),
+    });
+    const res = await app.inject({ method: 'GET', url: `/clips/${clip.id}` });
+    assert.equal(res.statusCode, 200);
+    assert.ok(!('participants' in res.json()), 'who you played with is not public');
+
+    const list = await app.inject({ method: 'GET', url: '/clips' });
+    assert.ok(!('participants' in list.json().items[0]));
+  } finally {
+    await app.close();
+  }
+});
+
 test('listing filters, sorting, pagination and rankings', async () => {
   const app = await clipApp();
   try {

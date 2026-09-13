@@ -6,10 +6,15 @@
 
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 
-import { clips, posts, reactions, users } from '../db/schema.js';
+import { browserSessions, clips, posts, reactions, users } from '../db/schema.js';
 import { escapeHtml, formatDate, formatDuration, layout } from '../lib/html.js';
+import { SESSION_COOKIE_NAME } from '../plugins/session.js';
+import { hashToken } from '../lib/tokens.js';
 
 const RECENT_LIMIT = 30;
+// A guild query param is only ever the "back to <guild>" link guildSite.js's redirect
+// attaches; it never gates anything, so a stray or stale value just makes that link vanish.
+const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?$/;
 
 /** @type {import('fastify').FastifyPluginAsync} */
 export default async function playerRoutes(app) {
@@ -17,6 +22,7 @@ export default async function playerRoutes(app) {
 
   const clipColumns = {
     id: clips.id,
+    userId: clips.userId,
     game: clips.game,
     title: clips.title,
     durationMs: clips.durationMs,
@@ -28,6 +34,21 @@ export default async function playerRoutes(app) {
     discordId: users.discordId,
     avatar: users.avatar,
   };
+
+  // Never fails the request: an invalid, expired or missing cookie just means "not logged
+  // in", the same as any other anonymous viewer - viewing a clip never requires a session.
+  async function currentUserId(request) {
+    const raw = request.cookies?.[SESSION_COOKIE_NAME];
+    const unsigned = raw ? request.unsignCookie(raw) : null;
+    if (!unsigned?.valid || !unsigned.value) return null;
+    const [row] = await app.db
+      .select({ userId: browserSessions.userId, expiresAt: browserSessions.expiresAt })
+      .from(browserSessions)
+      .where(eq(browserSessions.tokenHash, hashToken(unsigned.value)))
+      .limit(1);
+    if (!row || row.expiresAt.getTime() < Date.now()) return null;
+    return row.userId;
+  }
 
   async function findReadyClip(id) {
     const [row] = await app.db
@@ -58,8 +79,11 @@ export default async function playerRoutes(app) {
     const clip = await findReadyClip(id);
     if (!clip) return notFound(reply);
     const reactionCount = await countReactions(id);
+    const viewerId = await currentUserId(req);
+    const rawGuild = typeof req.query.guild === 'string' ? req.query.guild.toLowerCase() : '';
+    const guildSlug = SLUG_PATTERN.test(rawGuild) ? rawGuild : null;
     reply.type('text/html; charset=utf-8');
-    return renderPlayer(clip, reactionCount);
+    return renderPlayer(clip, reactionCount, { viewerId, guildSlug });
   });
 
   app.get('/', async (req, reply) => {
@@ -90,7 +114,38 @@ export default async function playerRoutes(app) {
     return `<span>${img}${escapeHtml(clip.username)}</span>`;
   }
 
-  function renderPlayer(clip, reactionCount) {
+  /** The management panel's inline script, sharing one clip id/CSS class with the markup. */
+  function managePanelHtml(clip) {
+    const id = escapeHtml(clip.id);
+    return (
+      `<div class="panel" id="manage">` +
+      `<label for="manage-title">Title</label><input id="manage-title" value="${escapeHtml(clip.title ?? '')}">` +
+      `<label for="manage-game">Game</label><input id="manage-game" value="${escapeHtml(clip.game ?? '')}">` +
+      '<div class="row">' +
+      '<button class="save" type="button" onclick="cnSave()">Save</button>' +
+      '<button class="danger" type="button" onclick="cnDelete()">Delete</button>' +
+      '</div><p class="err" id="manage-err"></p></div>' +
+      '<script>' +
+      `(function(){var id=${JSON.stringify(id)};` +
+      'function err(m){var e=document.getElementById("manage-err");e.textContent=m;e.style.display="block";}' +
+      'window.cnSave=async function(){' +
+      'try{var r=await fetch("/clips/"+id,{method:"PATCH",credentials:"same-origin",' +
+      'headers:{"content-type":"application/json"},' +
+      'body:JSON.stringify({title:document.getElementById("manage-title").value,' +
+      'game:document.getElementById("manage-game").value})});' +
+      'if(!r.ok)throw new Error("save failed");location.reload();' +
+      '}catch(e){err("Could not save. Try again.");}};' +
+      'window.cnDelete=async function(){' +
+      'if(!confirm("Delete this clip? This cannot be undone."))return;' +
+      'try{var r=await fetch("/clips/"+id,{method:"DELETE",credentials:"same-origin"});' +
+      'if(!r.ok)throw new Error("delete failed");location.href="/";' +
+      '}catch(e){err("Could not delete. Try again.");}};' +
+      '})();' +
+      '</script>'
+    );
+  }
+
+  function renderPlayer(clip, reactionCount, { viewerId = null, guildSlug = null } = {}) {
     const title = clipTitle(clip);
     const av1 = media(clip.id, 'av1');
     const h264 = media(clip.id, 'h264');
@@ -133,6 +188,18 @@ export default async function playerRoutes(app) {
       })
       .join('');
 
+    const backLink = guildSlug
+      ? `<a href="/${encodeURIComponent(guildSlug)}">&larr; Back to ${escapeHtml(guildSlug)}</a>`
+      : '<a href="/">More clips</a>';
+
+    const isOwner = viewerId != null && viewerId === clip.userId;
+    const loginNext = `/c/${encodeURIComponent(clip.id)}${guildSlug ? `?guild=${encodeURIComponent(guildSlug)}` : ''}`;
+    const manageHtml = isOwner
+      ? managePanelHtml(clip)
+      : viewerId == null
+        ? `<p class="crumbs"><a href="/login?next=${encodeURIComponent(loginNext)}">Log in with Discord to manage your clips</a></p>`
+        : '';
+
     const body =
       `<video controls playsinline preload="metadata" poster="${escapeHtml(thumb)}">` +
       `<source src="${escapeHtml(av1)}" type='video/mp4; codecs="av01.0.08M.08"'>` +
@@ -147,8 +214,9 @@ export default async function playerRoutes(app) {
       `<span>${escapeHtml(formatDuration(clip.durationMs))}</span>` +
       `<span>${reactionCount} reaction${reactionCount === 1 ? '' : 's'}</span>` +
       `<a href="${escapeHtml(h264)}" download>Download</a>` +
-      '<a href="/">More clips</a>' +
-      '</div>';
+      backLink +
+      '</div>' +
+      manageHtml;
 
     return layout({ title, head, body });
   }
