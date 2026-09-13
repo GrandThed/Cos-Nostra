@@ -18,7 +18,13 @@ const LANGUAGES: Language[] = ["es", "en"];
 let root: HTMLElement | null = null;
 /** The edits in progress. Replaced from the store on mount and after every save. */
 let draft: Settings | null = null;
+/** What `draft` looked like before any edit, to tell whether the save bar should show. */
+let baseline: Settings | null = null;
 let hotkey: HotkeyControl | null = null;
+/** The save bar, appended to `root` only while there is something to show. */
+let saveBar: HTMLElement | null = null;
+/** The account card's identity block, kept live so status/login updates can replace just it. */
+let accountBlockEl: HTMLElement | null = null;
 let message = "";
 let messageKind: "" | "ok" | "err" = "";
 /** The device login in progress, if any. */
@@ -29,6 +35,10 @@ export function initSettings(): void {
   on("settings", () => {
     if (root && !draft) render();
   });
+  // The account card reads data.status directly. This also fires from the five-second status
+  // poll in main.ts, so it must not trigger a full render (that would reset scroll, collapse
+  // Advanced, and eat whatever the user is mid-typing elsewhere in the form).
+  on("status", () => syncAccountBlock());
   onLanguage(() => {
     if (root) render();
   });
@@ -37,7 +47,10 @@ export function initSettings(): void {
 export function mountSettings(node: HTMLElement): void {
   root = node;
   draft = null;
+  baseline = null;
   hotkey = null;
+  saveBar = null;
+  accountBlockEl = null;
   message = "";
   messageKind = "";
   void loadSettings().then(() => {
@@ -50,14 +63,18 @@ export function unmountSettings(): void {
   hotkey?.stop();
   root = null;
   draft = null;
+  baseline = null;
   hotkey = null;
+  saveBar = null;
+  accountBlockEl = null;
 }
 
 /** The account block reacts to the login events main.ts forwards. */
 export function onLoginStateChanged(code: string | null, note: string): void {
   pendingCode = code;
   loginNote = note;
-  if (root) render();
+  if (accountBlockEl) syncAccountBlock();
+  else if (root) render();
 }
 
 function render(): void {
@@ -71,7 +88,8 @@ function render(): void {
       return;
     }
     draft = { ...data.settings };
-    hotkey = hotkeyControl(draft.hotkey);
+    baseline = { ...data.settings };
+    hotkey = hotkeyControl(draft.hotkey, () => markEdited());
   }
   const s = draft;
 
@@ -79,6 +97,53 @@ function render(): void {
     root,
     h("div", { class: "settings scroll" }, captureCard(s), behaviourCard(s), encodingCard(s), accountCard(s)),
   );
+  saveBar = null;
+  syncSaveBar();
+}
+
+/** Whether `draft` (plus the hotkey, which lives outside it until save) differs from what was
+ *  loaded. Drives whether the save bar shows at all. */
+function isDirty(): boolean {
+  if (!draft || !baseline || !hotkey) return false;
+  return JSON.stringify({ ...draft, hotkey: hotkey.value() }) !== JSON.stringify(baseline);
+}
+
+/** Shows, updates or hides the save bar without touching the rest of the form, so typing in a
+ *  text field does not lose focus or cursor position on every keystroke. */
+function syncSaveBar(): void {
+  if (!root || !draft) return;
+  if (!isDirty() && !message) {
+    saveBar?.remove();
+    saveBar = null;
+    return;
+  }
+  if (!saveBar) {
+    saveBar = h(
+      "div",
+      { class: "save-bar" },
+      h("button", {
+        type: "button",
+        class: "btn primary",
+        text: t("settings.save"),
+        onclick: () => void save(),
+      }),
+      h("span", { class: "msg" }),
+    );
+    root.appendChild(saveBar);
+  }
+  const btn = saveBar.querySelector("button")!;
+  btn.textContent = t("settings.save");
+  const msg = saveBar.querySelector(".msg")!;
+  msg.className = `msg ${messageKind}`;
+  msg.textContent = message;
+}
+
+/** Marks the draft touched: clears any stale confirmation/error from a previous save and
+ *  refreshes the save bar. Called from every field's change handler. */
+function markEdited(): void {
+  message = "";
+  messageKind = "";
+  syncSaveBar();
 }
 
 function card(title: string, ...children: (Node | string | null | false)[]): HTMLElement {
@@ -111,6 +176,8 @@ function captureCard(s: Settings): HTMLElement {
           const dir = await ipc.pickClipDir();
           if (dir) {
             s.clip_dir = dir;
+            message = "";
+            messageKind = "";
             render();
           }
         },
@@ -159,6 +226,8 @@ function encodingCard(s: Settings): HTMLElement {
       s.quality,
       (id) => {
         s.quality = id as Quality;
+        message = "";
+        messageKind = "";
         render();
       },
     ),
@@ -172,6 +241,8 @@ function encodingCard(s: Settings): HTMLElement {
       s.encode_engine,
       (id) => {
         s.encode_engine = id as EncodeEngine;
+        message = "";
+        messageKind = "";
         render();
       },
     ),
@@ -196,6 +267,13 @@ function encodingCard(s: Settings): HTMLElement {
           text(s.backend_url, (v) => (s.backend_url = v)),
           h("span", { class: "hint", text: t("settings.backendUrl.hint") }),
         ),
+        h(
+          "div",
+          { class: "field-row" },
+          h("span", { class: "name", text: t("settings.valorantShard.name") }),
+          text(s.valorant_shard, (v) => (s.valorant_shard = v.toLowerCase())),
+          h("span", { class: "hint", text: t("settings.valorantShard.hint") }),
+        ),
       ),
     ),
   );
@@ -208,6 +286,8 @@ function languageRow(s: Settings): HTMLElement {
       class: "field",
       onchange: (e: Event) => {
         s.language = (e.target as HTMLSelectElement).value as Language;
+        message = "";
+        messageKind = "";
         render();
       },
     },
@@ -225,8 +305,11 @@ function languageRow(s: Settings): HTMLElement {
   );
 }
 
-function accountCard(s: Settings): HTMLElement {
-  const account = data.status?.account ?? s.account;
+/** The identity + login-state part of the account card, rebuilt on its own by `syncAccountBlock`
+ *  so a status poll or a login event never has to re-render the whole form (and cost the user
+ *  their cursor position in a text field, or collapse the Advanced disclosure). */
+function accountBlock(): HTMLElement {
+  const account = data.status?.account ?? draft?.account ?? null;
   const avatar = h("span", { class: "avatar" });
   if (account) renderAvatar(avatar, account);
 
@@ -283,27 +366,32 @@ function accountCard(s: Settings): HTMLElement {
           }),
         );
 
-  return card(
-    t("settings.account"),
+  return h(
+    "div",
+    { class: "account-block" },
     identity,
     loginNote ? h("span", { class: "note", text: loginNote }) : null,
+  );
+}
+
+/** Swaps the live account block for a freshly built one. No-op before the card has mounted. */
+function syncAccountBlock(): void {
+  if (!accountBlockEl) return;
+  const fresh = accountBlock();
+  accountBlockEl.replaceWith(fresh);
+  accountBlockEl = fresh;
+}
+
+function accountCard(s: Settings): HTMLElement {
+  accountBlockEl = accountBlock();
+  return card(
+    t("settings.account"),
+    accountBlockEl,
     toggle(
       t("settings.autoUpload.name"),
       s.auto_upload,
       (v) => (s.auto_upload = v),
       t("settings.autoUpload.detail"),
-    ),
-    h("span", { class: "grow" }),
-    h(
-      "div",
-      { class: "save-row" },
-      h("button", {
-        type: "button",
-        class: "btn primary",
-        text: t("settings.save"),
-        onclick: () => void save(),
-      }),
-      h("span", { class: `msg ${messageKind}`, text: message }),
     ),
   );
 }
@@ -318,7 +406,10 @@ function toggle(
   detail?: string,
 ): HTMLElement {
   const input = h("input", { type: "checkbox", checked }) as HTMLInputElement;
-  input.addEventListener("change", () => set(input.checked));
+  input.addEventListener("change", () => {
+    set(input.checked);
+    markEdited();
+  });
   return h(
     "label",
     { class: "toggle" },
@@ -343,7 +434,10 @@ function number(
     step: String(step),
     value: String(value),
   }) as HTMLInputElement;
-  input.addEventListener("input", () => set(Number(input.value)));
+  input.addEventListener("input", () => {
+    set(Number(input.value));
+    markEdited();
+  });
   return input;
 }
 
@@ -354,7 +448,10 @@ function text(value: string, set: (v: string) => void): HTMLInputElement {
     spellcheck: "false",
     value,
   }) as HTMLInputElement;
-  input.addEventListener("input", () => set(input.value.trim()));
+  input.addEventListener("input", () => {
+    set(input.value.trim());
+    markEdited();
+  });
   return input;
 }
 

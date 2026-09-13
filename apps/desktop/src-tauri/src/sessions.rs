@@ -568,6 +568,22 @@ impl SessionStore {
         Ok(rows)
     }
 
+    /// Every match with a file on disk, oldest first, across every session — for enforcing
+    /// `session_storage_limit_gb`. Unlike `list` (newest session first, for the UI), this reads
+    /// straight across sessions and only matches actually `ready`: a `live` or `pending` match
+    /// has no file to free yet, and a `missing` or `failed` one never got one.
+    pub fn oldest_matches(&self) -> Result<Vec<MatchRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MATCH_COLUMNS} FROM matches WHERE status = 'ready' ORDER BY started_at, id"
+        ))?;
+        let rows = stmt
+            .query_map([], match_from)?
+            .collect::<rusqlite::Result<_>>()
+            .context("listing oldest matches")?;
+        Ok(rows)
+    }
+
     pub fn get_match(&self, id: i64) -> Result<Option<MatchRow>> {
         self.lock()
             .query_row(
@@ -892,6 +908,22 @@ mod tests {
         let files = s.delete_session(id).unwrap();
         assert_eq!(files, vec![dir.join("raw2.mp4").display().to_string()]);
         assert!(s.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oldest_matches_spans_sessions_and_skips_matches_with_no_file() {
+        let (s, dir) = store();
+        let s1 = s.create_session(SessionGame::Valorant, "Valorant", t(0)).unwrap();
+        let s2 = s.create_session(SessionGame::League, "League of Legends", t(1000)).unwrap();
+        let ready1 = s.add_undetected_match(s1, t(0), t(10)).unwrap();
+        s.set_match_file(ready1, &dir.join("a.mp4"), None, t(0), 10_000, 1).unwrap();
+        let ready2 = s.add_undetected_match(s2, t(1000), t(1010)).unwrap();
+        s.set_match_file(ready2, &dir.join("b.mp4"), None, t(1000), 10_000, 1).unwrap();
+        // Still open: no file yet, so it must not show up.
+        s.open_match(s2, t(2000), None, None).unwrap();
+
+        let ids: Vec<i64> = s.oldest_matches().unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![ready1, ready2], "oldest first, across both sessions");
     }
 
     #[test]

@@ -25,10 +25,6 @@
   font-size: 15px;
 }
 
-.setting-card .grow {
-  flex: 1;
-}
-
 .field-row {
   display: flex;
   align-items: center;
@@ -153,6 +149,12 @@
 
 /* --- Account ------------------------------------------------------------- */
 
+.account-block {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
 .account {
   display: flex;
   align-items: center;
@@ -191,16 +193,23 @@
   text-align: center;
 }
 
-.save-row {
+/* --- Save bar -------------------------------------------------------------
+   Sibling of .settings inside .view (a flex column), so it docks below the
+   scrollable grid and only exists in the DOM while there is something to
+   save or a save just finished. */
+
+.save-bar {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+  padding: 12px 18px;
+  background: var(--panel);
   border-top: 1px solid var(--line);
-  padding-top: 12px;
 }
 
-.save-row .btn {
+.save-bar .btn {
   padding: 7px 16px;
   border-radius: 8px;
 }

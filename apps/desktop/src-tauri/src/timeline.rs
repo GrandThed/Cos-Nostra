@@ -28,10 +28,14 @@ pub enum SessionGame {
     Valorant,
     League,
     CounterStrike,
+    /// No provider: it gets the same whole-session-kept treatment Counter-Strike had before
+    /// its GSI provider, by design (see `providers::for_game`).
+    TeamfightTactics,
 }
 
 impl SessionGame {
-    pub const ALL: [SessionGame; 3] = [Self::Valorant, Self::League, Self::CounterStrike];
+    pub const ALL: [SessionGame; 4] =
+        [Self::Valorant, Self::League, Self::CounterStrike, Self::TeamfightTactics];
 
     /// Stable id, stored in the database.
     pub fn id(self) -> &'static str {
@@ -39,6 +43,7 @@ impl SessionGame {
             Self::Valorant => "valorant",
             Self::League => "league",
             Self::CounterStrike => "counter_strike",
+            Self::TeamfightTactics => "teamfight_tactics",
         }
     }
 
@@ -50,6 +55,7 @@ impl SessionGame {
             Self::Valorant => &["VALORANT-Win64-Shipping.exe"],
             Self::League => &["League of Legends.exe"],
             Self::CounterStrike => &["cs2.exe", "csgo.exe"],
+            Self::TeamfightTactics => &["TFTClient-Win64-Shipping.exe"],
         }
     }
 
@@ -58,7 +64,7 @@ impl SessionGame {
     fn client_exes(self) -> &'static [&'static str] {
         match self {
             Self::League => &["LeagueClientUx.exe", "LeagueClient.exe"],
-            Self::Valorant | Self::CounterStrike => &[],
+            Self::Valorant | Self::CounterStrike | Self::TeamfightTactics => &[],
         }
     }
 }

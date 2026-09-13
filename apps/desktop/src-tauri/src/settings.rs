@@ -98,6 +98,11 @@ pub struct Settings {
     pub language: Language,
     /// Base URL of the Cos Nostra backend, no trailing slash.
     pub backend_url: String,
+    /// Region shard for Valorant's public match-details API (`pd.<shard>.a.pvp.net`), used only
+    /// by `providers::valorant` to fetch per-kill detail once a match ends. The local Riot
+    /// Client API gives no reliable way to discover this, so it is asked rather than guessed;
+    /// `na` is this project's presumed region. Common values: `na`, `eu`, `ap`, `kr`.
+    pub valorant_shard: String,
     /// Long-lived device token from the Discord device login. `None` when logged out.
     pub device_token: Option<String>,
     /// Who the token belongs to; shown in the UI.
@@ -111,6 +116,11 @@ pub struct Settings {
     /// Keep the clip folder under this many gigabytes, 0 for no limit. Enforced by dropping the
     /// local video of the oldest clips the backend already has, never anything only stored here.
     pub storage_limit_gb: u32,
+    /// Keep the `Matches` folder (whole sessions and cut match files) under this many
+    /// gigabytes, 0 for no limit. Unlike `storage_limit_gb`, match footage is never backed up
+    /// anywhere, so enforcing this deletes the oldest matches outright rather than releasing a
+    /// local copy of something published. Off by default, same as `storage_limit_gb` was.
+    pub session_storage_limit_gb: u32,
     /// Record every session of a supported game (Valorant, League of Legends, Counter-Strike)
     /// from start to finish and cut it into matches afterwards. The recording shares the
     /// replay buffer's encoder, so it costs disk (about 9 GB an hour at the default bitrate
@@ -149,11 +159,13 @@ impl Default for Settings {
             encode_engine: EncodeEngine::default(),
             language: Language::default(),
             backend_url: DEFAULT_BACKEND_URL.into(),
+            valorant_shard: "na".into(),
             device_token: None,
             account: None,
             auto_upload: true,
             delete_source_after_encode: false,
             storage_limit_gb: 0,
+            session_storage_limit_gb: 0,
             record_sessions: true,
             open_after_session: true,
             first_run_done: true,
@@ -241,7 +253,16 @@ impl Settings {
         if self.storage_limit_gb > MAX_STORAGE_LIMIT_GB {
             anyhow::bail!("storage limit must be at most {MAX_STORAGE_LIMIT_GB} GB");
         }
+        if self.session_storage_limit_gb > MAX_STORAGE_LIMIT_GB {
+            anyhow::bail!("session storage limit must be at most {MAX_STORAGE_LIMIT_GB} GB");
+        }
         validate_backend_url(&self.backend_url)?;
+        if self.valorant_shard.trim().is_empty()
+            || self.valorant_shard.len() > 16
+            || !self.valorant_shard.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            anyhow::bail!("Valorant shard must be a short lowercase code, like na, eu, ap or kr");
+        }
         Ok(())
     }
 
@@ -392,6 +413,8 @@ mod tests {
         // The storage settings arrived later still, and both defaults mean "behave as before".
         assert!(!s.delete_source_after_encode);
         assert_eq!(s.storage_limit_gb, 0);
+        assert_eq!(s.session_storage_limit_gb, 0);
+        assert_eq!(s.valorant_shard, "na");
         // Session recording arrived after that, on by default.
         assert!(s.record_sessions);
         assert!(s.open_after_session);
@@ -411,6 +434,31 @@ mod tests {
             ..Default::default()
         };
         assert!(absurd.validate().is_err());
+    }
+
+    #[test]
+    fn the_session_storage_limit_is_range_checked() {
+        let ok = Settings { session_storage_limit_gb: 500, ..Default::default() };
+        ok.validate().unwrap();
+        let absurd = Settings {
+            session_storage_limit_gb: MAX_STORAGE_LIMIT_GB + 1,
+            ..Default::default()
+        };
+        assert!(absurd.validate().is_err());
+    }
+
+    #[test]
+    fn the_valorant_shard_defaults_to_na_and_is_validated() {
+        let s = Settings::default();
+        assert_eq!(s.valorant_shard, "na");
+        s.validate().unwrap();
+
+        assert!(Settings { valorant_shard: "NA".into(), ..Default::default() }.validate().is_err(), "must be lowercase");
+        assert!(Settings { valorant_shard: "".into(), ..Default::default() }.validate().is_err(), "must not be empty");
+        assert!(
+            Settings { valorant_shard: "eu".into(), ..Default::default() }.validate().is_ok(),
+            "other real shards are accepted, not just na"
+        );
     }
 
     #[test]

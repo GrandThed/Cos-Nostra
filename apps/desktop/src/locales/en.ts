@@ -412,6 +412,11 @@ export default {
     onlyHere: "Only on this PC",
     onSiteLine: " On the site · {count} · {size} local",
     onlyHereLine: " Only on this PC · {count} · {size}",
+    sessionRecordings: "Session recordings",
+    sessionRecordingsNote:
+      "Whole sessions and the matches cut from them, in the Matches folder. Never encoded, never uploaded.",
+    matchOne: "match",
+    matchMany: "matches",
     cleaner: {
       sources: {
         label: "Original recordings",
@@ -445,8 +450,13 @@ export default {
     keepAtMost: "Keep at most",
     limitNote:
       "· 0 for no limit. Over the limit, the oldest clips the site already has give up their local video; clips only on this PC are never touched.",
+    keepSessionsAtMost: "Keep session recordings at most",
+    sessionLimitNote:
+      "· 0 for no limit. Over the limit, the oldest matches are deleted outright — they are never backed up anywhere.",
     over:
       "Over the {limit} GB limit by {size}. Nothing more can go automatically: what is left is not on the site yet.",
+    sessionOver:
+      "Over the {limit} GB limit by {size}. What is left is still being recorded or cut into matches.",
     save: "Save",
     saving: "Saving…",
     saved: "Saved",
@@ -492,6 +502,10 @@ export default {
     advanced: "Advanced",
     bufferBitrate: { name: "Buffer bitrate", hint: "kbps · 2000–60000" },
     backendUrl: { name: "Backend URL", hint: "https:// · http:// only for localhost" },
+    valorantShard: {
+      name: "Valorant shard",
+      hint: "na, eu, ap or kr · used only to fetch kills after a match",
+    },
     language: {
       name: "Language",
       hint: "the whole app changes as soon as you save",

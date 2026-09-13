@@ -64,6 +64,11 @@ pub struct Presence {
     pub provisioning: Option<String>,
     pub ally: Option<u32>,
     pub enemy: Option<u32>,
+    /// The current match's id, when the blob carries one. UNVERIFIED: `matchId` is where
+    /// community documentation of this presence blob places it, but nothing here has confirmed
+    /// it against a real match. `None` just means phase 2 (post-match kills) does not run for
+    /// that match; everything else in this file is unaffected.
+    pub match_id: Option<String>,
 }
 
 impl Presence {
@@ -135,6 +140,7 @@ fn parse_presence(root: &Value) -> Option<Presence> {
         provisioning: text(root, "provisioningFlow"),
         ally: number(root, "partyOwnerMatchScoreAllyTeam"),
         enemy: number(root, "partyOwnerMatchScoreEnemyTeam"),
+        match_id: text(root, "matchId"),
     })
 }
 
@@ -406,6 +412,123 @@ impl Client {
         }
         Ok(presence)
     }
+
+    /// The local client's own entitlement: an access token and an entitlements JWT, needed
+    /// alongside the account's puuid to call Riot's public match-details API. Same lockfile
+    /// auth as everything else here, but this is Riot's documented endpoint for it
+    /// (`/entitlements/v1/token`), unlike the presence blob this file otherwise leans on.
+    fn entitlement(&self) -> Result<Entitlement> {
+        let body = self.get("/entitlements/v1/token")?;
+        let field = |k: &str| -> Result<String> {
+            body.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .with_context(|| format!("the entitlement response has no {k}"))
+        };
+        Ok(Entitlement { access_token: field("accessToken")?, token: field("token")? })
+    }
+}
+
+/// From `/entitlements/v1/token`. `token` is the entitlements JWT despite the confusing name
+/// Riot gives the field; `access_token` is the bearer token.
+struct Entitlement {
+    access_token: String,
+    token: String,
+}
+
+/// How long the one-shot call to Riot's public match-details API is allowed, once per finished
+/// match. Separate from `HTTP_TIMEOUT`, which is for the local client and can be much shorter.
+const MATCH_DETAILS_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+/// Fetches `pd.<shard>.a.pvp.net/match-details/v1/matches/<match_id>`. Deliberately a plain
+/// `reqwest` client with normal certificate validation, not `Client::http`'s
+/// `tls_danger_accept_invalid_certs`, which exists only for the local client's self-signed cert
+/// and has no business relaxing validation for a real internet host.
+///
+/// The shard is not discoverable from the local API with any confidence (see `Settings::
+/// valorant_shard`), so it is whatever the caller was configured with; a wrong one answers with
+/// a 4xx that shows up in the log rather than silently placing kills on the wrong instance.
+fn fetch_match_details(shard: &str, match_id: &str, ent: &Entitlement) -> Result<Value> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(MATCH_DETAILS_TIMEOUT)
+        .build()
+        .context("building the match-details client")?;
+    let url = format!("https://pd.{shard}.a.pvp.net/match-details/v1/matches/{match_id}");
+    let response = http
+        .get(&url)
+        .bearer_auth(&ent.access_token)
+        .header("X-Riot-Entitlements-JWT", &ent.token)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("GET {url}: {status}");
+    }
+    response.json().with_context(|| format!("GET {url}: not JSON"))
+}
+
+/// `puuid -> displayed name` from a match-details response's player list, so kills read like
+/// League's rather than showing raw puuids. UNVERIFIED: `players[].subject` and `gameName` are
+/// Valorant's community-documented match-details shape, not a field capture from a live match.
+fn player_names(details: &Value) -> std::collections::HashMap<String, String> {
+    details
+        .get("players")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let puuid = p.get("subject").and_then(Value::as_str)?.to_string();
+            let name = p.get("gameName").and_then(Value::as_str).unwrap_or("");
+            (!name.is_empty()).then(|| (puuid, name.to_string()))
+        })
+        .collect()
+}
+
+/// Turns a match-details response's per-kill list into `Kill`/`Death` events for `my_puuid`,
+/// anchored on `match_started_at` (the wall-clock time the corresponding `MatchStart` fired):
+/// `timeSinceGameStartMillis` is an offset from that zero, the same style `league.rs` uses for
+/// its own game-clock events. Kills that involve neither the tracked player as killer nor as
+/// victim are left out, same reasoning as League's: everyone else's kills are not what gets
+/// clipped from this player's footage.
+///
+/// UNVERIFIED against a real match: `kills[]` with `killer`, `victim` (puuids) and
+/// `timeSinceGameStartMillis` is Valorant's community-documented match-details shape, not a
+/// capture from a live game. Weapon and headshot detail are left out rather than guessed: the
+/// documented shape puts them behind a weapon-asset id this file has no table for.
+fn kills_from_match_details(details: &Value, my_puuid: &str, match_started_at: DateTime<Utc>) -> Vec<GameEvent> {
+    let names = player_names(details);
+    details
+        .get("kills")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|k| {
+            let millis = k.get("timeSinceGameStartMillis").and_then(Value::as_i64)?;
+            let killer = k.get("killer").and_then(Value::as_str).unwrap_or("");
+            let victim = k.get("victim").and_then(Value::as_str).unwrap_or("");
+            let at = match_started_at + Duration::milliseconds(millis);
+            if !killer.is_empty() && killer == my_puuid {
+                Some(GameEvent {
+                    at,
+                    event: Event::Kill { victim: names.get(victim).cloned(), weapon: None, headshot: false },
+                })
+            } else if !victim.is_empty() && victim == my_puuid {
+                Some(GameEvent { at, event: Event::Death { killer: names.get(killer).cloned(), weapon: None } })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Entitlement, then match-details, then translated into events. One function so `poll` has a
+/// single `Result` to log and move on from.
+fn fetch_kills(client: &Client, shard: &str, match_id: &str, started_at: DateTime<Utc>) -> Result<Vec<GameEvent>> {
+    let ent = client.entitlement().context("fetching the local entitlement token")?;
+    let details = fetch_match_details(shard, match_id, &ent)
+        .with_context(|| format!("fetching match details from shard {shard:?}"))?;
+    Ok(kills_from_match_details(&details, &client.puuid, started_at))
 }
 
 pub struct Valorant {
@@ -414,16 +537,33 @@ pub struct Valorant {
     reached: bool,
     tracker: Tracker,
     last_error: Option<String>,
+    /// Region shard for the match-details API (`Settings::valorant_shard`, default `"na"`).
+    /// Read once at construction: a session's provider lives only as long as the game runs, so
+    /// re-reading it mid-session would not do anything a restart of the game does not already.
+    shard: String,
+    /// Wall-clock start of whatever match is open right now, taken from the `MatchStart` event
+    /// itself rather than `now`, so a match id that only shows up in a later presence poll is
+    /// still paired with the true start. `None` when no match is open.
+    current_match_started: Option<DateTime<Utc>>,
+    /// The current match's id, once the presence blob has carried one (see `Presence::
+    /// match_id`, which is UNVERIFIED against a real match). `None` until it does, or once a
+    /// finished match's kills have been fetched with it.
+    current_match_id: Option<String>,
 }
 
 impl Valorant {
     pub fn new() -> Self {
+        let shard = crate::settings::Settings::load().valorant_shard;
+        log::info!("valorant: match details will use shard {shard:?} (Settings > Advanced > Valorant shard)");
         Self {
             client: None,
             next_connect: None,
             reached: false,
             tracker: Tracker::default(),
             last_error: None,
+            shard,
+            current_match_started: None,
+            current_match_id: None,
         }
     }
 
@@ -467,7 +607,51 @@ impl Provider for Valorant {
             }
             None => None,
         };
-        self.tracker.observe(now, presence.as_ref())
+        let mut events = self.tracker.observe(now, presence.as_ref());
+
+        // A fresh match: remember when it started, from the event rather than `now` in case
+        // the id only shows up in a later poll, and forget any id left over from whatever
+        // match (if any) came before it.
+        if let Some(started) =
+            events.iter().find_map(|e| matches!(e.event, Event::MatchStart { .. }).then_some(e.at))
+        {
+            self.current_match_started = Some(started);
+            self.current_match_id = None;
+        }
+        if self.current_match_started.is_some() {
+            if let Some(id) = presence.as_ref().and_then(|p| p.match_id.clone()) {
+                self.current_match_id = Some(id);
+            }
+        }
+
+        // Phase 2: once a match has a real result, try to enrich it with per-kill detail from
+        // the public API. Best-effort — no match id ever showed up, the entitlement call
+        // fails, the shard is wrong, the network is down — any of it just leaves the match
+        // with the round-level events phase 1 already produces.
+        if let Some(pos) = events
+            .iter()
+            .position(|e| matches!(e.event, Event::MatchEnd { reason: EndReason::Finished, .. }))
+        {
+            let started_at = self.current_match_started.take();
+            if let (Some(match_id), Some(started_at), Some(client)) =
+                (self.current_match_id.take(), started_at, self.client.as_ref())
+            {
+                match fetch_kills(client, &self.shard, &match_id, started_at) {
+                    Ok(kills) if !kills.is_empty() => {
+                        log::info!("valorant: {} kill/death event(s) added from match {match_id}", kills.len());
+                        events.splice(pos..pos, kills);
+                    }
+                    Ok(_) => log::debug!("valorant: match {match_id} details had no kills for this player"),
+                    Err(e) => log::info!("valorant: match details for {match_id} unavailable: {e:#}"),
+                }
+            }
+        } else if events.iter().any(|e| matches!(e.event, Event::MatchEnd { .. })) {
+            // Lost, superseded, or cut short by the session ending: not worth asking the API
+            // about, since it may not even be finalised there yet.
+            self.current_match_started = None;
+            self.current_match_id = None;
+        }
+        events
     }
 
     fn reached(&self) -> bool {
@@ -496,6 +680,7 @@ mod tests {
             provisioning: Some("Matchmaking".into()),
             ally: Some(ally),
             enemy: Some(enemy),
+            match_id: None,
         }
     }
 
@@ -507,6 +692,7 @@ mod tests {
             provisioning: None,
             ally: Some(0),
             enemy: Some(0),
+            match_id: None,
         }
     }
 
@@ -667,5 +853,78 @@ mod tests {
         let events = tr.observe(t(200), Some(&ingame(0, 0)));
         let kinds: Vec<_> = events.iter().map(|e| e.event.kind()).collect();
         assert_eq!(kinds, vec!["match_end", "match_start"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: post-match kill detail. UNVERIFIED against a real match (see the module doc
+    // comment and the crate's top-level report) — these are hand-written match-details bodies
+    // shaped like Valorant's community-documented API, the same way the presence tests above
+    // are hand-written blobs rather than a capture from a live client.
+
+    #[test]
+    fn decodes_a_match_id_when_the_presence_carries_one() {
+        let blob = json!({
+            "isValid": true,
+            "sessionLoopState": "INGAME",
+            "matchMap": "/Game/Maps/Ascent/Ascent",
+            "queueId": "competitive",
+            "matchId": "b1f0c1a0-aaaa-bbbb-cccc-1234567890ab",
+            "partyOwnerMatchScoreAllyTeam": 0,
+            "partyOwnerMatchScoreEnemyTeam": 0
+        });
+        let p = decode_presence(&encode(&blob)).unwrap();
+        assert_eq!(p.match_id.as_deref(), Some("b1f0c1a0-aaaa-bbbb-cccc-1234567890ab"));
+
+        // Most presences do not carry one at all; that must not fail decoding.
+        let mut without_id = blob.clone();
+        without_id.as_object_mut().unwrap().remove("matchId");
+        assert_eq!(decode_presence(&encode(&without_id)).unwrap().match_id, None);
+    }
+
+    fn sample_match_details() -> Value {
+        json!({
+            "matchInfo": { "matchId": "match-1" },
+            "players": [
+                { "subject": "me-puuid", "gameName": "Benja", "tagLine": "LAS" },
+                { "subject": "foe-puuid", "gameName": "Rival", "tagLine": "NA1" },
+                { "subject": "ally-puuid", "gameName": "Mate", "tagLine": "LAS" }
+            ],
+            "kills": [
+                { "timeSinceGameStartMillis": 5_000, "killer": "me-puuid", "victim": "foe-puuid" },
+                { "timeSinceGameStartMillis": 12_000, "killer": "foe-puuid", "victim": "me-puuid" },
+                // Not involving the tracked player at all: left out.
+                { "timeSinceGameStartMillis": 20_000, "killer": "foe-puuid", "victim": "ally-puuid" }
+            ]
+        })
+    }
+
+    #[test]
+    fn player_names_map_puuids_to_game_names() {
+        let names = player_names(&sample_match_details());
+        assert_eq!(names.get("me-puuid").map(String::as_str), Some("Benja"));
+        assert_eq!(names.get("foe-puuid").map(String::as_str), Some("Rival"));
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn kills_from_match_details_keeps_only_the_tracked_players_own_kills_and_deaths() {
+        let details = sample_match_details();
+        let started = t(1_000);
+        let events = kills_from_match_details(&details, "me-puuid", started);
+        assert_eq!(events.len(), 2, "the third kill involves neither killer nor victim we track");
+
+        assert_eq!(events[0].at, t(1_000 + 5));
+        assert_eq!(
+            events[0].event,
+            Event::Kill { victim: Some("Rival".into()), weapon: None, headshot: false }
+        );
+        assert_eq!(events[1].at, t(1_000 + 12));
+        assert_eq!(events[1].event, Event::Death { killer: Some("Rival".into()), weapon: None });
+    }
+
+    #[test]
+    fn kills_from_match_details_is_empty_for_an_unrecognised_shape() {
+        assert!(kills_from_match_details(&json!({}), "me-puuid", t(0)).is_empty());
+        assert!(kills_from_match_details(&json!({ "kills": [] }), "me-puuid", t(0)).is_empty());
     }
 }

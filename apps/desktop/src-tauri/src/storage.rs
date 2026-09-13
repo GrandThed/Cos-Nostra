@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::queue::{ClipRow, ClipStatus, Queue};
+use crate::sessions::SessionStore;
 
 /// Outputs live next to the source: `<stem>.av1.mp4`, `<stem>.h264.mp4`, `<stem>.jpg`.
 pub fn output_paths(source: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -101,6 +102,12 @@ pub struct StorageStats {
     pub reclaim_sources: Bucket,
     pub reclaim_published: Bucket,
     pub reclaim_failed: Bucket,
+    /// Session recordings and cut match files under `<clip folder>\Matches`, from `scan_matches`
+    /// (a separate scan against `sessions.db`, since this struct's own `scan` never recurses
+    /// into that folder). Matches have no AV1/H264 encode step and are never uploaded, so they
+    /// get their own bucket rather than folding into `published`/`local_only`, which are both
+    /// about clips.
+    pub matches: Bucket,
     /// Free and total bytes of the volume holding the clip folder, when Windows answers.
     pub free_space: Option<i64>,
     pub disk_size: Option<i64>,
@@ -320,6 +327,63 @@ pub fn enforce_limit(queue: &Queue, clip_dir: &Path, limit: i64) -> Result<Clean
     if result.clips > 0 {
         log::info!(
             "storage: limit of {limit} bytes freed {} bytes across {} uploaded clips",
+            result.bytes,
+            result.clips
+        );
+    }
+    Ok(result)
+}
+
+/// Sums the disk footage of every session's match files (whole-session renames and cut match
+/// files alike, under `<clip folder>\Matches`). The same "trust nothing, `stat` everything" rule
+/// as `scan`: `sessions.rs`'s `size` column is recorded once when the match file is written and
+/// never revisited, so a file moved or deleted outside the app would otherwise be miscounted.
+pub fn scan_matches(store: &SessionStore) -> Result<Bucket> {
+    let mut bucket = Bucket::default();
+    for session in store.list().context("listing sessions")? {
+        for m in session.matches {
+            let Some(path) = m.path.as_deref() else { continue };
+            let size = size_on_disk(path);
+            if size > 0 {
+                bucket.add(size);
+            }
+        }
+    }
+    Ok(bucket)
+}
+
+/// Keeps `<clip folder>\Matches` under `limit_bytes` by deleting the oldest match files outright,
+/// oldest first. A limit of zero means no limit. Unlike `enforce_limit` for clips, there is no
+/// "only give up a copy the backend already has" nuance here: a match is never backed up
+/// anywhere, so the oldest one goes regardless of whether it has ever been opened. Reuses
+/// `SessionStore::delete_match` for the database side, which already returns the file paths it
+/// owned; this only does the actual `fs::remove_file`, the same as every other cleanup here.
+pub fn enforce_session_limit(store: &SessionStore, limit: i64) -> Result<CleanResult> {
+    let mut result = CleanResult::default();
+    if limit <= 0 {
+        return Ok(result);
+    }
+    let mut total = scan_matches(store)?.bytes;
+    if total <= limit {
+        return Ok(result);
+    }
+    for m in store.oldest_matches().context("listing matches")? {
+        if total <= limit {
+            break;
+        }
+        let files = store
+            .delete_match(m.id)
+            .with_context(|| format!("deleting match {}", m.id))?;
+        let freed: i64 = files.iter().map(|p| remove(p)).sum();
+        if freed > 0 {
+            total -= freed;
+            result.clips += 1;
+            result.bytes += freed;
+        }
+    }
+    if result.clips > 0 {
+        log::info!(
+            "storage: session limit of {limit} bytes freed {} bytes across {} match(es)",
             result.bytes,
             result.clips
         );
@@ -623,5 +687,71 @@ mod tests {
         assert!(scan(&q.list().unwrap(), &dir).total > 500, "still over, and honest about it");
 
         assert_eq!(enforce_limit(&q, &dir, 0).unwrap().clips, 0, "zero means no limit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session/match storage
+
+    use crate::timeline::SessionGame;
+
+    fn session_store() -> (SessionStore, PathBuf) {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cos-nostra-storage-sessions-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (SessionStore::open(&dir.join("sessions.db")).unwrap(), dir)
+    }
+
+    fn t(s: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap()
+    }
+
+    /// A ready match with `bytes` of video on disk, oldest matches given the smallest `s`.
+    fn ready_match(store: &SessionStore, dir: &Path, session: i64, s: i64, name: &str, bytes: usize) -> i64 {
+        let id = store.add_undetected_match(session, t(s), t(s + 10)).unwrap();
+        let path = dir.join(format!("{name}.mp4"));
+        write(&path, bytes);
+        store.set_match_file(id, &path, None, t(s), 10_000, bytes as i64).unwrap();
+        id
+    }
+
+    #[test]
+    fn scan_matches_sums_files_across_sessions() {
+        let (store, dir) = session_store();
+        let s1 = store.create_session(SessionGame::Valorant, "Valorant", t(0)).unwrap();
+        let s2 = store.create_session(SessionGame::League, "League of Legends", t(1000)).unwrap();
+        ready_match(&store, &dir, s1, 0, "a", 1000);
+        ready_match(&store, &dir, s2, 1000, "b", 2000);
+        // A match with no file yet (still live or pending) contributes nothing.
+        store.open_match(s2, t(2000), None, None).unwrap();
+
+        let bucket = scan_matches(&store).unwrap();
+        assert_eq!(bucket.clips, 2);
+        assert_eq!(bucket.bytes, 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_limit_deletes_the_oldest_matches_outright() {
+        let (store, dir) = session_store();
+        let s = store.create_session(SessionGame::Valorant, "Valorant", t(0)).unwrap();
+        let old = ready_match(&store, &dir, s, 0, "old", 1000);
+        let newer = ready_match(&store, &dir, s, 100, "newer", 1000);
+
+        let freed = enforce_session_limit(&store, 1500).unwrap();
+        assert_eq!(freed.clips, 1, "one match was enough to get under the limit");
+        assert_eq!(freed.bytes, 1000);
+        assert!(!dir.join("old.mp4").exists(), "the oldest match went first, unconditionally");
+        assert!(dir.join("newer.mp4").exists());
+        assert!(store.get_match(old).unwrap().is_none(), "the row goes with the file");
+        assert!(store.get_match(newer).unwrap().is_some());
+
+        assert_eq!(enforce_session_limit(&store, 0).unwrap().clips, 0, "zero means no limit");
+        assert_eq!(scan_matches(&store).unwrap().bytes, 1000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

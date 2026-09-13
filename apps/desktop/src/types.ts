@@ -61,12 +61,17 @@ export interface Settings {
   encode_engine: EncodeEngine;
   language: Language;
   backend_url: string;
+  /** Region shard for Valorant's public match-details API (`pd.<shard>.a.pvp.net`), e.g. "na",
+   *  "eu", "ap", "kr". Not discoverable from the local Riot Client API, so it is a setting. */
+  valorant_shard: string;
   /** No `device_token`: `get_settings` blanks it, and `save_settings` puts the live one back.
    *  Whether a device is linked is `account` (or `get_account`), never the token itself. */
   account: Account | null;
   auto_upload: boolean;
   delete_source_after_encode: boolean;
   storage_limit_gb: number;
+  /** Same idea as `storage_limit_gb`, but for `<clip folder>\Matches`: 0 for no limit. */
+  session_storage_limit_gb: number;
   record_sessions: boolean;
   open_after_session: boolean;
   first_run_done: boolean;
@@ -176,6 +181,9 @@ export interface StorageStats {
   reclaim_sources: Bucket;
   reclaim_published: Bucket;
   reclaim_failed: Bucket;
+  /** Session recordings and cut match files under `<clip folder>\Matches`. Never encoded to
+   *  AV1/H264 and never uploaded, so it is its own bucket rather than part of the split above. */
+  matches: Bucket;
   free_space: number | null;
   disk_size: number | null;
 }
@@ -190,7 +198,7 @@ export interface CleanResult {
 // ---------------------------------------------------------------------------
 // Sessions and matches. Keep in step with `sessions.rs`, `timeline.rs` and `session_watch.rs`.
 
-export type SessionGame = "valorant" | "league" | "counter_strike";
+export type SessionGame = "valorant" | "league" | "counter_strike" | "teamfight_tactics";
 
 /** The session the watch is recording right now. */
 export interface LiveSession {

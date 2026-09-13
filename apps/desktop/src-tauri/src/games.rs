@@ -407,6 +407,7 @@ const KNOWN_GAMES: &[(&str, &str)] = &[
     // Strategy and cards
     ("dota2.exe", "Dota 2"),
     ("League of Legends.exe", "League of Legends"),
+    ("TFTClient-Win64-Shipping.exe", "Teamfight Tactics"),
     ("SC2_x64.exe", "StarCraft II"),
     ("Warcraft III.exe", "Warcraft III"),
     ("AoE2DE_s.exe", "Age of Empires II: Definitive Edition"),

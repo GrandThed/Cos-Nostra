@@ -413,6 +413,11 @@ export default {
     onlyHere: "Solo en esta PC",
     onSiteLine: " En la web · {count} · {size} en local",
     onlyHereLine: " Solo en esta PC · {count} · {size}",
+    sessionRecordings: "Grabaciones de sesiones",
+    sessionRecordingsNote:
+      "Sesiones completas y las partidas recortadas de ellas, en la carpeta Matches. Nunca se codifican ni se suben.",
+    matchOne: "partida",
+    matchMany: "partidas",
     cleaner: {
       sources: {
         label: "Grabaciones originales",
@@ -446,8 +451,13 @@ export default {
     keepAtMost: "Guardar como máximo",
     limitNote:
       "· 0 para no poner límite. Al pasarse, los clips más antiguos que ya están en la web sueltan su video local; los que solo están en esta PC no se tocan nunca.",
+    keepSessionsAtMost: "Guardar grabaciones de sesiones como máximo",
+    sessionLimitNote:
+      "· 0 para no poner límite. Al pasarse, las partidas más antiguas se eliminan directamente: nunca se respaldan en ningún lado.",
     over:
       "Te pasas del límite de {limit} GB por {size}. No se puede liberar nada más automáticamente: lo que queda todavía no está en la web.",
+    sessionOver:
+      "Te pasas del límite de {limit} GB por {size}. Lo que queda todavía se está grabando o recortando en partidas.",
     save: "Guardar",
     saving: "Guardando…",
     saved: "Guardado",
@@ -493,6 +503,10 @@ export default {
     advanced: "Avanzado",
     bufferBitrate: { name: "Bitrate del búfer", hint: "kbps · 2000–60000" },
     backendUrl: { name: "URL del backend", hint: "https:// · http:// solo para localhost" },
+    valorantShard: {
+      name: "Región de Valorant",
+      hint: "na, eu, ap o kr · solo se usa para buscar las bajas después de una partida",
+    },
     language: {
       name: "Idioma",
       hint: "toda la app cambia en cuanto guardes",

@@ -38,6 +38,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 chrono = "0.4"
 # Decodes the base64 presence blob the Riot client serves. Already in the graph (MIT/Apache).
 base64 = "0.22"
+# CS2's Game State Integration POSTs JSON to a local HTTP endpoint. Apache-2.0/MIT, no async
+# runtime needed (the rest of the app is threads + blocking calls), unlike axum or warp.
+tiny_http = "0.12"
 # Win32 calls for the foreground window lookup, the game process watch and the save sound. Same version libobs-window-helper uses.
 windows = { version = "0.62", features = [
     "Win32_Foundation",

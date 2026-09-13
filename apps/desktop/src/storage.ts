@@ -118,6 +118,7 @@ function render(): void {
       ),
       kinds(stats),
       whereClipsLive(stats),
+      sessionRecordings(stats.matches),
       freeUpSpace(stats),
       keepInCheck(stats, settings),
     ),
@@ -274,6 +275,24 @@ function whereClipsLive(s: StorageStats): HTMLElement {
   );
 }
 
+/** Session recordings and cut match files under `<clip folder>\Matches`: never encoded, never
+ *  uploaded, so a plain row rather than a bar split like the clips above. */
+function sessionRecordings(matches: Bucket): HTMLElement {
+  return block(
+    t("storage.sessionRecordings"),
+    h(
+      "div",
+      { class: "kind" },
+      h("span", {
+        class: "k",
+        text: fmtCount(matches.clips, t("storage.matchOne"), t("storage.matchMany")),
+      }),
+      h("span", { class: "v", text: fmtBytes(matches.bytes) }),
+    ),
+    h("span", { class: "note", text: t("storage.sessionRecordingsNote") }),
+  );
+}
+
 function freeUpSpace(s: StorageStats): HTMLElement {
   const cards = CLEANERS.map((c) => {
     const bucket = c.of(s);
@@ -371,9 +390,19 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
     step: "1",
     value: String(settings.storage_limit_gb),
   }) as HTMLInputElement;
+  const sessionLimit = h("input", {
+    type: "number",
+    class: "field",
+    min: "0",
+    max: "100000",
+    step: "1",
+    value: String(settings.session_storage_limit_gb),
+  }) as HTMLInputElement;
 
   const cap = settings.storage_limit_gb * GB;
   const over = cap > 0 && s.total > cap;
+  const sessionCap = settings.session_storage_limit_gb * GB;
+  const sessionOver = sessionCap > 0 && s.matches.bytes > sessionCap;
 
   const save = h("button", {
     type: "button",
@@ -387,6 +416,7 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
           ...settings,
           delete_source_after_encode: deleteSources.checked,
           storage_limit_gb: Number(limit.value),
+          session_storage_limit_gb: Number(sessionLimit.value),
         });
         saveMsg = { text: t("storage.saved"), kind: "ok" };
         await loadSettings();
@@ -423,6 +453,23 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
           text: t("storage.over", {
             limit: settings.storage_limit_gb,
             size: fmtBytes(s.total - cap),
+          }),
+        })
+      : null,
+    h(
+      "div",
+      { class: "limit" },
+      t("storage.keepSessionsAtMost"),
+      sessionLimit,
+      "GB",
+      h("span", { class: "note", text: t("storage.sessionLimitNote") }),
+    ),
+    sessionOver
+      ? h("div", {
+          class: "over",
+          text: t("storage.sessionOver", {
+            limit: settings.session_storage_limit_gb,
+            size: fmtBytes(s.matches.bytes - sessionCap),
           }),
         })
       : null,

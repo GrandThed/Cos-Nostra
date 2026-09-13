@@ -215,7 +215,26 @@ fn process(app: &AppHandle, ids: Vec<i64>) {
             app.state::<AppState>().processing.lock().unwrap().remove(&id);
             emit_sessions_changed(&app, id);
         }
+        enforce_session_storage(&app, &store);
     });
+}
+
+/// Keeps `<clip folder>\Matches` under the configured limit, the same way the clip queue's
+/// `on_clip_changed` enforces `storage_limit_gb` after every job. Runs once after a batch of
+/// sessions finishes cutting rather than after each one, since a whole batch just wrote its
+/// match files together.
+fn enforce_session_storage(app: &AppHandle, store: &SessionStore) {
+    let limit_gb = app.state::<AppState>().settings.lock().unwrap().session_storage_limit_gb;
+    if limit_gb == 0 {
+        return;
+    }
+    match crate::storage::enforce_session_limit(store, i64::from(limit_gb) * crate::storage::GB) {
+        Ok(freed) if freed.clips > 0 => {
+            log::info!("session storage limit freed {} match(es), {} bytes", freed.clips, freed.bytes);
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("session storage limit could not be applied: {e:#}"),
+    }
 }
 
 fn store_or_err(state: &AppState) -> Result<Arc<SessionStore>, String> {
