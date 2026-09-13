@@ -35,11 +35,31 @@ const schema = z.object({
   S3_SECRET_ACCESS_KEY: z.string().optional(),
   // "virtual" (default, Railway and R2) or "path" for older buckets.
   S3_URL_STYLE: z.enum(['virtual', 'path']).default('virtual'),
+  // Largest single video a clip may upload. The presigned PUT is signed for exactly the
+  // size the desktop declares, so this is the ceiling on what one signature can write.
+  MAX_CLIP_MB: z.coerce.number().int().positive().default(2048),
+  // Total stored bytes one user may hold, 0 for no limit. Counts the AV1 and H.264 copies
+  // of every ready clip plus the reservations of uploads still in flight.
+  USER_QUOTA_GB: z.coerce.number().int().nonnegative().default(50),
   LOG_LEVEL: z.string().default('info'),
 });
 
+const MB = 1024 * 1024;
+const GB = 1024 * MB;
+
+// Thumbnails are a single JPEG frame; anything near this is already pathological. Not an
+// environment variable because there is no deployment where a different number is right.
+const MAX_THUMB_BYTES = 2 * MB;
+
 /**
- * @typedef {z.infer<typeof schema> & { storage: null | {
+ * @typedef {object} Limits
+ * @property {number} maxClipBytes  ceiling for one AV1 or H.264 upload
+ * @property {number} maxThumbBytes ceiling for one thumbnail upload
+ * @property {number} userQuotaBytes total stored bytes per user, 0 for no limit
+ */
+
+/**
+ * @typedef {z.infer<typeof schema> & { limits: Limits, storage: null | {
  *   endpoint: string, region: string, bucket: string, accessKeyId: string,
  *   secretAccessKey: string, forcePathStyle: boolean } }} Config
  */
@@ -63,5 +83,10 @@ export function loadConfig(env = process.env) {
         forcePathStyle: c.S3_URL_STYLE === 'path',
       }
     : null;
-  return { ...c, storage };
+  const limits = {
+    maxClipBytes: c.MAX_CLIP_MB * MB,
+    maxThumbBytes: MAX_THUMB_BYTES,
+    userQuotaBytes: c.USER_QUOTA_GB * GB,
+  };
+  return { ...c, limits, storage };
 }

@@ -1,0 +1,93 @@
+﻿/* The one token set both themes run on, switched by the system theme. Values come straight
+   from the design handoff; nothing else in the app should hard-code a colour, with the one
+   exception of the storage bar palette below, which is deliberately theme-independent so a
+   game keeps its colour when the theme flips. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f5f0e5;
+  --panel: #fdfaf2;
+  --panel2: #ebe3cf;
+  --ink: #2b241a;
+  --mut: #6f6553;
+  --line: #ddd3bd;
+  --acc: #b04a28;
+  --accInk: #fff8f0;
+  --ok: #237a4b;
+  --warn: #8a6210;
+  --info: #3763a8;
+  --err: #b23a28;
+  --rel: #655399;
+
+  /* Derived: the window edge, the wash behind a tinted banner, the scrim a badge sits on
+     when it is over a thumbnail, and the shadow under anything that floats. */
+  --edge: #c9bda4;
+  --okWash: rgba(35, 122, 75, 0.08);
+  --warnWash: rgba(138, 98, 16, 0.08);
+  --errWash: rgba(178, 58, 40, 0.08);
+  --scrim: rgba(255, 251, 240, 0.92);
+  --lift: 0 24px 48px -20px rgba(30, 20, 5, 0.35);
+
+  /* Fixed: a chip over video is always light on dark, whatever the app theme is doing. */
+  --overVideo: rgba(12, 9, 4, 0.78);
+  --overVideoInk: #f1eadb;
+
+  --ui: "Rubik", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --display: "Bricolage Grotesque", "Rubik", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --titlebar: 38px;
+  --toolbar: 54px;
+  --sidebar: 224px;
+  --rail: 300px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16130f;
+    --panel: #1e1a15;
+    --panel2: #292217;
+    --ink: #f1eadb;
+    --mut: #b0a48d;
+    --line: #37301f;
+    --acc: #e2794f;
+    --accInk: #231204;
+    --ok: #5fc98b;
+    --warn: #e6b656;
+    --info: #84abe8;
+    --err: #ee7f66;
+    --rel: #b9a7e8;
+
+    --edge: #4a4232;
+    --okWash: rgba(95, 201, 139, 0.08);
+    --warnWash: rgba(230, 182, 86, 0.08);
+    --errWash: rgba(238, 127, 102, 0.08);
+    --scrim: rgba(12, 9, 4, 0.78);
+    --lift: 0 24px 48px -20px rgba(0, 0, 0, 0.6);
+  }
+}
+
+/* The window is narrow enough that the sidebar has to give a little before it folds. */
+@media (max-width: 960px) {
+  :root {
+    --sidebar: 200px;
+    --rail: 260px;
+  }
+}
+
+@keyframes rec {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

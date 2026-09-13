@@ -37,7 +37,9 @@ export async function buildApp(opts = {}) {
       level: config.LOG_LEVEL,
       ...(config.NODE_ENV === 'development' ? { transport: { target: 'pino-pretty' } } : {}),
     },
-    trustProxy: true,
+    // Exactly one hop (Railway's edge). `true` would let a client pick its own request.ip, and
+    // with it the rate-limit bucket, by sending an X-Forwarded-For the edge appends to.
+    trustProxy: 1,
     ...opts.fastify,
   });
 

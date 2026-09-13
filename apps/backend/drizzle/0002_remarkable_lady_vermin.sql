@@ -1,0 +1,1 @@
+ALTER TABLE "device_logins" ADD COLUMN "poll_secret_hash" text DEFAULT '' NOT NULL;

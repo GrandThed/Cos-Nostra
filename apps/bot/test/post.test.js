@@ -530,3 +530,53 @@ test('a clip that cannot be loaded rejects so the caller can retry the whole pos
 
   await assert.rejects(() => poster.postClip('clip1'), /backend down/);
 });
+
+// ---- mentions ----------------------------------------------------------------------------
+
+test('every message disables mentions, on both the attachment and the link path', async () => {
+  // The content carries a clip title and an owner username, neither of which the bot controls.
+  // 27 MB fits under the tier 3 limit and not under the tier 0 one, so one post takes each path.
+  const clip = makeClip();
+  const attached = makeChannel({ channelId: 'c1', guildId: 'g1', premiumTier: 3, messageId: 'm1' });
+  const linked = makeChannel({ channelId: 'c2', guildId: 'g2', premiumTier: 0, messageId: 'm2' });
+  const backend = makeBackend({
+    clip,
+    guilds: [
+      { guildId: 'g1', channelId: 'c1', seedEmojis: [] },
+      { guildId: 'g2', channelId: 'c2', seedEmojis: [] },
+    ],
+  });
+  backend.getClip = async () => clip;
+  const poster = createPoster({
+    client: client({ c1: attached, c2: linked }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  assert.ok(attached.sent[0].files, 'expected the attachment path in the tier 3 guild');
+  assert.deepEqual(attached.sent[0].allowedMentions, { parse: [] });
+  assert.equal(linked.sent[0].files, undefined, 'expected the link path in the tier 0 guild');
+  assert.deepEqual(linked.sent[0].allowedMentions, { parse: [] });
+  // A fresh object per message: discord.js resolves the payload it is handed in place.
+  assert.notEqual(attached.sent[0].allowedMentions, linked.sent[0].allowedMentions);
+});
+
+test('a clip titled @everyone is posted as text that cannot ping', async () => {
+  const clip = makeClip({
+    title: '@everyone look at this',
+    owner: { discordId: '4242', username: '<@&1234567890>' },
+  });
+  const channel = makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' });
+  const backend = makeBackend({ clip, guilds: [{ guildId: 'g1', channelId: 'c1', seedEmojis: [] }] });
+  const poster = createPoster({ client: client({ c1: channel }), backend, log: makeLog(), fetch: makeFetch() });
+
+  await poster.postClip('clip1');
+
+  const payload = channel.sent[0];
+  // The text is sent as typed - it is allowedMentions, not escaping, that makes it inert.
+  assert.ok(payload.content.includes('@everyone look at this'));
+  assert.deepEqual(payload.allowedMentions, { parse: [] });
+});

@@ -274,6 +274,33 @@ ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,heig
 
 Machine readable: add `-of json`.
 
+## Cutting: trim and multi-part cuts
+
+The editor stores a cut as kept ranges in milliseconds (`ffmpeg::Cut`). One range is a trim
+and uses input seeking, frame accurate and never decoding the rest:
+
+```
+ffmpeg -y -ss 12.500 -to 20.000 -i src.mp4 -c:v ... src_out.mp4
+```
+
+Several ranges (the middle removed) seek to the first start and stop at the last end, then a
+filter graph trims each kept part out of that span and concatenates them, all in the same pass
+that encodes. Times in the graph are relative to the seek point, because input seeking resets
+the decoded timestamps to zero:
+
+```
+ffmpeg -y -ss 10.000 -to 26.000 -i src.mp4 -filter_complex "\
+[0:v]trim=start=0.000:end=2.000,setpts=PTS-STARTPTS[v0];[0:a]atrim=start=0.000:end=2.000,asetpts=PTS-STARTPTS[a0];\
+[0:v]trim=start=10.000:end=16.000,setpts=PTS-STARTPTS[v1];[0:a]atrim=start=10.000:end=16.000,asetpts=PTS-STARTPTS[a1];\
+[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" -c:v ... out.mp4
+```
+
+Two things bite here. Naming `[0:a]` on a file with no audio stream is a hard error, not an
+empty stream, so probe for one first (`MediaInfo::has_audio`) and build a video-only graph
+(`concat=n=N:v=1:a=0[v]`, `-map "[v]"`) when there is none. And `-progress` reports output
+time, so measure the percentage against the kept length, not the source length. Both paths
+are exercised by `cargo test ffmpeg::tests::end_to_end`, including a silent source.
+
 ## Recap compilation
 
 Normalize each clip first, then concat. Normalizing avoids concat failures from mismatched parameters.

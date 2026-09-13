@@ -10,17 +10,27 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "Cos Nostra",
-        "width": 480,
-        "height": 360,
-        "resizable": false
+        "width": 1120,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": false,
+        "shadow": true,
+        "backgroundColor": "#16130f"
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.discordapp.com; media-src 'self' asset: http://asset.localhost https:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' data: https://cdn.discordapp.com; media-src 'self' asset: http://asset.localhost https:; font-src 'self' http://localhost:1420; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'none'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     }
   },
   "bundle": {

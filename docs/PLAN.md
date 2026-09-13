@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-11. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phases 5 and 6 have not started.
+Last updated 2026-09-11. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed; phase 5 has not started.
 
 ## 1. What we are building
 
@@ -170,16 +170,16 @@ Reactions are append-only with a removed_at timestamp. Rankings count rows where
 
 Auth:
 
-- Desktop login: the app opens the browser to `/auth/discord/start?device=<code>`. After the OAuth callback the backend shows a page that says the device is linked and stores a long-lived device token. The desktop polls `/auth/device/<code>` until it receives the token. This is the standard device flow and avoids a local HTTP listener in the app.
+- Desktop login: the app opens the browser to `/auth/discord/start?device=<code>`. That page shows the device name and the code and asks the user to confirm before a same-origin form POST sends them to Discord; a link alone never reaches Discord, so a phished verify URL cannot link a stranger's device. After the OAuth callback the backend shows a page naming the linked device and stores a long-lived device token. The desktop polls `/auth/device/<code>` with the `pollSecret` it got when it started the login (a bearer header; without it the poll is a 401), until it receives the token. This is the standard device flow and avoids a local HTTP listener in the app.
 - Bot to backend: a shared secret in an `Authorization` header over Railway's private network.
 
 Endpoints:
 
 | Method and path | Purpose |
 |---|---|
-| POST /auth/device | Start a device login, returns a code |
-| GET /auth/discord/start, /auth/discord/callback | OAuth dance |
-| GET /auth/device/:code | Poll for the device token |
+| POST /auth/device | Start a device login, returns a code and a poll secret |
+| GET+POST /auth/discord/start, GET /auth/discord/callback | Confirmation page, then the OAuth dance |
+| GET /auth/device/:code | Poll for the device token (bearer: the poll secret) |
 | POST /clips | Create a pending clip, returns presigned PUT URLs for av1, h264 and thumb |
 | POST /clips/:id/complete | Mark upload done, triggers bot post |
 | GET /clips/:id | Clip metadata |
@@ -299,6 +299,124 @@ What changed from what one might expect:
   tests did not reproduce: the SQLite WAL files landed in the clip folder and were counted as
   leftovers. The fixture now keeps them apart the way the app does.
 
+### Desktop UI redesign. Done 2026-09-11.
+
+The four-tab 480x360 window was scaffolding: it showed the pipeline, not the clips. The
+redesign in `design_handoff_cos_nostra_ui/` replaces it with a resizable 1120x720 app whose
+subject is the library, and it is implemented as plain HTML/CSS/TypeScript modules under
+`apps/desktop/src/` with no framework, because every component in the handoff is one element
+and one class.
+
+- Navigation: three tabs (Library, Storage, Settings) in a segmented pill. Capture status is
+  not a tab but a live pill in the toolbar that opens a status panel, and the three alarms
+  (recorder failed, hotkey taken, ffmpeg missing) plus the capture conflict stack as banners
+  under the toolbar on every tab. The player is a detail view inside the library, not a
+  destination, and its Prev/Next walk whatever the library is currently showing.
+- The window is undecorated (`decorations: false`) so the title bar is ours, at the design's
+  38 px. That needs `core:window:allow-*` permissions in `capabilities/default.json`.
+- Theme: one token set in `src/styles/tokens.css`, switched by `prefers-color-scheme`. WebView2
+  fixes the scheme when the window is created, so a system theme change only shows after a
+  restart.
+- The three design fonts are self-hosted in `src/assets/fonts/` (about 160 KB of variable
+  woff2, OFL-1.1) rather than pulled from Google, because the app has to look the same with no
+  network. `scripts/fetch-fonts.mjs` regenerates them.
+- The player plays the local H.264 through the asset protocol, whose scope is widened to the
+  clip folder at startup and whenever the folder setting changes. A clip that has not finished
+  encoding plays its original recording; one whose local video was released streams from
+  `/clips/:id/h264`.
+
+What this needed from the Rust side, all of it small:
+
+- Encode and upload percentages, because the design's badges show them. `ffmpeg -progress` is
+  parsed from a spawned child (stderr drained on its own thread so neither pipe can fill), and
+  the upload body is a counting reader with an explicit length, since a chunked presigned PUT
+  is rejected. Both surface as a `clip-progress` event plus a `clip_progress` command for a UI
+  that opened mid-job.
+- `rename_game`, which renames every clip of one game and so also merges two.
+- An `fps` column (schema v3) so the rail can say "1920x1080 - 60 fps" and the player can step
+  one frame. Rows written before it read `None` and fall back to 60.
+- `delete_clip` now deletes the copy on the site first and stops if that fails, because the
+  rail calls the button "Delete everywhere". The backend keeps the row, so the Discord post
+  survives with a dead video; the rail says exactly that rather than claiming otherwise.
+- The OBS bootstrap moved inside the Tauri app so the first-run screen can show the download.
+  The window is up and reporting progress while it runs, and on `Restart` the app says so and
+  exits for the updater.
+
+### Match recording and the game timeline. Base and Valorant phase 1 done 2026-09-13.
+
+Not in the original plan. The hotkey only catches what the player remembers to save; this
+records every match of Valorant, League of Legends and Counter-Strike so clips can be made
+afterwards, from a list of matches with a timeline of what happened in each.
+
+The shape, and why:
+
+- **The whole session is recorded, then cut.** A session opens when the game's process
+  appears (`timeline::sight`, a Toolhelp snapshot every second, no handle to the game) and
+  closes ten seconds after it is gone, or six minutes for League while its client is still
+  open between games. Detection only *labels* footage, it never decides what gets recorded,
+  so a missed or late match start costs a marker, not the match.
+- **Same encoder, second output.** `capture::Recorder::start_recording` adds OBS's
+  `mp4_output` (hybrid MP4, readable after a crash) on the replay buffer's own video and audio
+  encoders, so a session costs disk (about 9 GB an hour at 20 Mbps until it is cut), not a
+  second hardware encode. `ffmpeg_muxer` with fragmented flags is the fallback.
+- **Everything is wall-clock time.** Providers emit `timeline::Event`s (`match_start`,
+  `round_end`, `match_end`, and `kill`/`death`/`assist` for games that can see them) stamped
+  with when they happened. A recording's start is measured afterwards as its stop time minus
+  its probed duration; a match file stores its first frame's time. Events land in any file by
+  subtraction, and a recorder restart mid-match just leaves two recordings side by side.
+- **Cutting is a stream copy.** `cutter.rs` gives each match its span plus 10 s before and
+  8 s after, copied from the keyframe at or before the start (found from packet headers around
+  the point, so it costs the same on a three hour file), joined with the concat demuxer when a
+  restart split it, plus a thumbnail. Then the raw recordings are deleted. A provider that
+  worked and saw no match means the session was menus and it is discarded; a game with no
+  provider, or a provider that never reached the game, keeps each recording whole, renamed.
+- **A clip from a match is an ordinary clip.** `clip_from_match` copies the range with three
+  seconds either side into the clip folder and enqueues it with the exact range as its `cut`
+  (`Queue::enqueue_with_cut`), so encoding, the editor and uploading are the paths that exist.
+- **Separate database.** `sessions.db` beside `clips.db`, because the queue versions its schema
+  through `user_version` and two stores in one file would share the number.
+- Files go to `<clip folder>\Matches`, which the Storage tab's top-level scan does not see and
+  the asset protocol scope now also allows.
+- When the session ends the window comes forward on the Matches tab (`open_after_session`),
+  and both new settings default on.
+
+Valorant phase 1 (`providers/valorant.rs`): the Riot Client's lockfile gives a port and password
+for its loopback API; `/chat/v1/session` gives the player's puuid and `/chat/v4/presences`,
+polled every second, the base64 presence blob. `INGAME` opens a match (not in the range),
+every rise of the score is a `round_end` with who won it, leaving `INGAME` ends it with the
+result, and ninety seconds without presence mid-match writes it off at the moment it went
+quiet. Riot moved the loop state into `matchPresenceData` in 2024, so fields are looked up by
+name at any depth, nested groups first; both layouts are tested.
+
+Verified 2026-09-13 in `tauri dev` with uploads off, against a real Riot Client (League's
+client was open): ffplay renamed to `VALORANT-Win64-Shipping.exe` opened session 1, the hybrid
+MP4 started on the shared AMF encoder, the provider connected to the local API, closing the
+fake game stopped the recording (2052 frames, 2 lagged), the session ended after the grace,
+was kept whole because no Valorant presence existed, renamed to a 34.2 s 1080p60 H.264/AAC
+match file with a thumbnail, and the window came up on it. `cargo test`: 80 pass, including
+real ffmpeg cuts across a recorder restart and the watch state machine on a fake host.
+
+Not verified, and what would:
+
+- A real Valorant match. Round ends from the score, the result, and the 2024 presence layout
+  are tested against hand-written blobs only; the log line `valorant: INGAME (queue ..., map
+  ...)` on a real match is what confirms the fields. If the score never moves, the score
+  fields have moved too.
+- `clip_from_match` end to end from the UI; its keyframe search, copy and queue insert are each
+  tested.
+- Marker precision on real footage. The file's start comes from the stop time, which libobs
+  honours to within a frame or two; presence polls are one second apart.
+
+Next:
+
+- Valorant phase 2: after `match_end`, fetch the match details (`pd.<shard>.a.pvp.net`,
+  entitlement token from the local API) and add each kill with `timeSinceGameStartMillis`,
+  anchored on the round ends already in the timeline.
+- League: Live Client Data API on `127.0.0.1:2999` (`ChampionKill`, `Multikill`, `Ace`).
+  Counter-Strike: Game State Integration, which needs a `.cfg` in the game's folder.
+- Teamfight Tactics runs as `TFTClient-Win64-Shipping.exe`, which is not a session game yet.
+- Matches in the Storage tab, and a limit on how much session footage is kept.
+
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
 Goal: once a year the bot posts a compilation of the best clips.
@@ -313,12 +431,52 @@ Tasks:
 
 Acceptance: run the recap against last year's test data and get a watchable video with correct ordering and credits.
 
-### Phase 6. Editing in the desktop app. Three weeks, after everything above works.
+### Phase 6. Editing in the desktop app. Cutting done 2026-09-11.
 
-- Trim: a timeline under a video preview with in and out handles. Preview plays the local H.264 file through the webview.
-- Simple cuts: remove a middle section, join the two parts. Still done through ffmpeg, no custom video code.
-- Re-upload of an edited clip replaces the object and keeps the same clip id and Discord post.
-- Later ideas, not planned: overlays, slow motion, audio ducking.
+The scope was narrowed to cutting, which is what a clipper actually needs: trim the ends,
+take out the middle, put it back on the site under the same link.
+
+What exists:
+
+- An editor screen (`editor.ts`, reached from the player's strip, its rail button or `E`)
+  with the clip above a timeline: a ruler, a filmstrip drawn from a second decoder, every
+  kept part outlined with draggable in and out handles, removed ranges hatched with a "keep"
+  button to restore them, and a playhead. Split at the playhead, set in and out, remove a
+  part, undo and redo, precise in/out fields, zoom (1 to 12x, Ctrl+wheel), and playback that
+  skips the removed ranges so the preview is what the clip will be. Keys are the ones every
+  trimmer shares: I, O, S, Delete, [ and ], Ctrl+Z, Ctrl+Enter.
+- A cut is a list of kept ranges (`ffmpeg::Segment`) on the clip row (`cut`, schema v4),
+  measured against the original recording. Apply puts the row back to `saved`; the worker
+  re-encodes both outputs from the recording (one range through `-ss`/`-to`, several through a
+  `trim`/`concat` filter graph in the same pass), takes the thumbnail from inside the kept
+  footage, records the new length, and re-uploads.
+- Non-destructive while the recording is on disk: the editor reopens on the whole recording
+  with the cut drawn on it, and Reset undoes it. Once the recording has been dropped by the
+  Storage tab, the H.264 copy is the source, the cut is baked in and the editor asks for a
+  second click on Apply and says why.
+- `POST /clips/:id/replace` on the backend re-signs the three PUT URLs for the same keys, so
+  the clip id, the page URL and the Discord post survive. `/complete` no longer pings the bot
+  for a replace. The row stays `ready` throughout, since a PUT to an existing key is atomic.
+
+Verified 2026-09-11 in `tauri dev` with uploads off: a 14.65 s desktop recording was split at
+5 s and 10 s and the middle removed; the queue re-encoded it with two kept parts and both
+outputs probe at 9.63 s (the source keeps its 14.65 s), the card shows 0:10, the editor reopens
+with the cut drawn and Apply disabled until something changes. A three-part cut on a generated
+sample, with and without an audio stream, is in `cargo test ffmpeg::tests::end_to_end`; the
+replace route has a backend test; the re-encode request has a queue test.
+
+What changed from the plan and why:
+
+- The replace path was **not** exercised against production: the backend has to be deployed
+  with the new route first, and the desktop deliberately fails (and retries) rather than
+  creating a second clip when it meets a backend without it.
+- Discord caches an embed on first crawl, so a replaced video shows up in the existing
+  post's inline player only when Discord's media proxy refetches it; an attachment post keeps
+  the old file. The link is right either way. Re-posting is a bot change for later.
+- Not done: "save as a new clip" (two highlights out of one buffer). The source path is unique
+  per row, so it needs a copy or a hard link of the recording and a decision about how the
+  Storage tab counts it.
+- Later ideas, still not planned: overlays, slow motion, audio ducking.
 
 ## 5. Cross-cutting work
 

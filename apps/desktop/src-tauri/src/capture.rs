@@ -1,13 +1,18 @@
-//! Replay buffer on top of embedded libobs.
+//! Replay buffer and session recording on top of embedded libobs.
 //!
 //! The scene has two layers: a monitor capture of the primary display underneath and a
 //! game capture of any fullscreen application on top. When a game is hooked it covers the
 //! monitor layer; otherwise the desktop is what gets recorded. Desktop audio is mixed in.
+//!
+//! A session recording writes the same scene to a file for as long as a supported game runs.
+//! It shares the replay buffer's encoders rather than opening its own, so recording a whole
+//! session costs disk, not a second hardware encode.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use libobs_simple::output::replay::ObsContextReplayExt;
 use libobs_simple::output::simple::{HardwareCodec, HardwarePreset};
 use libobs_simple::sources::windows::{
@@ -15,13 +20,25 @@ use libobs_simple::sources::windows::{
     ObsGameCaptureMode, ObsHookableSourceSignals, ObsHookableSourceTrait,
 };
 use libobs_wrapper::context::ObsContext;
-use libobs_wrapper::data::output::{ObsOutputTrait, ObsReplayBufferOutputRef};
+use libobs_wrapper::data::object::ObsObjectTrait;
+use libobs_wrapper::data::output::{ObsOutputRef, ObsOutputTrait, ObsReplayBufferOutputRef};
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::data::ObsDataSetters;
 use libobs_wrapper::encoders::ObsContextEncoders;
 use libobs_wrapper::scenes::SceneItemExtSceneTrait;
 use libobs_wrapper::sources::ObsSourceBuilder;
-use libobs_wrapper::utils::{ObsPath, SourceInfo, StartupInfo};
+use libobs_wrapper::utils::{ObsPath, OutputInfo, SourceInfo, StartupInfo};
+
+/// Output types tried for a session recording, best first. `mp4_output` is OBS's hybrid MP4:
+/// an ordinary MP4 to every player, and still readable after a crash because it writes as it
+/// goes. `ffmpeg_muxer` is the classic recorder, kept for a runtime without the first, with
+/// fragmented MP4 flags for the same crash safety.
+const SESSION_OUTPUTS: [&str; 2] = ["mp4_output", "ffmpeg_muxer"];
+
+/// How long a started recording may report itself inactive before it counts as lost. An
+/// output that failed after a successful start (a muxer that died, a full disk) stops being
+/// active; one that just started may take a moment to say it is.
+const START_SETTLE: Duration = Duration::from_secs(5);
 
 use crate::settings::Settings;
 
@@ -77,12 +94,23 @@ fn foreground_conflict() -> Result<Option<CaptureConflict>> {
     }))
 }
 
+/// The session recording that is running right now.
+struct SessionRecording {
+    output: ObsOutputRef,
+    path: PathBuf,
+    started: Instant,
+}
+
 pub struct Recorder {
-    // Declared before `_context` so the signal manager disconnects while the OBS runtime is
+    // Declared before `context` so the signal manager disconnects while the OBS runtime is
     // still alive. Dropping it closes the broadcast channels, which ends the hook thread.
     _game_signals: Arc<ObsHookableSourceSignals>,
     hooked: Arc<Mutex<Option<HookedGame>>>,
-    _context: ObsContext,
+    session: Option<SessionRecording>,
+    /// Session outputs created so far, by output type. Reused with a new path for every
+    /// recording, because the context keeps every output it ever created.
+    session_outputs: Vec<(&'static str, ObsOutputRef)>,
+    context: ObsContext,
     replay: ObsReplayBufferOutputRef,
     encoder_id: String,
 }
@@ -183,7 +211,9 @@ impl Recorder {
         Ok(Self {
             _game_signals: game_signals,
             hooked,
-            _context: context,
+            session: None,
+            session_outputs: Vec::new(),
+            context,
             replay,
             encoder_id,
         })
@@ -201,6 +231,112 @@ impl Recorder {
 
     pub fn is_active(&self) -> bool {
         self.replay.is_active().unwrap_or(false)
+    }
+
+    /// Starts writing the scene to `path` until `stop_recording`, on the replay buffer's own
+    /// encoders. The replay buffer keeps running alongside.
+    pub fn start_recording(&mut self, path: &Path) -> Result<()> {
+        if self.session.is_some() {
+            bail!("a session recording is already running");
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let path_text = path
+            .to_str()
+            .context("recording path is not valid UTF-8")?
+            .to_string();
+        let mut last_error = None;
+        for kind in SESSION_OUTPUTS {
+            match self.start_session_output(kind, &path_text) {
+                Ok(output) => {
+                    log::info!("session recording started with {kind}: {}", path.display());
+                    self.session = Some(SessionRecording {
+                        output,
+                        path: path.to_path_buf(),
+                        started: Instant::now(),
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("session recording with {kind} did not start: {e:#}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no session output type available")))
+            .context("starting the session recording")
+    }
+
+    fn start_session_output(&mut self, kind: &'static str, path: &str) -> Result<ObsOutputRef> {
+        let mut settings = self.context.data()?;
+        settings.set_string("path", path)?;
+        if kind == "ffmpeg_muxer" {
+            settings.set_string("muxer_settings", "movflags=frag_keyframe+empty_moov+default_base_moof")?;
+        }
+        let output = match self.session_outputs.iter().find(|(k, _)| *k == kind) {
+            Some((_, existing)) => {
+                existing.update_settings(settings).context("updating the output path")?;
+                existing.clone()
+            }
+            None => {
+                let mut output = self
+                    .context
+                    .output(OutputInfo::new(kind, format!("session_{kind}"), Some(settings), None))
+                    .with_context(|| format!("creating {kind} output"))?;
+                let video = self
+                    .replay
+                    .get_current_video_encoder()?
+                    .context("the replay buffer has no video encoder to share")?;
+                output.set_video_encoder(video).context("sharing the video encoder")?;
+                let audio: Vec<_> = self
+                    .replay
+                    .audio_encoders()
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("audio encoder lock poisoned: {e}"))?
+                    .iter()
+                    .map(|(mixer, encoder)| (*mixer, encoder.clone()))
+                    .collect();
+                for (mixer, encoder) in audio {
+                    output
+                        .set_audio_encoder(encoder, mixer)
+                        .context("sharing the audio encoder")?;
+                }
+                self.session_outputs.push((kind, output.clone()));
+                output
+            }
+        };
+        output.start().with_context(|| format!("starting {kind}"))?;
+        Ok(output)
+    }
+
+    /// Stops the session recording and waits until the file is closed. `None` when nothing
+    /// was recording.
+    pub fn stop_recording(&mut self) -> Result<Option<PathBuf>> {
+        let Some(mut recording) = self.session.take() else {
+            return Ok(None);
+        };
+        let active = recording.output.is_active().unwrap_or(false);
+        if active {
+            recording
+                .output
+                .stop()
+                .with_context(|| format!("stopping the recording {}", recording.path.display()))?;
+        }
+        log::info!("session recording stopped: {}", recording.path.display());
+        Ok(Some(recording.path))
+    }
+
+    /// The file the session recording is writing, while it is. A recording whose output died
+    /// after starting reads as `None`, so the session watch starts a fresh one.
+    pub fn recording_path(&self) -> Option<PathBuf> {
+        let recording = self.session.as_ref()?;
+        let settled = recording.started.elapsed() >= START_SETTLE;
+        if settled && !recording.output.is_active().unwrap_or(false) {
+            return None;
+        }
+        Some(recording.path.clone())
     }
 }
 
@@ -287,6 +423,12 @@ fn pick_h264_encoder(context: &ObsContext) -> Result<String> {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        // The session recording shares the replay buffer's encoders, so it closes its file
+        // first. The session watch notices the recording is gone and starts a new one on the
+        // next recorder.
+        if let Err(e) = self.stop_recording() {
+            log::warn!("stopping session recording: {e:#}");
+        }
         if let Err(e) = self.replay.stop() {
             log::warn!("stopping replay buffer: {e}");
         }

@@ -456,6 +456,7 @@ mod tests {
                 duration_ms: 30_000,
                 width: 1920,
                 height: 1080,
+                fps: 60.0,
                 size_source: bytes as i64,
             })
             .unwrap()
@@ -477,6 +478,7 @@ mod tests {
                     thumb_path,
                     size_av1: av1 as i64,
                     size_h264: h264 as i64,
+                    duration_ms: None,
                 },
             )
             .unwrap();

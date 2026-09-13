@@ -6,9 +6,8 @@
 // of the parts, so post.js, reactions.js, commands.js and outbox.js stay independently
 // testable with fakes.
 
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
-
 import { loadConfig } from './config.js';
+import { createClient } from './client.js';
 import { createBackend } from './backend.js';
 import { createServer } from './server.js';
 import { createPoster } from './post.js';
@@ -55,15 +54,8 @@ try {
 
 const log = createLog(config.LOG_LEVEL);
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
-  ],
-  // Partials let us receive reactions on messages sent before the bot started.
-  partials: [Partials.Message, Partials.Reaction],
-});
+// Intents, partials and the allowedMentions default live in client.js so they can be tested.
+const client = createClient();
 
 const backend = createBackend({
   baseUrl: config.BACKEND_URL,

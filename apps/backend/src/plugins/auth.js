@@ -6,13 +6,11 @@
 //
 // Exported without an encapsulation context so the decorators are visible app-wide.
 
-import { timingSafeEqual } from 'node:crypto';
-
 import jwt from '@fastify/jwt';
 import { eq } from 'drizzle-orm';
 
 import { schema } from '../db/index.js';
-import { hashToken } from '../lib/tokens.js';
+import { constantTimeEqual, hashToken } from '../lib/tokens.js';
 
 const LAST_SEEN_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -21,19 +19,17 @@ const LAST_SEEN_INTERVAL_MS = 5 * 60 * 1000;
  * @typedef {{ id: number, name: string }} AuthDevice
  */
 
-/** @param {import('fastify').FastifyRequest} request */
-function bearer(request) {
+/**
+ * The `Authorization: Bearer <value>` value, or null if the header is missing or malformed.
+ * Exported because routes/auth.js reads the device-login poll secret the same way.
+ * @param {import('fastify').FastifyRequest} request
+ */
+export function bearer(request) {
   const header = request.headers.authorization;
   if (typeof header !== 'string') return null;
   const [scheme, value, ...rest] = header.trim().split(/\s+/);
   if (!value || rest.length || scheme.toLowerCase() !== 'bearer') return null;
   return value;
-}
-
-function constantEqual(a, b) {
-  const ab = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
-  return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
 /** @param {import('fastify').FastifyInstance} app */
@@ -87,7 +83,7 @@ async function plugin(app) {
   /** @type {import('fastify').preHandlerAsyncHookHandler} */
   async function authenticateBot(request, reply) {
     const token = bearer(request);
-    if (!token || !constantEqual(token, app.config.BOT_SHARED_SECRET)) {
+    if (!token || !constantTimeEqual(token, app.config.BOT_SHARED_SECRET)) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
   }

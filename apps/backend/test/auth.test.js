@@ -54,7 +54,7 @@ before(async () => {
 });
 after(() => stub.server.close());
 
-test('device flow: start, redirect, callback, poll, me, revoke', async () => {
+test('device flow: start, confirm, callback, poll, me, revoke', async () => {
   const app = await testApp({ DISCORD_API_BASE: stub.base });
   try {
     // 1. Desktop starts a login.
@@ -64,18 +64,72 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
       payload: { deviceName: 'gaming-pc' },
     });
     assert.equal(start.statusCode, 200);
-    const { code, verifyUrl, expiresIn } = start.json();
+    const { code, verifyUrl, pollSecret, expiresIn } = start.json();
     assert.match(code, /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/);
     assert.equal(verifyUrl, `http://localhost:3000/auth/discord/start?device=${code}`);
     assert.equal(expiresIn, 600);
+    // The poll secret is a fresh 32-byte token, and only its hash is stored.
+    assert.match(pollSecret, /^[A-Za-z0-9_-]{43}$/);
+    const [loginRow] = await app.db.select().from(schema.deviceLogins);
+    assert.equal(loginRow.pollSecretHash, hashToken(pollSecret));
+    assert.notEqual(loginRow.pollSecretHash, pollSecret);
 
-    // 2. Polling before the browser finished is pending.
-    let poll = await app.inject({ method: 'GET', url: `/auth/device/${code}` });
-    assert.equal(poll.statusCode, 200);
-    assert.deepEqual(poll.json(), { status: 'pending' });
+    const poll = (secret) =>
+      app.inject({
+        method: 'GET',
+        url: `/auth/device/${code}`,
+        ...(secret === undefined ? {} : { headers: { authorization: `Bearer ${secret}` } }),
+      });
 
-    // 3. Browser opens the verify URL and is sent to Discord with our state.
-    const redirect = await app.inject({ method: 'GET', url: `/auth/discord/start?device=${code}` });
+    // 2. Polling before the browser finished is pending, but only for the holder of the secret.
+    let polled = await poll(pollSecret);
+    assert.equal(polled.statusCode, 200);
+    assert.deepEqual(polled.json(), { status: 'pending' });
+
+    // 3. Browser opens the verify URL. It must NOT be sent to Discord: it gets a confirmation
+    // page naming the device and the code first.
+    const confirm = await app.inject({ method: 'GET', url: `/auth/discord/start?device=${code}` });
+    assert.equal(confirm.statusCode, 200);
+    assert.match(confirm.headers['content-type'], /text\/html/);
+    assert.equal(confirm.headers.location, undefined, 'GET start must never redirect');
+    assert.match(confirm.body, /gaming-pc/);
+    assert.ok(confirm.body.includes(code), 'the page shows the code to check against the app');
+    assert.match(confirm.body, /Only continue if this code is showing in the Cos Nostra app/);
+    assert.match(confirm.body, /<form method="post" action="\/auth\/discord\/start">/);
+
+    // An auto-submitting form on someone else's page cannot stand in for that click.
+    const crossSite = await app.inject({
+      method: 'POST',
+      url: '/auth/discord/start',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        origin: 'https://evil.example',
+      },
+      payload: `device=${code}`,
+    });
+    assert.equal(crossSite.statusCode, 403);
+    assert.equal(crossSite.headers.location, undefined);
+
+    // Neither can a sandboxed iframe or a data: page, which send the literal "null" origin.
+    const nullOrigin = await app.inject({
+      method: 'POST',
+      url: '/auth/discord/start',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'null' },
+      payload: `device=${code}`,
+    });
+    assert.equal(nullOrigin.statusCode, 403);
+    assert.equal(nullOrigin.headers.location, undefined);
+
+    // 4. Clicking Continue posts the form and only then are we sent to Discord with our state.
+    const redirect = await app.inject({
+      method: 'POST',
+      url: '/auth/discord/start',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        origin: 'http://localhost:3000',
+      },
+      payload: `device=${code}`,
+    });
     assert.equal(redirect.statusCode, 302);
     const location = new URL(redirect.headers.location);
     assert.equal(location.origin + location.pathname, 'https://discord.com/oauth2/authorize');
@@ -90,7 +144,7 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
     assert.ok(state);
     assert.deepEqual(app.jwt.verify(state).device, code);
 
-    // 4. Discord sends the browser back; the backend links the device.
+    // 5. Discord sends the browser back; the backend links the device.
     const callback = await app.inject({
       method: 'GET',
       url: `/auth/discord/callback?code=good-code&state=${encodeURIComponent(state)}`,
@@ -98,6 +152,8 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
     assert.equal(callback.statusCode, 200);
     assert.match(callback.headers['content-type'], /text\/html/);
     assert.match(callback.body, /Device linked/);
+    // The success page names the device again, so linking the wrong machine is visible.
+    assert.match(callback.body, /Linked gaming-pc\. You can close this tab\./);
     assert.equal(stub.seen.tokenRequests.length, 1);
     assert.equal(stub.seen.tokenRequests[0].client_secret, 'client-secret');
     assert.equal(stub.seen.tokenRequests[0].grant_type, 'authorization_code');
@@ -124,10 +180,22 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
     assert.equal(again.statusCode, 400);
     assert.match(again.body, /Already linked/);
 
-    // 5. Poll returns the token exactly once.
-    poll = await app.inject({ method: 'GET', url: `/auth/device/${code}` });
-    assert.equal(poll.statusCode, 200);
-    const ready = poll.json();
+    // 6. A poll without the secret, or with the wrong one, cannot collect the ready token.
+    for (const secret of [undefined, newToken(), '', hashToken(pollSecret)]) {
+      polled = await poll(secret);
+      assert.equal(polled.statusCode, 401, `should reject poll secret ${JSON.stringify(secret)}`);
+      assert.deepEqual(polled.json(), { error: 'unauthorized' });
+    }
+    assert.equal(
+      (await app.db.select().from(schema.deviceLogins)).length,
+      1,
+      'a refused poll leaves the login row alone',
+    );
+
+    // 7. The right secret returns the token exactly once.
+    polled = await poll(pollSecret);
+    assert.equal(polled.statusCode, 200);
+    const ready = polled.json();
     assert.equal(ready.status, 'ready');
     assert.equal(typeof ready.token, 'string');
     assert.equal(hashToken(ready.token), devices[0].tokenHash);
@@ -137,13 +205,14 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
       username: 'benja',
       avatar: 'abc123',
     });
-    poll = await app.inject({ method: 'GET', url: `/auth/device/${code}` });
-    assert.equal(poll.statusCode, 404);
-    assert.deepEqual(poll.json(), { error: 'unknown_code' });
+    // The row is gone, so even the rightful holder now looks like anyone else: 401, not 404.
+    polled = await poll(pollSecret);
+    assert.equal(polled.statusCode, 401);
+    assert.deepEqual(polled.json(), { error: 'unauthorized' });
     const logins = await app.db.select().from(schema.deviceLogins);
     assert.equal(logins.length, 0, 'login row is gone once the token was collected');
 
-    // 6. The token authenticates; nothing else does.
+    // 8. The token authenticates; nothing else does.
     const me = await app.inject({
       method: 'GET',
       url: '/auth/me',
@@ -163,7 +232,7 @@ test('device flow: start, redirect, callback, poll, me, revoke', async () => {
       assert.deepEqual(res.json(), { error: 'unauthorized' });
     }
 
-    // 7. Revoke, then the token is dead.
+    // 9. Revoke, then the token is dead.
     const revoke = await app.inject({
       method: 'DELETE',
       url: '/auth/device',
@@ -214,26 +283,46 @@ test('bad input: unknown codes, bad state, discord failures, expired logins', as
     assert.equal(res.json().error, 'bad_request');
     assert.ok(Array.isArray(res.json().issues));
 
-    res = await app.inject({ method: 'GET', url: '/auth/device/NOPE' });
-    assert.equal(res.statusCode, 404);
-    res = await app.inject({ method: 'GET', url: '/auth/device/ABCDEFGH' });
-    assert.equal(res.statusCode, 404);
-    assert.deepEqual(res.json(), { error: 'unknown_code' });
+    // A malformed code, an unknown code and a real code polled without a secret are all the
+    // same 401, so polling tells an attacker nothing about which codes exist.
+    for (const url of ['/auth/device/NOPE', '/auth/device/ABCDEFGH']) {
+      for (const headers of [{}, { authorization: `Bearer ${newToken()}` }]) {
+        res = await app.inject({ method: 'GET', url, headers });
+        assert.equal(res.statusCode, 401);
+        assert.deepEqual(res.json(), { error: 'unauthorized' });
+      }
+    }
 
     res = await app.inject({ method: 'GET', url: '/auth/discord/start?device=ABCDEFGH' });
     assert.equal(res.statusCode, 400);
     assert.match(res.headers['content-type'], /text\/html/);
+    assert.match(res.body, /Unknown or expired code/);
     res = await app.inject({ method: 'GET', url: '/auth/discord/start' });
     assert.equal(res.statusCode, 400);
+
+    // The POST behind Continue validates the code the same way, so it cannot be used to skip
+    // the interstitial with a stale or made-up code.
+    for (const payload of ['device=ABCDEFGH', 'device=nope', '']) {
+      res = await app.inject({
+        method: 'POST',
+        url: '/auth/discord/start',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        payload,
+      });
+      assert.equal(res.statusCode, 400, `should refuse body ${JSON.stringify(payload)}`);
+      assert.match(res.headers['content-type'], /text\/html/);
+      assert.equal(res.headers.location, undefined);
+    }
 
     res = await app.inject({ method: 'GET', url: '/auth/discord/callback?code=x&state=garbage' });
     assert.equal(res.statusCode, 400);
     assert.match(res.body, /invalid or has expired/);
 
     // Valid state but Discord rejects the code -> 502, nothing linked.
-    const { code } = (
+    const { code, pollSecret } = (
       await app.inject({ method: 'POST', url: '/auth/device', payload: { deviceName: 'pc' } })
     ).json();
+    const auth = { authorization: `Bearer ${pollSecret}` };
     const state = app.jwt.sign({ device: code }, { expiresIn: '10m' });
     res = await app.inject({
       method: 'GET',
@@ -241,7 +330,7 @@ test('bad input: unknown codes, bad state, discord failures, expired logins', as
     });
     assert.equal(res.statusCode, 502);
     assert.equal((await app.db.select().from(schema.devices)).length, 0);
-    res = await app.inject({ method: 'GET', url: `/auth/device/${code}` });
+    res = await app.inject({ method: 'GET', url: `/auth/device/${code}`, headers: auth });
     assert.deepEqual(res.json(), { status: 'pending' });
 
     // User cancels on Discord -> 400, still pending.
@@ -252,16 +341,55 @@ test('bad input: unknown codes, bad state, discord failures, expired logins', as
     assert.equal(res.statusCode, 400);
     assert.match(res.body, /cancelled/);
 
-    // Expire the login: start refuses it, poll 404s and the row is cleaned up.
+    // Expire the login: start refuses it, poll 401s and the row is cleaned up.
     await app.db
       .update(schema.deviceLogins)
       .set({ expiresAt: new Date(Date.now() - 1000) })
       .where(eq(schema.deviceLogins.code, code));
     res = await app.inject({ method: 'GET', url: `/auth/discord/start?device=${code}` });
     assert.equal(res.statusCode, 400);
-    res = await app.inject({ method: 'GET', url: `/auth/device/${code}` });
-    assert.equal(res.statusCode, 404);
+    res = await app.inject({ method: 'GET', url: `/auth/device/${code}`, headers: auth });
+    assert.equal(res.statusCode, 401);
     assert.equal((await app.db.select().from(schema.deviceLogins)).length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a login that expires after linking takes its uncollected device with it', async () => {
+  const app = await testApp({ DISCORD_API_BASE: stub.base });
+  try {
+    const { code, pollSecret } = (
+      await app.inject({ method: 'POST', url: '/auth/device', payload: { deviceName: 'orphan-pc' } })
+    ).json();
+    const state = app.jwt.sign({ device: code }, { expiresIn: '10m' });
+    const callback = await app.inject({
+      method: 'GET',
+      url: `/auth/discord/callback?code=good-code&state=${encodeURIComponent(state)}`,
+    });
+    assert.equal(callback.statusCode, 200);
+    assert.equal((await app.db.select().from(schema.devices)).length, 1);
+
+    // The desktop never came back for the token, and the code ran out. The device row holds a
+    // working credential nobody was ever handed, so it must not survive the login row.
+    await app.db
+      .update(schema.deviceLogins)
+      .set({ expiresAt: new Date(Date.now() - 1000) })
+      .where(eq(schema.deviceLogins.code, code));
+    const res = await app.inject({
+      method: 'GET',
+      url: `/auth/device/${code}`,
+      headers: { authorization: `Bearer ${pollSecret}` },
+    });
+    assert.equal(res.statusCode, 401);
+    assert.equal((await app.db.select().from(schema.deviceLogins)).length, 0);
+    assert.equal(
+      (await app.db.select().from(schema.devices)).length,
+      0,
+      'the orphaned device is deleted with the expired login',
+    );
+    // The user row stays: it is not the login's to delete.
+    assert.equal((await app.db.select().from(schema.users)).length, 1);
   } finally {
     await app.close();
   }

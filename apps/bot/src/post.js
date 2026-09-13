@@ -46,6 +46,20 @@ const MAX_CONTENT = 2000;
 const MAX_TITLE = 256;
 
 /**
+ * Mentions this module is willing to send: none.
+ *
+ * The content below carries a clip title and an owner username, neither of which the bot
+ * controls - a title of "@everyone" or "<@&12345>" typed in the desktop app would otherwise
+ * make the bot ping the whole server. The client in client.js already defaults to this; it is
+ * repeated on every payload so a change to that default cannot quietly re-open it. A fresh
+ * object per message, because discord.js resolves the payload in place.
+ * @returns {import('discord.js').MessageMentionOptions}
+ */
+function noMentions() {
+  return { parse: [] };
+}
+
+/**
  * @param {string} value
  * @param {number} max
  */
@@ -184,6 +198,7 @@ export function createPoster({
         return {
           content: messageContent(clip, { unfurl: false }),
           files: [new AttachmentBuilder(bytes, { name: attachmentName(clip) })],
+          allowedMentions: noMentions(),
         };
       } catch (err) {
         // Small enough to attach, but we could not get the bytes. The link still works.
@@ -201,7 +216,7 @@ export function createPoster({
     // 2026-09-11 — a rich embed plus a bare URL produced one `type=rich` embed and no
     // player, while the URL alone produced `type=video` at 1920x1080. The page's og: tags
     // already supply the title, owner, game, duration and thumbnail, so nothing is lost.
-    return { content: messageContent(clip, { unfurl: true }) };
+    return { content: messageContent(clip, { unfurl: true }), allowedMentions: noMentions() };
   }
 
   /**

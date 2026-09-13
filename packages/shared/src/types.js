@@ -52,8 +52,9 @@ export const CLIP_STATUSES = Object.freeze(['pending', 'ready', 'failed', 'delet
  * @property {number} durationMs
  * @property {number} width
  * @property {number} height
- * @property {number} sizeAv1
- * @property {number} sizeH264
+ * @property {number} sizeAv1   exact byte length of the AV1 file; signed into its upload URL
+ * @property {number} sizeH264  exact byte length of the H.264 file
+ * @property {number} sizeThumb exact byte length of the thumbnail
  * @property {string} recordedAt  ISO 8601
  */
 
@@ -86,19 +87,20 @@ export const CLIP_STATUSES = Object.freeze(['pending', 'ready', 'failed', 'delet
 /**
  * Response of POST /auth/device.
  * @typedef {object} DeviceLoginStart
- * @property {string} code
- * @property {string} verificationUrl  open this in the browser
+ * @property {string} code  8 characters, shown to the user so they can check it in the browser
+ * @property {string} verifyUrl  open this in the browser; it carries the code
+ * @property {string} pollSecret  send as `Authorization: Bearer` when polling. Shown once, never
+ *   put in a URL or on screen: it is what proves a poll comes from the app that started the login
  * @property {number} expiresIn  seconds
- * @property {number} interval  suggested poll interval in seconds
  */
 
 /**
- * Response of GET /auth/device/:code.
+ * Response of GET /auth/device/:code. Requires the pollSecret as a bearer token; a missing or
+ * wrong secret is a 401, whether or not the code exists.
  * @typedef {object} DeviceLoginPoll
- * @property {'pending' | 'linked' | 'expired'} status
- * @property {string} [token]  present when status is "linked"
- * @property {User} [user]
- * @property {Device} [device]
+ * @property {'pending' | 'ready'} status
+ * @property {string} [token]  the device token, present exactly once, when status is "ready"
+ * @property {User | null} [user]
  */
 
 /**

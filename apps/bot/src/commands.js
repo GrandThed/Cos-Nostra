@@ -4,7 +4,7 @@
 //   /clips latest                     the newest ready clip, as an embed
 //   /clips top [year] [game]          the yearly leaderboard for this guild
 //   /clips mine                       the caller's own clips, ephemeral
-//   /clips link                       start a device login for the desktop app, ephemeral
+//   /clips link                       how to link the desktop app, ephemeral
 //
 // Every subcommand defers first: Discord discards an interaction that is not acknowledged in
 // three seconds and all five have to cross the network to the backend. Ephemeral-ness is
@@ -30,9 +30,6 @@ const TEXT_CHANNELS = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
 /** Subcommands whose reply only the caller should see. */
 const EPHEMERAL = new Set(['setup', 'mine', 'link']);
-
-/** Device-login method names, most likely first. packages/shared calls it startDeviceLogin. */
-const DEVICE_LOGIN_METHODS = ['startDeviceLogin', 'createDeviceLogin', 'deviceLogin', 'startLogin'];
 
 // ---- command definition ----------------------------------------------------------------
 
@@ -76,7 +73,7 @@ const clips = new SlashCommandBuilder()
     sub.setName('mine').setDescription('Show your own clips (only you see the reply)'),
   )
   .addSubcommand((sub) =>
-    sub.setName('link').setDescription('Link the Cos Nostra desktop app to your Discord account'),
+    sub.setName('link').setDescription('How to link the Cos Nostra desktop app to your account'),
   );
 
 /**
@@ -84,6 +81,37 @@ const clips = new SlashCommandBuilder()
  * @type {import('discord.js').RESTPostAPIApplicationCommandsJSONBody[]}
  */
 export const commands = [clips.toJSON()];
+
+// ---- replies ---------------------------------------------------------------------------
+
+/**
+ * Edits the deferred reply, with mentions disabled.
+ *
+ * Every reply goes through here because most of them interpolate text the bot does not
+ * control: clip titles and owner usernames from the backend, and the free-text `game` option
+ * of /clips top, which any member can set to "@everyone" or to a role id. `parse: []` makes
+ * Discord render those as plain text instead of pinging. The client in client.js already
+ * defaults to this; repeating it per payload means a change to that default cannot quietly
+ * turn a leaderboard into a server-wide ping. Channel mentions (`<#id>`) still render, as
+ * they never notify anyone.
+ *
+ * @param {any} interaction
+ * @param {import('discord.js').InteractionEditReplyOptions} payload
+ */
+function respond(interaction, payload) {
+  return interaction.editReply({ ...payload, allowedMentions: { parse: [] } });
+}
+
+/**
+ * Wraps user-supplied text in a code span so it reads as a quoted value rather than as
+ * markup. Backticks are stripped first, so the span cannot be closed early and the rest of
+ * the sentence cannot be turned into markdown. allowedMentions already stops the pings; this
+ * is about the message not being hijacked visually.
+ * @param {string} value
+ */
+function quoted(value) {
+  return `\`${String(value).replace(/`/g, '')}\``;
+}
 
 // ---- formatting ------------------------------------------------------------------------
 
@@ -187,40 +215,6 @@ function normalizeLog(log) {
   return { error: pick('error'), warn: pick('warn'), info: pick('info') };
 }
 
-// ---- device login ----------------------------------------------------------------------
-
-/**
- * Starts a device login for /clips link.
- *
- * backend.js does not expose the device-login call today (it is a public route, not an
- * /internal one), so this falls back to POST /auth/device directly. Add startDeviceLogin to
- * backend.js and the first branch takes over with no change here.
- *
- * @param {any} backend
- * @param {string} deviceName
- * @returns {Promise<{ code?: string, verifyUrl?: string, verificationUrl?: string, expiresIn?: number } | null>}
- */
-async function startDeviceLogin(backend, deviceName) {
-  const method = DEVICE_LOGIN_METHODS.find((name) => typeof backend?.[name] === 'function');
-  if (method) return backend[method](deviceName);
-
-  const baseUrl = String(backend?.baseUrl ?? process.env.BACKEND_URL ?? '').replace(/\/+$/, '');
-  if (!baseUrl) return null;
-  const res = await fetch(`${baseUrl}/auth/device`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ deviceName }),
-  });
-  if (!res.ok) {
-    // Shaped like the shared ApiError so humanError() treats it the same way.
-    const err = new Error(`POST /auth/device failed with status ${res.status}`);
-    err.name = 'ApiError';
-    err.status = res.status;
-    throw err;
-  }
-  return res.json();
-}
-
 // ---- subcommand handlers ---------------------------------------------------------------
 
 /**
@@ -236,7 +230,7 @@ async function startDeviceLogin(backend, deviceName) {
  */
 async function handleSetup(interaction, { backend, log }) {
   if (!interaction.guildId) {
-    return interaction.editReply({ content: 'Run this in the server you want clips posted to.' });
+    return respond(interaction, { content: 'Run this in the server you want clips posted to.' });
   }
 
   // The gate that counts: default_member_permissions cannot be scoped to one subcommand and
@@ -246,14 +240,14 @@ async function handleSetup(interaction, { backend, log }) {
     log.info(
       `/clips setup refused for ${interaction.user?.id} in ${interaction.guildId}: no Manage Server`,
     );
-    return interaction.editReply({
+    return respond(interaction, {
       content: 'You need the **Manage Server** permission to change the clip channel.',
     });
   }
 
   const channel = interaction.options.getChannel('channel');
   if (!channel || !TEXT_CHANNELS.includes(channel.type)) {
-    return interaction.editReply({
+    return respond(interaction, {
       content: 'Pick a normal text channel. Clips cannot be posted to that one.',
     });
   }
@@ -267,7 +261,7 @@ async function handleSetup(interaction, { backend, log }) {
   const seeds = saved?.seedEmojis ?? seedEmojis;
   const seedLine = Array.isArray(seeds) && seeds.length > 0 ? ` Seed reactions: ${seeds.join(' ')}` : '';
   log.info(`clip channel for guild ${interaction.guildId} set to ${channel.id}`);
-  return interaction.editReply({
+  return respond(interaction, {
     content: `New clips will be posted to <#${channel.id}>.${seedLine}`,
   });
 }
@@ -281,11 +275,11 @@ async function handleLatest(interaction, { backend }) {
   const { items = [] } = (await backend.listClips({ sort: 'recent', limit: 1 })) ?? {};
   const clip = items[0];
   if (!clip) {
-    return interaction.editReply({
+    return respond(interaction, {
       content: 'No clips yet. Press the hotkey in a game and this will fill up.',
     });
   }
-  return interaction.editReply({ embeds: [clipEmbed(clip)] });
+  return respond(interaction, { embeds: [clipEmbed(clip)] });
 }
 
 /**
@@ -295,7 +289,7 @@ async function handleLatest(interaction, { backend }) {
  */
 async function handleTop(interaction, { backend }) {
   if (!interaction.guildId) {
-    return interaction.editReply({ content: 'Rankings are per server, so run this in one.' });
+    return respond(interaction, { content: 'Rankings are per server, so run this in one.' });
   }
   const year = interaction.options.getInteger('year') ?? new Date().getUTCFullYear();
   const game = interaction.options.getString('game');
@@ -312,9 +306,10 @@ async function handleTop(interaction, { backend }) {
     : items;
 
   if (rows.length === 0) {
-    return interaction.editReply({
+    return respond(interaction, {
+      // The game name is whatever the caller typed, so it is quoted rather than echoed raw.
       content: game
-        ? `No ranked ${game} clips in ${year} yet.`
+        ? `No ranked ${quoted(game)} clips in ${year} yet.`
         : `No clips have been reacted to in ${year} yet.`,
     });
   }
@@ -332,7 +327,7 @@ async function handleTop(interaction, { backend }) {
   if (game) embed.setFooter({ text: `Filtered to ${game} within this year's top 10` });
   const best = rows[0]?.clip;
   if (isHttpUrl(best?.urls?.thumb)) embed.setThumbnail(best.urls.thumb);
-  return interaction.editReply({ embeds: [embed] });
+  return respond(interaction, { embeds: [embed] });
 }
 
 /**
@@ -344,7 +339,7 @@ async function handleMine(interaction, { backend }) {
   // The backend's `user` filter matches users.discord_id, which is exactly this id.
   const { items = [] } = (await backend.listClips({ user: interaction.user.id, limit: 5 })) ?? {};
   if (items.length === 0) {
-    return interaction.editReply({
+    return respond(interaction, {
       content:
         'You have no uploaded clips yet. Link the desktop app with `/clips link` and save one.',
     });
@@ -360,35 +355,33 @@ async function handleMine(interaction, { backend }) {
     .setTitle('Your clips')
     .setDescription(lines.join('\n'))
     .setFooter({ text: `Your ${items.length} most recent` });
-  return interaction.editReply({ embeds: [embed] });
+  return respond(interaction, { embeds: [embed] });
 }
 
 /**
- * /clips link - start a device login. The reply carries a login code, so it stays ephemeral.
+ * /clips link - explain how to link the desktop app. Ephemeral, because it is about the
+ * caller's own account.
+ *
+ * This used to start a device login here and hand back the code and the verify URL. That
+ * never worked and now cannot: only the process that calls POST /auth/device can finish the
+ * login, because the response's `pollSecret` is the bearer for GET /auth/device/:code and it
+ * is shown exactly once. A login the bot starts is therefore one the desktop can never
+ * collect - it always starts its own - so the old reply sent people through a Discord consent
+ * screen that linked a device nobody held, which then expired ten minutes later.
+ *
+ * Rather than leave that in, the command says where the real button is. Linking from the app
+ * is also the flow the confirmation page was designed around: the code on screen in the app
+ * is what the user checks the browser against.
+ *
  * @param {any} interaction
- * @param {HandlerContext} ctx
+ * @param {HandlerContext} _ctx
  */
-async function handleLink(interaction, { backend }) {
-  const deviceName = `Discord ${
-    interaction.user?.username ?? interaction.user?.id ?? 'user'
-  }`.slice(0, 100);
-  const login = await startDeviceLogin(backend, deviceName);
-  // routes/auth.js answers { code, verifyUrl, expiresIn }; the older shared typedef called it
-  // verificationUrl, so accept either.
-  const url = login?.verifyUrl ?? login?.verificationUrl;
-  if (!login?.code || !url) {
-    return interaction.editReply({
-      content: 'Device linking is not available right now. Ask an admin to check the bot setup.',
-    });
-  }
-  const expiresIn = Number(login.expiresIn);
-  const minutes = Number.isFinite(expiresIn) && expiresIn > 0 ? Math.max(1, Math.round(expiresIn / 60)) : null;
-  return interaction.editReply({
+async function handleLink(interaction, _ctx) {
+  return respond(interaction, {
     content: [
-      'Open this link, approve it with Discord, and the desktop app picks the login up on its own:',
-      url,
-      `Your code: **${login.code}**${minutes ? ` (expires in about ${minutes} minutes)` : ''}`,
-      'Only you can see this message. Do not share the code with anyone.',
+      'Link the desktop app from the app itself: open **Cos Nostra**, go to **Settings**, and press **Link Discord**.',
+      'It opens your browser and shows an eight-character code. Check that the page shows the same code before you press Continue, and never approve a link page you did not start yourself.',
+      'Once it says linked, your clips upload on their own.',
     ].join('\n'),
   });
 }
@@ -448,7 +441,7 @@ async function handleInteraction(interaction, { backend, log }) {
     log.error(`/clips ${sub} failed${status}: ${errorText(err)}`);
     if (!deferred) return;
     try {
-      await interaction.editReply({ content: humanError(err), embeds: [] });
+      await respond(interaction, { content: humanError(err), embeds: [] });
     } catch (editErr) {
       // The interaction token expires after 15 minutes; nothing left to do but log it.
       log.warn(`could not edit the deferred /clips ${sub} reply: ${errorText(editErr)}`);

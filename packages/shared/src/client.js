@@ -49,13 +49,16 @@ export function createClient(options) {
   /**
    * @param {'GET' | 'POST' | 'PUT' | 'DELETE'} method
    * @param {string} path
-   * @param {{ body?: unknown, auth?: 'user' | 'bot' | 'none' }} [opts]
+   * @param {{ body?: unknown, auth?: 'user' | 'bot' | 'none', bearer?: string }} [opts]
+   *   `bearer` overrides the configured token for a single call, for one-off credentials such as
+   *   the device-login poll secret that are not the client's own token.
    */
   async function request(method, path, opts = {}) {
     const headers = { accept: 'application/json' };
     const auth = opts.auth ?? 'user';
-    const bearer = auth === 'bot' ? botToken : auth === 'user' ? userToken : undefined;
-    if (bearer) headers.authorization = `Bearer ${bearer}`;
+    const token =
+      opts.bearer ?? (auth === 'bot' ? botToken : auth === 'user' ? userToken : undefined);
+    if (token) headers.authorization = `Bearer ${token}`;
     let body;
     if (opts.body !== undefined) {
       headers['content-type'] = 'application/json';
@@ -87,9 +90,19 @@ export function createClient(options) {
     /** @param {string} deviceName @returns {Promise<import('./types.js').DeviceLoginStart>} */
     startDeviceLogin: (deviceName) =>
       request('POST', '/auth/device', { body: { deviceName }, auth: 'none' }),
-    /** @param {string} code @returns {Promise<import('./types.js').DeviceLoginPoll>} */
-    pollDeviceLogin: (code) =>
-      request('GET', `/auth/device/${encodeURIComponent(code)}`, { auth: 'none' }),
+    /**
+     * Polls a pending device login. The `pollSecret` from startDeviceLogin goes on the wire as a
+     * bearer token: the code alone is not enough to collect the device token, and a wrong or
+     * missing secret is a 401 whether or not the code exists.
+     * @param {string} code
+     * @param {string} pollSecret  the `pollSecret` field of the startDeviceLogin response
+     * @returns {Promise<import('./types.js').DeviceLoginPoll>}
+     */
+    pollDeviceLogin: (code, pollSecret) =>
+      request('GET', `/auth/device/${encodeURIComponent(code)}`, {
+        auth: 'none',
+        bearer: pollSecret,
+      }),
     /** @returns {Promise<import('./types.js').User>} */
     me: () => request('GET', '/auth/me'),
 

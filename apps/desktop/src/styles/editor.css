@@ -1,0 +1,347 @@
+/* The cut editor. It borrows the player's frame (head, stage, transport, rail) and adds the
+   timeline: a ruler, a filmstrip, the kept parts drawn as bright ranges with accent handles,
+   the removed ranges hatched dark, and a playhead with a head in the ruler. */
+
+.editor .player-head .mode {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--acc);
+  border: 1px solid var(--acc);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+/* --- Timeline ------------------------------------------------------------ */
+
+.editor .timeline {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* Room for the outer handles, which hang 6 px past the track at either end; without it
+     they count as overflow and the strip grows a scrollbar at 1x. */
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+  user-select: none;
+  touch-action: none;
+}
+
+.editor .track {
+  position: relative;
+  width: 100%;
+  min-width: 100%;
+  height: 84px;
+  cursor: crosshair;
+}
+
+.editor .ruler {
+  position: relative;
+  height: 18px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--mut);
+}
+
+.editor .ruler .tick {
+  position: absolute;
+  top: 12px;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+
+.editor .ruler .tick.major {
+  top: 6px;
+  background: var(--mut);
+}
+
+.editor .ruler .tick.major i {
+  position: absolute;
+  left: 4px;
+  top: -7px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.editor canvas.film {
+  position: absolute;
+  left: 0;
+  top: 18px;
+  display: block;
+  width: 100%;
+  height: 56px;
+  background: linear-gradient(90deg, hsl(var(--hue) 20% 18%), hsl(var(--hue) 24% 12%));
+}
+
+.editor .gaps,
+.editor .parts {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 18px;
+  height: 56px;
+}
+
+/* Removed: hatched dark, with a way back under the pointer. */
+.editor .gap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(0, 0, 0, 0.6) 0 6px,
+    rgba(0, 0, 0, 0.72) 6px 12px
+  );
+}
+
+.editor .gap .restore {
+  border: 1px solid rgba(241, 234, 219, 0.5);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(12, 9, 4, 0.72);
+  color: var(--overVideoInk);
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.editor .gap:hover .restore {
+  opacity: 1;
+}
+
+/* Kept: an accent outline; the selected one is solid and lifted. */
+.editor .part {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border: 2px solid color-mix(in srgb, var(--acc) 70%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.editor .part.selected {
+  border-color: var(--acc);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acc) 60%, transparent);
+  z-index: 1;
+}
+
+.editor .part .len {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  background: var(--overVideo);
+  color: var(--overVideoInk);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.editor .part[data-narrow] .len {
+  display: none;
+}
+
+.editor .handle {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 10px;
+  border-radius: 4px;
+  background: var(--acc);
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 2;
+}
+
+.editor .handle::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 50%;
+  height: 12px;
+  transform: translateY(-50%);
+  border-left: 1px solid var(--accInk);
+  border-right: 1px solid var(--accInk);
+  opacity: 0.7;
+}
+
+.editor .handle.in {
+  left: -6px;
+}
+
+.editor .handle.out {
+  right: -6px;
+}
+
+.editor .handle:hover {
+  filter: brightness(1.1);
+}
+
+.editor .playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid var(--ink);
+  transform: translateX(-1px);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.editor .playhead .head {
+  position: absolute;
+  top: 0;
+  left: -7px;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 8px solid var(--ink);
+}
+
+/* --- Cut bar and controls ------------------------------------------------- */
+
+.cut-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cut-bar .field-label {
+  color: var(--mut);
+  font-size: 12px;
+}
+
+.cut-bar .field.mono {
+  width: 96px;
+  text-align: center;
+}
+
+.cut-bar .field:disabled {
+  color: var(--mut);
+  opacity: 0.6;
+}
+
+.editor .controls .skip[aria-pressed="true"] {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+.editor .controls .zoom {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.editor .controls .zoom button {
+  width: 22px;
+  height: 20px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.editor .controls .zoom .zoom-level {
+  min-width: 26px;
+  text-align: center;
+}
+
+/* --- Rail ---------------------------------------------------------------- */
+
+.editor .rail .summary {
+  font-size: 13px;
+}
+
+.editor .rail .summary b {
+  font-family: var(--display);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.editor .part-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.editor .part-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.editor .part-row:hover {
+  border-color: var(--mut);
+}
+
+.editor .part-row.selected {
+  border-color: var(--acc);
+  background: var(--panel2);
+}
+
+.editor .part-row .n {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--acc);
+  color: var(--accInk);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  line-height: 16px;
+}
+
+.editor .part-row .range {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.editor .part-row .mono {
+  font-size: 11px;
+}
+
+/* Waiting for a second click on the only copy: amber, like the Storage tab's cleanups. */
+.editor .btn.warn.armed {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #231a05;
+}
+
+@media (max-width: 840px) {
+  .editor .keys {
+    display: none;
+  }
+}

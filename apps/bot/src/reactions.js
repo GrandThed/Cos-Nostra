@@ -199,10 +199,12 @@ export function registerReactions({ client, backend, outbox, log }) {
    * @param {import('discord.js').User} user
    */
   async function handle(action, reaction, user) {
-    // 1. Resolve partials. With Partials.Message and Partials.Reaction the gateway delivers
-    //    reactions on messages the bot never saw, and nothing but the ids is readable until the
-    //    structures are fetched. A deleted message or a lost channel makes the fetch fail; that
-    //    is a warning and a skip, never a throw.
+    // 1. Resolve partials. With Partials.Message, Partials.Reaction and Partials.User (see
+    //    client.js) the gateway delivers reactions on messages the bot never saw and from users
+    //    it has never cached, and nothing but the ids is readable until the structures are
+    //    fetched. A deleted message or a lost channel makes the fetch fail; that is a warning
+    //    and a skip, never a throw. The user is deliberately never fetched: its id is all this
+    //    module sends to the backend, and step 2 explains why the bot flag can stay unknown.
     if (reaction?.partial) {
       try {
         // MessageReaction#fetch fetches the message too, so this usually covers both partials.
@@ -237,6 +239,14 @@ export function registerReactions({ client, backend, outbox, log }) {
 
     // 2. Never count a bot. The poster seeds two or three emojis on every clip so people have
     //    something to click; those are ours and are not votes. Other bots are ignored too.
+    //
+    //    Our own reactions are recognised by id, which a partial user always carries, so the
+    //    seeds are filtered whether or not the user is cached. The `bot` flag is not: on a
+    //    partial User it is undefined until the user is fetched, and this treats an unknown
+    //    flag as "not a bot" rather than spending an API call on every reaction event. The
+    //    cost of that choice is bounded - a third-party bot reacting to a clip post would be
+    //    counted once, and the backend counts distinct users, so it is one stray vote and not
+    //    a loop - while fetching would turn every reaction in a busy guild into a round trip.
     if (client.user?.id && userDiscordId === client.user.id) {
       logger.debug(`reaction ${action} on message ${messageId} is our own seed, ignored`);
       return;

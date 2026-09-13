@@ -1,4 +1,5 @@
-//! Small Win32 helpers shared by capture (conflict check) and game detection.
+//! Small Win32 helpers shared by capture (conflict check), game detection and the session
+//! watch.
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::HWND;
@@ -78,4 +79,34 @@ pub fn window_title(hwnd: HWND) -> String {
     // Safety: the buffer is valid for the call and Win32 bounds the copy by its length.
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
+/// File names of every running process, e.g. `cs2.exe`. One Toolhelp snapshot, which costs
+/// about a millisecond, so it is cheap enough to take every second. Needs no handle to any
+/// process, which matters for games behind a kernel anti-cheat.
+pub fn running_executables() -> Result<Vec<String>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // Safety: the snapshot handle is closed on every path; the entry is sized as the API wants.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .context("taking a process snapshot")?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut names = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+        names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    Ok(names)
 }

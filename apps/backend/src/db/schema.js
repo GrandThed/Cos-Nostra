@@ -49,6 +49,12 @@ export const deviceLogins = pgTable('device_logins', {
   deviceId: integer('device_id').references(() => devices.id, { onDelete: 'cascade' }),
   // The plaintext token, kept only until the desktop collects it, then nulled.
   token: text('token'),
+  // SHA-256 of the poll secret handed to the desktop once, in the POST /auth/device response.
+  // Only a caller holding that secret may poll this code, so the human-readable code is not the
+  // only thing between a stranger and the device token. The '' default is there so the migration
+  // cannot fail on a live row; hashToken() always returns 64 hex chars, never '', so a row left
+  // with the default can never be polled.
+  pollSecretHash: text('poll_secret_hash').notNull().default(''),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });

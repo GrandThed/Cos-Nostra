@@ -130,6 +130,7 @@ const validBody = {
   recordedAt: '2025-06-01T12:00:00.000Z',
   sizeAv1: 1000,
   sizeH264: 2000,
+  sizeThumb: 100,
 };
 
 test('ids are 12 base62 characters and unique', () => {
@@ -187,16 +188,17 @@ test('create, complete and read a clip', async () => {
     assert.equal(created.statusCode, 201, created.body);
     const { id, uploads, expiresIn } = created.json();
     assert.match(id, /^[0-9A-Za-z]{12}$/);
-    assert.equal(expiresIn, 3600);
+    assert.equal(expiresIn, 900);
     for (const [name, file] of [['av1', 'av1.mp4'], ['h264', 'h264.mp4'], ['thumb', 'thumb.jpg']]) {
       const url = new URL(uploads[name]);
       assert.equal(url.origin, 'http://127.0.0.1:9');
       assert.equal(url.pathname, `/test-bucket/clips/${user.id}/${id}/${file}`);
       assert.equal(url.searchParams.get('X-Amz-Algorithm'), 'AWS4-HMAC-SHA256');
-      assert.equal(url.searchParams.get('X-Amz-Expires'), '3600');
+      assert.equal(url.searchParams.get('X-Amz-Expires'), '900');
       assert.ok(url.searchParams.get('X-Amz-Signature'));
-      // The SDK leaves content-type unsigned so the uploader sets it on the PUT itself.
-      assert.equal(url.searchParams.get('X-Amz-SignedHeaders'), 'host');
+      // content-length is signed, so the URL can only write the size that was declared.
+      // content-type is not: the SDK drops it, and the uploader sets it on the PUT itself.
+      assert.equal(url.searchParams.get('X-Amz-SignedHeaders'), 'content-length;host');
     }
 
     // Pending clips are invisible.
@@ -286,6 +288,147 @@ test('create, complete and read a clip', async () => {
     assert.equal((await app.inject({ method: 'GET', url: `/clips/${id}/h264` })).statusCode, 404);
     res = await app.inject({ method: 'DELETE', url: `/clips/${id}`, headers: auth('tok-alice') });
     assert.equal(res.statusCode, 404);
+  } finally {
+    await app.close();
+  }
+});
+
+test('replace re-signs the same keys, keeps the id and does not re-post', async () => {
+  const app = await clipApp({ MAX_CLIP_MB: '10', USER_QUOTA_GB: '1' });
+  try {
+    const user = await makeUser(app, '500', 'editor', 'tok-editor');
+    await makeUser(app, '501', 'other', 'tok-other');
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-editor'),
+      payload: validBody,
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    const { id } = created.json();
+    const keys = {
+      av1: `clips/${user.id}/${id}/av1.mp4`,
+      h264: `clips/${user.id}/${id}/h264.mp4`,
+      thumb: `clips/${user.id}/${id}/thumb.jpg`,
+    };
+
+    // A clip that has not finished its first upload cannot be replaced.
+    const early = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 500, sizeH264: 900, sizeThumb: 80 },
+    });
+    assert.equal(early.statusCode, 409);
+    assert.equal(early.json().error, 'not_ready');
+
+    const objects = {
+      [keys.av1]: { size: 1000, contentType: 'video/mp4' },
+      [keys.h264]: { size: 2000, contentType: 'video/mp4' },
+      [keys.thumb]: { size: 100, contentType: 'image/jpeg' },
+    };
+    app.storage.head = async (key) => objects[key] ?? null;
+    let res = await app.inject({ method: 'POST', url: `/clips/${id}/complete`, headers: auth('tok-editor') });
+    assert.equal(res.statusCode, 200, res.body);
+    await waitForNotification(app, 1);
+    assert.deepEqual(app.notified, [id]);
+
+    // Not the owner, bad body, too large: refused before anything changes.
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-other'),
+      payload: { durationMs: 12000, sizeAv1: 500, sizeH264: 900, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 403);
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 0, sizeH264: 900, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 400);
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 11 * MB, sizeH264: 900, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 413);
+    assert.equal(res.json().file, 'av1');
+
+    // The replace: same keys, signed for the new sizes, row still readable meanwhile.
+    const signed = [];
+    const realPresign = app.storage.presignPut;
+    app.storage.presignPut = (key, contentType, expires, contentLength) => {
+      signed.push([key, contentLength]);
+      return realPresign(key, contentType, expires, contentLength);
+    };
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 500, sizeH264: 900, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(res.json().id, id);
+    assert.equal(res.json().expiresIn, 900);
+    assert.deepEqual(signed, [
+      [keys.av1, 500],
+      [keys.h264, 900],
+      [keys.thumb, 80],
+    ]);
+    for (const name of ['av1', 'h264', 'thumb']) {
+      assert.equal(new URL(res.json().uploads[name]).pathname, `/test-bucket/${keys[name]}`);
+    }
+    assert.equal((await app.inject({ method: 'GET', url: `/clips/${id}` })).statusCode, 200);
+    assert.equal((await app.inject({ method: 'GET', url: `/clips/${id}/h264` })).statusCode, 302);
+
+    // The second complete records what landed and stays quiet towards the bot.
+    objects[keys.av1].size = 512;
+    objects[keys.h264].size = 933;
+    res = await app.inject({ method: 'POST', url: `/clips/${id}/complete`, headers: auth('tok-editor') });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(res.json().durationMs, 12000);
+    assert.equal(res.json().sizeAv1, 512);
+    assert.equal(res.json().sizeH264, 933);
+    await sleep(60);
+    assert.deepEqual(app.notified, [id], 'no second Discord post');
+
+    // The quota counts the clip's own bytes as freed: with 1004 MB held elsewhere, a 20 MB
+    // replacement lands exactly on the 1 GiB line and one byte more does not.
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 10 * MB, sizeH264: 10 * MB, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const elsewhere = await insertReadyClip(app, user, {
+      sizeAv1: 502 * MB,
+      sizeH264: 502 * MB,
+      recordedAt: new Date('2025-06-01T00:00:00Z'),
+    });
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 10 * MB, sizeH264: 10 * MB, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 200, 'the clip being replaced does not count against itself');
+    await app.db
+      .update(clips)
+      .set({ sizeH264: 502 * MB + 1 })
+      .where(eq(clips.id, elsewhere.id));
+    res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/replace`,
+      headers: auth('tok-editor'),
+      payload: { durationMs: 12000, sizeAv1: 10 * MB, sizeH264: 10 * MB, sizeThumb: 80 },
+    });
+    assert.equal(res.statusCode, 413);
+    assert.equal(res.json().error, 'quota_exceeded');
   } finally {
     await app.close();
   }
@@ -421,6 +564,301 @@ test('listing filters, sorting, pagination and rankings', async () => {
 
     res = await app.inject({ method: 'GET', url: '/rankings?year=2025' });
     assert.equal(res.statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+// --- upload limits ---------------------------------------------------------------------
+// The three presigned PUTs are the only bucket write anyone outside the backend holds, so
+// these cover what one of them may write (the signed content-length) and how many of them a
+// single account may accumulate (the quota).
+
+const MB = 1024 * 1024;
+const GB = 1024 * MB;
+
+test('each upload URL is signed for exactly the size that was declared', async () => {
+  const app = await clipApp();
+  try {
+    await makeUser(app, '400', 'signed', 'tok-signed');
+    /** @type {Array<[string, number | undefined]>} */
+    const signed = [];
+    const realPresign = app.storage.presignPut;
+    app.storage.presignPut = (key, contentType, expires, contentLength) => {
+      signed.push([key.split('/').pop(), contentLength]);
+      return realPresign(key, contentType, expires, contentLength);
+    };
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-signed'),
+      payload: { ...validBody, sizeAv1: 4242, sizeH264: 8484, sizeThumb: 777 },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    assert.deepEqual(signed, [
+      ['av1.mp4', 4242],
+      ['h264.mp4', 8484],
+      ['thumb.jpg', 777],
+    ]);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a size of zero, a missing size or a wrong type is a 400', async () => {
+  const app = await clipApp();
+  try {
+    await makeUser(app, '401', 'sizes', 'tok-sizes');
+    for (const payload of [
+      { ...validBody, sizeAv1: 0 },
+      { ...validBody, sizeH264: -1 },
+      (({ sizeThumb, ...rest }) => rest)(validBody),
+      { ...validBody, sizeThumb: '100' },
+    ]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/clips',
+        headers: auth('tok-sizes'),
+        payload,
+      });
+      assert.equal(res.statusCode, 400, JSON.stringify(payload));
+      assert.equal(res.json().error, 'bad_request');
+    }
+  } finally {
+    await app.close();
+  }
+});
+
+test('a file over its cap is refused before anything is signed', async () => {
+  const app = await clipApp({ MAX_CLIP_MB: '10' });
+  try {
+    await makeUser(app, '402', 'big', 'tok-big');
+    const before = await app.db.select().from(clips);
+
+    for (const [payload, file] of [
+      [{ ...validBody, sizeAv1: 11 * MB }, 'av1'],
+      [{ ...validBody, sizeH264: 11 * MB }, 'h264'],
+      [{ ...validBody, sizeThumb: 3 * MB }, 'thumb'],
+    ]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/clips',
+        headers: auth('tok-big'),
+        payload,
+      });
+      assert.equal(res.statusCode, 413, res.body);
+      assert.equal(res.json().error, 'clip_too_large');
+      assert.equal(res.json().file, file);
+    }
+
+    // A rejected create leaves no row behind, so it costs nothing and reserves nothing.
+    assert.equal((await app.db.select().from(clips)).length, before.length);
+
+    const ok = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-big'),
+      payload: { ...validBody, sizeAv1: 10 * MB, sizeH264: 10 * MB, sizeThumb: 2 * MB },
+    });
+    assert.equal(ok.statusCode, 201, ok.body);
+  } finally {
+    await app.close();
+  }
+});
+
+test('the per-user quota counts stored and in-flight clips, and only its own user', async () => {
+  const app = await clipApp({ USER_QUOTA_GB: '1' });
+  try {
+    const alice = await makeUser(app, '403', 'alice', 'tok-q-alice');
+    await makeUser(app, '404', 'bob', 'tok-q-bob');
+
+    // 600 MB already stored.
+    await insertReadyClip(app, alice, {
+      sizeAv1: 500 * MB,
+      sizeH264: 100 * MB,
+      recordedAt: new Date('2025-06-01T00:00:00Z'),
+    });
+
+    const create = (token, mb) =>
+      app.inject({
+        method: 'POST',
+        url: '/clips',
+        headers: auth(token),
+        payload: { ...validBody, sizeAv1: mb * MB, sizeH264: 1, sizeThumb: 100 },
+      });
+
+    // 600 + 300 fits under 1 GiB and stays pending: still not uploaded, still reserved.
+    const pending = await create('tok-q-alice', 300);
+    assert.equal(pending.statusCode, 201, pending.body);
+
+    const over = await create('tok-q-alice', 300);
+    assert.equal(over.statusCode, 413, over.body);
+    const body = over.json();
+    assert.equal(body.error, 'quota_exceeded');
+    assert.equal(body.quota, GB);
+    assert.equal(body.used, 900 * MB + 1);
+
+    // Bob's quota is his own.
+    assert.equal((await create('tok-q-bob', 900)).statusCode, 201);
+
+    // An expired upload URL cannot write any more, but what it wrote before expiring is still
+    // in the bucket, so the pending row keeps counting past its TTL...
+    const deleted = [];
+    app.storage.deleteMany = async (keys) => deleted.push(...keys);
+    const age = async (ms) =>
+      app.db
+        .update(clips)
+        .set({ createdAt: new Date(Date.now() - ms) })
+        .where(eq(clips.id, pending.json().id));
+    await age(60 * 60 * 1000);
+    assert.equal((await create('tok-q-alice', 300)).statusCode, 413, 'an hour-old pending still counts');
+    assert.deepEqual(deleted, [], 'and is not reaped while a slow PUT could still be landing');
+
+    // ...until the reaper has deleted its objects, and only then does it stop counting.
+    await age(2 * 60 * 60 * 1000);
+    assert.equal((await create('tok-q-alice', 300)).statusCode, 201);
+    const pendingId = pending.json().id;
+    assert.deepEqual(deleted, [
+      `clips/${alice.id}/${pendingId}/av1.mp4`,
+      `clips/${alice.id}/${pendingId}/h264.mp4`,
+      `clips/${alice.id}/${pendingId}/thumb.jpg`,
+    ]);
+    const [reaped] = await app.db.select().from(clips).where(eq(clips.id, pendingId));
+    assert.equal(reaped.status, 'deleted');
+
+    // So does a deleted clip: its objects are gone from the bucket.
+    await app.db.update(clips).set({ status: 'deleted' }).where(eq(clips.userId, alice.id));
+    assert.equal((await create('tok-q-alice', 900)).statusCode, 201);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a replace that is never uploaded cannot shrink what the quota counts', async () => {
+  const app = await clipApp({ USER_QUOTA_GB: '1' });
+  try {
+    const user = await makeUser(app, '406', 'hoarder', 'tok-hoarder');
+    // 1000 MB really in the bucket, completed.
+    const clip = await insertReadyClip(app, user, {
+      sizeAv1: 500 * MB,
+      sizeH264: 500 * MB,
+      recordedAt: new Date('2025-06-01T00:00:00Z'),
+    });
+
+    // Declare a one-byte replacement, then never PUT and never complete.
+    const res = await app.inject({
+      method: 'POST',
+      url: `/clips/${clip.id}/replace`,
+      headers: auth('tok-hoarder'),
+      payload: { durationMs: 1000, sizeAv1: 1, sizeH264: 1, sizeThumb: 1 },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const [row] = await app.db.select().from(clips).where(eq(clips.id, clip.id));
+    assert.equal(row.sizeAv1, 500 * MB, 'the old objects are still there, so they still count');
+    assert.equal(row.sizeH264, 500 * MB);
+
+    // So the room it pretended to free is not there.
+    const next = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-hoarder'),
+      payload: { ...validBody, sizeAv1: 900 * MB, sizeH264: 1, sizeThumb: 100 },
+    });
+    assert.equal(next.statusCode, 413, next.body);
+    assert.equal(next.json().error, 'quota_exceeded');
+  } finally {
+    await app.close();
+  }
+});
+
+test('an abandoned upload the bucket will not delete keeps counting', async () => {
+  const app = await clipApp({ USER_QUOTA_GB: '1' });
+  try {
+    await makeUser(app, '407', 'unlucky', 'tok-unlucky');
+    const create = (mb) =>
+      app.inject({
+        method: 'POST',
+        url: '/clips',
+        headers: auth('tok-unlucky'),
+        payload: { ...validBody, sizeAv1: mb * MB, sizeH264: 1, sizeThumb: 100 },
+      });
+    const first = await create(900);
+    assert.equal(first.statusCode, 201, first.body);
+    await app.db
+      .update(clips)
+      .set({ createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000) })
+      .where(eq(clips.id, first.json().id));
+
+    // The objects cannot be confirmed gone, so the row must not stop counting.
+    app.storage.deleteMany = async () => {
+      throw new Error('bucket unavailable');
+    };
+    assert.equal((await create(900)).statusCode, 413);
+    const [row] = await app.db.select().from(clips).where(eq(clips.id, first.json().id));
+    assert.equal(row.status, 'pending');
+  } finally {
+    await app.close();
+  }
+});
+
+test('USER_QUOTA_GB=0 disables the quota', async () => {
+  const app = await clipApp({ USER_QUOTA_GB: '0' });
+  try {
+    const user = await makeUser(app, '405', 'unlimited', 'tok-unlimited');
+    for (let i = 0; i < 3; i++) {
+      await insertReadyClip(app, user, {
+        sizeAv1: 900 * MB,
+        sizeH264: 900 * MB,
+        recordedAt: new Date('2025-06-01T00:00:00Z'),
+      });
+    }
+    const res = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-unlimited'),
+      payload: validBody,
+    });
+    assert.equal(res.statusCode, 201, res.body);
+  } finally {
+    await app.close();
+  }
+});
+
+test('complete deletes an object that came back oversized', async () => {
+  const app = await clipApp({ MAX_CLIP_MB: '10' });
+  try {
+    const user = await makeUser(app, '406', 'liar', 'tok-liar');
+    const created = await app.inject({
+      method: 'POST',
+      url: '/clips',
+      headers: auth('tok-liar'),
+      payload: validBody,
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    const { id } = created.json();
+
+    // What the bucket would report if it had ignored the signed content-length.
+    const keys = [`clips/${user.id}/${id}/av1.mp4`, `clips/${user.id}/${id}/h264.mp4`];
+    app.storage.head = async (key) => ({
+      size: keys.includes(key) ? 50 * MB : 1000,
+      contentType: 'video/mp4',
+    });
+    const deleted = [];
+    app.storage.deleteMany = async (k) => deleted.push(...k);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/clips/${id}/complete`,
+      headers: auth('tok-liar'),
+    });
+    assert.equal(res.statusCode, 413, res.body);
+    assert.deepEqual(res.json(), { error: 'clip_too_large', files: ['av1', 'h264'] });
+    assert.equal(deleted.length, 3);
+
+    const [row] = await app.db.select().from(clips).where(eq(clips.id, id));
+    assert.equal(row.status, 'deleted');
+    assert.equal((await app.inject({ method: 'GET', url: `/clips/${id}` })).statusCode, 404);
   } finally {
     await app.close();
   }
