@@ -7,6 +7,7 @@ import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { data, loadSettings, loadStatus, on } from "./store";
 import type { Account, Status } from "./types";
+import { installUpdate, restartToUpdate, updateState } from "./updater";
 
 /** Result of the last "Save clip now", shown in the panel. */
 let lastSave = "";
@@ -45,6 +46,10 @@ export function initShell(): void {
   });
   on("settings", () => {
     renderToolbar();
+    if (panelOpen) renderStatusPanel();
+  });
+  on("update", () => {
+    renderBanners();
     if (panelOpen) renderStatusPanel();
   });
   // The frame is the only thing that outlives a screen, so it is the only thing that has to
@@ -166,8 +171,9 @@ interface Alarm {
 /** Everything worth interrupting for, in the order it should be dealt with. The same list
  *  renders as banners under the toolbar and at the top of the status panel. */
 function alarms(s: Status | null): Alarm[] {
-  if (!s) return [];
   const list: Alarm[] = [];
+  list.push(...updateAlarms());
+  if (!s) return list;
   if (s.error) {
     list.push({
       tone: "err",
@@ -199,6 +205,42 @@ function alarms(s: Status | null): Alarm[] {
     });
   }
   return list;
+}
+
+/** The update banner, from `updater.ts`'s own state rather than `Status`: it comes from the
+ *  webview's own check against GitHub, not from anything Rust reports. */
+function updateAlarms(): Alarm[] {
+  const u = updateState;
+  if (u.phase === "available") {
+    return [
+      {
+        tone: "warn",
+        title: t("shell.alarm.updateAvailable", { version: u.version }),
+        detail: t("shell.alarm.updateAvailableDetail"),
+        action: { label: t("shell.alarm.updateNow"), run: () => void installUpdate() },
+      },
+    ];
+  }
+  if (u.phase === "downloading") {
+    return [
+      {
+        tone: "warn",
+        title: t("shell.alarm.updateDownloading", { percent: u.percent }),
+        detail: t("shell.alarm.updateDownloadingDetail"),
+      },
+    ];
+  }
+  if (u.phase === "ready") {
+    return [
+      {
+        tone: "warn",
+        title: t("shell.alarm.updateReady", { version: u.version }),
+        detail: t("shell.alarm.updateReadyDetail"),
+        action: { label: t("shell.alarm.restartNow"), run: () => void restartToUpdate() },
+      },
+    ];
+  }
+  return [];
 }
 
 function bannerNode(a: Alarm): HTMLElement {

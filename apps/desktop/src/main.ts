@@ -15,6 +15,7 @@ import { activeTab, current, go, onRoute, type Route, type Tab } from "./router"
 import { initSettings, mountSettings, onLoginStateChanged, unmountSettings } from "./settings";
 import { initShell, noteClipSaved, renderBanners, renderToolbar } from "./shell";
 import { initStorage, mountStorage, unmountStorage } from "./storage";
+import { initUpdater } from "./updater";
 import {
   applyProgress,
   data,
@@ -38,6 +39,7 @@ initMatches();
 initStorage();
 initSettings();
 initFirstRun();
+initUpdater();
 
 for (const tab of TABS) {
   el(`tab-${tab}`).addEventListener("click", () => go({ view: tab }));

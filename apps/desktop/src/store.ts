@@ -21,7 +21,8 @@ export type Topic =
   | "sessions"
   | "storage"
   | "progress"
-  | "bootstrap";
+  | "bootstrap"
+  | "update";
 
 interface Data {
   status: Status | null;

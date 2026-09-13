@@ -128,6 +128,24 @@ Silent install and uninstall for testing:
 & "$env:LOCALAPPDATA\Cos Nostra\uninstall.exe" /S
 ```
 
+## Updates
+
+`src/updater.ts` checks `https://github.com/GrandThed/Cos-Nostra/releases/latest/download/latest.json`
+through `tauri-plugin-updater` at startup and every six hours, and downloads and installs a
+newer signed build in the background; `shell.ts` shows "update available" / "restart to finish"
+as ordinary alarm banners. Skipped entirely in `tauri dev` (`import.meta.env.DEV`), since there
+is no installed build to update into.
+
+The plugin verifies a minisign signature against the public key in `tauri.conf.json`
+(`plugins.updater.pubkey`). Only `.github/workflows/desktop-release.yml` can produce a build
+that verifies: it signs the installer with the private half via the `TAURI_SIGNING_PRIVATE_KEY`
+and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repo secrets and uploads the resulting `latest.json` to
+the release. Losing that private key means every future release has to ship a build that skips
+verification for one version, since nothing already installed would ever trust a new key. This
+also means releases can no longer be drafted (`releaseDraft: false`): GitHub's "latest release"
+has to already be this one for the endpoint above to find it, so there is no review window
+between a tag push and every desktop install offering that build.
+
 ## First launch
 
 The installed app starts with only the placeholder `obs.dll`. `libobs-bootstrapper` downloads

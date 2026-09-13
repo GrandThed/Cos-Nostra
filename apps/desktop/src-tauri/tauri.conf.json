@@ -62,6 +62,15 @@
         "installerHooks": "installer-hooks.nsh"
       }
     },
-    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"]
+    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhEREY3MzVCRjU0RjE0MjkKUldRcEZFLzFXM1BmamRVVVJCVVYxRzFlcXVyMXpYRUJMd0diRVo3V3JPZ3hRemRlb2RBOEh6QU8K",
+      "endpoints": [
+        "https://github.com/GrandThed/Cos-Nostra/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

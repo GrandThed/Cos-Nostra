@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. Only the window controls in the HTML title bar are here: the opener and global-shortcut plugins are driven from Rust (`app.opener()`, `app.global_shortcut()`), which needs no capability, so granting them to the webview would only let the UI open arbitrary paths and rebind arbitrary keys.",
+  "description": "Capability for the main window. Only the window controls in the HTML title bar are here: the opener and global-shortcut plugins are driven from Rust (`app.opener()`, `app.global_shortcut()`), which needs no capability, so granting them to the webview would only let the UI open arbitrary paths and rebind arbitrary keys. The updater is different: `updater.ts` drives check/download/install from the webview directly, so it needs its own permission, and `process:allow-restart` is the one command off of it the update banner needs (not `allow-exit`, which the window buttons have no reason to reach).",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -11,6 +11,8 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-is-maximized",
     "core:window:allow-start-dragging",
-    "core:window:allow-close"
+    "core:window:allow-close",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

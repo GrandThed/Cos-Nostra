@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-11. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed; phase 5 has not started.
+Last updated 2026-09-13. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed; phase 5 has not started.
 
 ## 1. What we are building
 
@@ -499,6 +499,33 @@ What changed from the plan and why:
   per row, so it needs a copy or a hard link of the recording and a decision about how the
   Storage tab counts it.
 - Later ideas, still not planned: overlays, slow motion, audio ducking.
+
+### Desktop auto-update. Done 2026-09-13.
+
+Not in the original plan. Before this, a new build only reached a player if they noticed the
+GitHub release and reinstalled by hand; every clipper on an older build would silently miss
+whatever the next one fixed.
+
+- `tauri-plugin-updater` polls `https://github.com/GrandThed/Cos-Nostra/releases/latest/download/latest.json`
+  (`plugins.updater` in `tauri.conf.json`) and checks the signature against a minisign keypair
+  generated for this: the public half lives in `tauri.conf.json`, the private half is the
+  `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub secrets that
+  `desktop-release.yml` feeds to `tauri-action`, which is what makes it sign the NSIS installer
+  and produce `latest.json` on every tagged build. Nothing but that pipeline can produce an
+  update this app will install.
+- `src/updater.ts` checks once at startup and every six hours (this is a tray app, often left
+  running for days) and drives download/install through the plugin; `shell.ts` reads its state
+  the same way it reads `Status` for the existing alarm banners, so "update available" and
+  "restart to finish" show up next to the recorder-failed and hotkey-taken banners rather than
+  as a separate UI. A restart is a `tauri-plugin-process` `relaunch()`, the same shape the OBS
+  bootstrap already uses to restart into a freshly downloaded runtime.
+- The release workflow had to stop drafting releases (`releaseDraft: false`): GitHub's
+  `/releases/latest` endpoint, which the updater's URL relies on, does not see draft or
+  prerelease releases. There is now no manual review step between a tag push and every desktop
+  install offering that build.
+- The binary itself is still unsigned (SmartScreen still warns on a fresh install); this only
+  signs the *update payload* so the app can trust it came from this pipeline, which is a
+  separate, cheaper guarantee than an EV code-signing certificate.
 
 ## 5. Cross-cutting work
 

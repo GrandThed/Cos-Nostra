@@ -1,5 +1,7 @@
-# Builds the Windows NSIS installer for the desktop clipper on every v* tag and
-# attaches it to a GitHub release. Unsigned for now: code signing is deferred.
+# Builds the Windows NSIS installer for the desktop clipper on every v* tag, signs it for the
+# Tauri updater with the CosNostraUpdaterKey secrets, and attaches it (plus latest.json) to a
+# published GitHub release, which is what tauri-plugin-updater polls. The binary itself is still
+# unsigned: code signing is deferred.
 name: desktop-release
 
 on:
@@ -31,9 +33,13 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
           releaseName: Cos Nostra ${{ github.ref_name }}
-          releaseDraft: true
+          # Draft releases are invisible to the updater's "latest" endpoint, so this has to
+          # publish straight away; there is no review step before an update goes out.
+          releaseDraft: false
           args: --bundles nsis
