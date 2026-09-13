@@ -79,14 +79,23 @@ export function renderToolbar(): void {
   const dot = el("status-dot");
   dot.className = `dot${s?.recording ? " live" : s?.error ? " bad" : ""}`;
 
-  el("status-label").textContent = s?.recording
-    ? "Recording"
-    : s?.error
-      ? "Not recording"
-      : "Starting…";
-  el("status-game").textContent = !s?.recording
-    ? ""
-    : (s.hooked_game?.title ?? s.hooked_game?.executable ?? "desktop");
+  // A session being recorded is the bigger news than the buffer: say which game and whether a
+  // match is on right now.
+  const session = s?.recording && s.session?.recording ? s.session : null;
+  el("status-label").textContent = session
+    ? session.match_id
+      ? "Recording match"
+      : "Recording session"
+    : s?.recording
+      ? "Recording"
+      : s?.error
+        ? "Not recording"
+        : "Starting…";
+  el("status-game").textContent = session
+    ? session.game_name
+    : !s?.recording
+      ? ""
+      : (s.hooked_game?.title ?? s.hooked_game?.executable ?? "desktop");
 
   el("save-hotkey").textContent = s?.hotkey ?? "";
   renderAvatar(el("account-avatar"), s?.account ?? null);
@@ -240,6 +249,20 @@ function renderStatusPanel(): void {
       capturing,
       " ",
       h("span", { class: "muted", style: "font-size:11px", text: "— follows the game you're in" }),
+    ),
+    h("span", { class: "key", text: "Session" }),
+    h(
+      "span",
+      { class: "value" },
+      s.session
+        ? `${s.session.game_name} — ${
+            s.session.recording
+              ? s.session.match_id
+                ? "recording, match in progress"
+                : "recording"
+              : "between games"
+          }`
+        : h("span", { class: "muted", text: "no supported game running" }),
     ),
     h("span", { class: "key", text: "Buffer encoder" }),
     h("span", { class: "value mono", text: s.encoder ?? "–" }),

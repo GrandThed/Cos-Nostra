@@ -1,8 +1,12 @@
-/** Which screen is up. Three are tabs; the player and the editor are detail views the library
+/** Which screen is up. Four are tabs; the player and the editor are detail views the library
  *  pushes, so they are routes rather than tabs. */
 
-export type Tab = "library" | "storage" | "settings";
-export type Route = { view: Tab } | { view: "player"; id: number } | { view: "editor"; id: number };
+export type Tab = "library" | "matches" | "storage" | "settings";
+export type Route =
+  | { view: Exclude<Tab, "matches"> }
+  | { view: "matches"; session?: number; match?: number }
+  | { view: "player"; id: number }
+  | { view: "editor"; id: number };
 
 let route: Route = { view: "library" };
 const listeners: ((r: Route) => void)[] = [];

@@ -99,6 +99,13 @@ pub struct Settings {
     /// Keep the clip folder under this many gigabytes, 0 for no limit. Enforced by dropping the
     /// local video of the oldest clips the backend already has, never anything only stored here.
     pub storage_limit_gb: u32,
+    /// Record every session of a supported game (Valorant, League of Legends, Counter-Strike)
+    /// from start to finish and cut it into matches afterwards. The recording shares the
+    /// replay buffer's encoder, so it costs disk (about 9 GB an hour at the default bitrate
+    /// until the session is cut), not frames.
+    pub record_sessions: bool,
+    /// Bring the window up on the finished session when the player leaves the game.
+    pub open_after_session: bool,
     /// Set once the first-run flow (runtime download, encoder probe, Discord link) has been
     /// seen through or skipped. Until then the window shows that flow instead of the library.
     ///
@@ -134,13 +141,16 @@ impl Default for Settings {
             auto_upload: true,
             delete_source_after_encode: false,
             storage_limit_gb: 0,
+            record_sessions: true,
+            open_after_session: true,
             first_run_done: true,
             tray_hint_shown: false,
         }
     }
 }
 
-/// Per-user data directory (`%APPDATA%\Cos Nostra`): settings, the clip queue database.
+/// Per-user data directory (`%APPDATA%\Cos Nostra`): settings, the clip queue database, the
+/// session database.
 /// `None` when APPDATA is not set, which only happens in odd service contexts.
 pub fn data_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Cos Nostra"))
@@ -369,6 +379,9 @@ mod tests {
         // The storage settings arrived later still, and both defaults mean "behave as before".
         assert!(!s.delete_source_after_encode);
         assert_eq!(s.storage_limit_gb, 0);
+        // Session recording arrived after that, on by default.
+        assert!(s.record_sessions);
+        assert!(s.open_after_session);
         // A settings file is proof the app has run here, so the first-run flow stays away
         // even though the key that records it was only added with the new window.
         assert!(s.first_run_done);

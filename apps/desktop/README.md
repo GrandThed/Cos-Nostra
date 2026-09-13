@@ -12,18 +12,36 @@ Windows clipper built with Tauri. Capture and encoding run on embedded libobs.
   available hardware H.264 encoder (NVENC, AMF, QSV) or x264 as fallback.
 - A global hotkey (default `Alt+F10`), the tray menu, or the window button flush the buffer to
   `%USERPROFILE%\Videos\Cos Nostra`.
-- Settings live in `%APPDATA%\Cos Nostra\settings.json`, clip metadata in `clips.db` beside it.
+- Settings live in `%APPDATA%\Cos Nostra\settings.json`, clip metadata in `clips.db` beside it,
+  game sessions and matches in `sessions.db`.
+
+## Match recording
+
+Valorant, League of Legends and Counter-Strike are recorded whole and cut into matches when the
+player leaves the game. The reasoning and what has been verified are in `docs/PLAN.md`; the map:
+
+| | |
+|---|---|
+| `timeline.rs` | the game-agnostic vocabulary: which games, events, the `Provider` trait, which footage a match wants |
+| `session_watch.rs` | the thread that sees a game start and stop, keeps a recording running, feeds provider events in; runs against a `Host` trait so tests use a fake |
+| `providers/valorant.rs` | Riot Client lockfile and local API, presence decoding, the presence-to-events state machine |
+| `sessions.rs` | `sessions.db`: sessions, recordings, matches, events |
+| `cutter.rs` | a finished session into match files, by stream copy from the nearest keyframe |
+| `session_app.rs` | the app side: the real `Host`, processing, the Matches tab's commands |
+
+Recordings (`session-<id>-<n>.mp4`) and match files live in `<clip folder>\Matches`.
 
 ## The window
 
 Plain HTML, CSS and TypeScript modules in `src/`, no framework. `main.ts` is the wiring: it
-mounts one of four screens, keeps `store.ts` fed from a five second poll and the events Rust
+mounts one of six screens, keeps `store.ts` fed from a five second poll and the events Rust
 pushes, and nothing renders from an event payload directly.
 
 | | |
 |---|---|
 | `shell.ts` | title bar, toolbar, alarm banners, the status panel behind the recording pill |
 | `library.ts` | game sidebar, filters, the clip grid that becomes rows under 840 px |
+| `matches.ts` | sessions and their matches, the match player with its round timeline, in/out marks that become a clip |
 | `player.ts` | the clip detail view, which is also the player |
 | `editor.ts` | trim & cut: the timeline with handles, split, undo, and Apply, which sends the clip back through the queue |
 | `storage.ts`, `settings.ts`, `firstrun.ts` | the other three screens |

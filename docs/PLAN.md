@@ -342,6 +342,81 @@ What this needed from the Rust side, all of it small:
   The window is up and reporting progress while it runs, and on `Restart` the app says so and
   exits for the updater.
 
+### Match recording and the game timeline. Base and Valorant phase 1 done 2026-09-13.
+
+Not in the original plan. The hotkey only catches what the player remembers to save; this
+records every match of Valorant, League of Legends and Counter-Strike so clips can be made
+afterwards, from a list of matches with a timeline of what happened in each.
+
+The shape, and why:
+
+- **The whole session is recorded, then cut.** A session opens when the game's process
+  appears (`timeline::sight`, a Toolhelp snapshot every second, no handle to the game) and
+  closes ten seconds after it is gone, or six minutes for League while its client is still
+  open between games. Detection only *labels* footage, it never decides what gets recorded,
+  so a missed or late match start costs a marker, not the match.
+- **Same encoder, second output.** `capture::Recorder::start_recording` adds OBS's
+  `mp4_output` (hybrid MP4, readable after a crash) on the replay buffer's own video and audio
+  encoders, so a session costs disk (about 9 GB an hour at 20 Mbps until it is cut), not a
+  second hardware encode. `ffmpeg_muxer` with fragmented flags is the fallback.
+- **Everything is wall-clock time.** Providers emit `timeline::Event`s (`match_start`,
+  `round_end`, `match_end`, and `kill`/`death`/`assist` for games that can see them) stamped
+  with when they happened. A recording's start is measured afterwards as its stop time minus
+  its probed duration; a match file stores its first frame's time. Events land in any file by
+  subtraction, and a recorder restart mid-match just leaves two recordings side by side.
+- **Cutting is a stream copy.** `cutter.rs` gives each match its span plus 10 s before and
+  8 s after, copied from the keyframe at or before the start (found from packet headers around
+  the point, so it costs the same on a three hour file), joined with the concat demuxer when a
+  restart split it, plus a thumbnail. Then the raw recordings are deleted. A provider that
+  worked and saw no match means the session was menus and it is discarded; a game with no
+  provider, or a provider that never reached the game, keeps each recording whole, renamed.
+- **A clip from a match is an ordinary clip.** `clip_from_match` copies the range with three
+  seconds either side into the clip folder and enqueues it with the exact range as its `cut`
+  (`Queue::enqueue_with_cut`), so encoding, the editor and uploading are the paths that exist.
+- **Separate database.** `sessions.db` beside `clips.db`, because the queue versions its schema
+  through `user_version` and two stores in one file would share the number.
+- Files go to `<clip folder>\Matches`, which the Storage tab's top-level scan does not see and
+  the asset protocol scope now also allows.
+- When the session ends the window comes forward on the Matches tab (`open_after_session`),
+  and both new settings default on.
+
+Valorant phase 1 (`providers/valorant.rs`): the Riot Client's lockfile gives a port and password
+for its loopback API; `/chat/v1/session` gives the player's puuid and `/chat/v4/presences`,
+polled every second, the base64 presence blob. `INGAME` opens a match (not in the range),
+every rise of the score is a `round_end` with who won it, leaving `INGAME` ends it with the
+result, and ninety seconds without presence mid-match writes it off at the moment it went
+quiet. Riot moved the loop state into `matchPresenceData` in 2024, so fields are looked up by
+name at any depth, nested groups first; both layouts are tested.
+
+Verified 2026-09-13 in `tauri dev` with uploads off, against a real Riot Client (League's
+client was open): ffplay renamed to `VALORANT-Win64-Shipping.exe` opened session 1, the hybrid
+MP4 started on the shared AMF encoder, the provider connected to the local API, closing the
+fake game stopped the recording (2052 frames, 2 lagged), the session ended after the grace,
+was kept whole because no Valorant presence existed, renamed to a 34.2 s 1080p60 H.264/AAC
+match file with a thumbnail, and the window came up on it. `cargo test`: 80 pass, including
+real ffmpeg cuts across a recorder restart and the watch state machine on a fake host.
+
+Not verified, and what would:
+
+- A real Valorant match. Round ends from the score, the result, and the 2024 presence layout
+  are tested against hand-written blobs only; the log line `valorant: INGAME (queue ..., map
+  ...)` on a real match is what confirms the fields. If the score never moves, the score
+  fields have moved too.
+- `clip_from_match` end to end from the UI; its keyframe search, copy and queue insert are each
+  tested.
+- Marker precision on real footage. The file's start comes from the stop time, which libobs
+  honours to within a frame or two; presence polls are one second apart.
+
+Next:
+
+- Valorant phase 2: after `match_end`, fetch the match details (`pd.<shard>.a.pvp.net`,
+  entitlement token from the local API) and add each kill with `timeSinceGameStartMillis`,
+  anchored on the round ends already in the timeline.
+- League: Live Client Data API on `127.0.0.1:2999` (`ChampionKill`, `Multikill`, `Ace`).
+  Counter-Strike: Game State Integration, which needs a `.cfg` in the game's folder.
+- Teamfight Tactics runs as `TFTClient-Win64-Shipping.exe`, which is not a session game yet.
+- Matches in the Storage tab, and a limit on how much session footage is kept.
+
 ### Phase 5. Yearly recap. Two weeks, mostly a worker.
 
 Goal: once a year the bot posts a compilation of the best clips.

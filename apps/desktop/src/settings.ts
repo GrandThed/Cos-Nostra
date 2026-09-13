@@ -132,6 +132,17 @@ function behaviourCard(s: Settings): HTMLElement {
       (v) => (s.encode_while_gaming = v),
       "Off: clips wait until you stop playing, so the game keeps every frame. On: clips are ready sooner but encoding may cost frames.",
     ),
+    toggle(
+      "Record whole matches",
+      s.record_sessions,
+      (v) => (s.record_sessions = v),
+      "Valorant, League of Legends and Counter-Strike are recorded from start to finish and cut into matches when you close the game, so you can make clips afterwards. Costs about 9 GB an hour of disk while you play; menus and queues are thrown away.",
+    ),
+    toggle(
+      "Open Cos Nostra when you close the game",
+      s.open_after_session,
+      (v) => (s.open_after_session = v),
+    ),
   );
 }
 

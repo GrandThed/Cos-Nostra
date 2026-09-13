@@ -1,0 +1,519 @@
+/* Matches: sessions and their matches on the left, the match on screen with its timeline in
+   the middle, the timeline as a list on the right. */
+
+.matches {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* --- Session list -------------------------------------------------------- */
+
+.session-list {
+  width: calc(var(--sidebar) + 40px);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+}
+
+.session-list .day-label {
+  margin: 10px 2px 4px;
+}
+
+.session-list .day-label:first-child {
+  margin-top: 0;
+}
+
+.session-empty {
+  padding: 8px 4px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.session {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 6px;
+}
+
+.session-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.session-head:hover,
+.session-head[aria-current="true"] {
+  background: var(--panel2);
+}
+
+.session-head .game {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-head .when {
+  flex: 1;
+  color: var(--mut);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.badge.live {
+  color: var(--err);
+}
+
+.session-note {
+  padding: 2px 8px 4px;
+  color: var(--mut);
+  font-size: 12px;
+}
+
+.match-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.match-item:hover {
+  background: var(--panel2);
+}
+
+.match-item[aria-current="true"] {
+  background: var(--panel2);
+  box-shadow: inset 3px 0 0 var(--acc);
+}
+
+.match-item .thumb {
+  width: 58px;
+  aspect-ratio: 16 / 9;
+  flex: none;
+  border-radius: 5px;
+  overflow: hidden;
+  background: linear-gradient(135deg, hsl(var(--hue) 30% 26%), hsl(var(--hue) 42% 10%));
+}
+
+.match-item .thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* An img with no source yet would draw a broken-image glyph over the gradient. */
+.match-item .thumb img:not([src]) {
+  visibility: hidden;
+}
+
+.match-item .lines {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.match-item .title {
+  font-size: 12.5px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.match-item .meta {
+  font-size: 11px;
+  color: var(--mut);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--panel2);
+  color: var(--mut);
+}
+
+.result.win {
+  color: var(--ok);
+  background: var(--okWash);
+}
+
+.result.loss {
+  color: var(--err);
+  background: var(--errWash);
+}
+
+/* --- The match on screen ------------------------------------------------- */
+
+.match-view {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.match-view > .empty-state {
+  margin: 18px;
+}
+
+.match-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.match-head .titles {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.match-head .label {
+  color: var(--mut);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.match-head h2 {
+  font-size: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.match-head .facts {
+  color: var(--mut);
+  font-size: 12.5px;
+}
+
+.match-head .actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.match-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.match-body > .empty-state {
+  flex: 1;
+  align-self: flex-start;
+  margin: 18px;
+}
+
+.match-stage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+}
+
+.match-stage .video {
+  --hue: 30;
+  flex: none;
+}
+
+.match-stage .video video {
+  display: block;
+}
+
+/* --- Timeline ------------------------------------------------------------ */
+
+.tl {
+  position: relative;
+  flex: none;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: crosshair;
+  touch-action: none;
+  overflow: hidden;
+}
+
+.tl-bar {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.tl-round {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  border-right: 1px solid var(--panel);
+  background: var(--panel2);
+}
+
+.tl-round.won {
+  background: color-mix(in srgb, var(--ok) 38%, var(--panel));
+}
+
+.tl-round.lost {
+  background: color-mix(in srgb, var(--err) 32%, var(--panel));
+}
+
+.tl-edge {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--mut);
+}
+
+.tl-dot {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 0 0 2px var(--panel);
+}
+
+.tl-dot.kill {
+  background: var(--acc);
+}
+
+.tl-dot.death {
+  background: var(--err);
+}
+
+.tl-dot.assist {
+  background: var(--info);
+}
+
+.tl-sel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-left: 2px solid var(--acc);
+  border-right: 2px solid var(--acc);
+  background: color-mix(in srgb, var(--acc) 22%, transparent);
+  pointer-events: none;
+}
+
+.tl-sel.open {
+  border-right: 0;
+  background: none;
+}
+
+.tl-head {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink);
+  pointer-events: none;
+}
+
+.tl-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -6px;
+  color: var(--mut);
+  font-size: 10.5px;
+}
+
+.clip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.clip-row .range {
+  color: var(--mut);
+  font-size: 12px;
+}
+
+.match-msg {
+  font-size: 12.5px;
+  color: var(--mut);
+  min-height: 1em;
+}
+
+.match-msg:empty {
+  display: none;
+}
+
+.match-msg.ok {
+  color: var(--ok);
+}
+
+.match-msg.err {
+  color: var(--err);
+}
+
+.match-stage .hint {
+  color: var(--mut);
+  font-size: 11.5px;
+}
+
+/* --- The timeline as a list ---------------------------------------------- */
+
+.match-rail {
+  width: var(--rail);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+}
+
+.event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.event-list > .muted {
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.event {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-left: 3px solid var(--line);
+  padding-left: 4px;
+}
+
+.event.won {
+  border-left-color: var(--ok);
+}
+
+.event.lost {
+  border-left-color: var(--err);
+}
+
+.event.match_start,
+.event.match_end {
+  border-left-color: var(--mut);
+}
+
+.event .jump {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  text-align: left;
+}
+
+.event .jump:hover {
+  background: var(--panel2);
+}
+
+.event .at {
+  flex: none;
+  width: 38px;
+  color: var(--mut);
+  font-size: 11px;
+}
+
+.event .what {
+  min-width: 0;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event.match_start .what,
+.event.match_end .what {
+  font-weight: 600;
+}
+
+.event .btn.small {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+/* --- Narrow windows ------------------------------------------------------ */
+
+@media (max-width: 960px) {
+  .match-body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .match-stage {
+    overflow: visible;
+  }
+
+  .match-rail {
+    width: auto;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 840px) {
+  .matches {
+    flex-direction: column;
+  }
+
+  .session-list {
+    width: auto;
+    max-height: 38%;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+}

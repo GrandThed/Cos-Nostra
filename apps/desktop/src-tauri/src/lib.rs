@@ -1,10 +1,16 @@
 mod api;
+mod cutter;
 mod capture;
 mod settings;
 mod storage;
 mod ffmpeg;
 mod games;
+mod providers;
 mod queue;
+mod session_app;
+mod session_watch;
+mod sessions;
+mod timeline;
 mod win;
 
 use std::panic::AssertUnwindSafe;
@@ -64,6 +70,12 @@ struct AppState {
     /// Per-clip encode and upload percentages, keyed by clip id. Live only: the queue owns the
     /// statuses, this is just how far the job that is running right now has got.
     progress: Mutex<std::collections::HashMap<i64, ClipProgress>>,
+    /// Game sessions and their matches; `None` until the database opened.
+    sessions: Mutex<Option<Arc<sessions::SessionStore>>>,
+    /// The session being played right now, as of the session watch's last look.
+    live_session: Mutex<Option<session_watch::LiveSession>>,
+    /// Sessions being cut into matches right now.
+    processing: Mutex<session_app::Processing>,
 }
 
 /// A running device login: the poll thread stops when `cancelled` is set.
@@ -122,6 +134,8 @@ struct Status {
     ffmpeg_error: Option<String>,
     account: Option<Account>,
     auto_upload: bool,
+    /// The game session being recorded, if one is.
+    session: Option<session_watch::LiveSession>,
 }
 
 /// How far the OBS runtime bootstrap has got. `Ready` on every launch after the first.
@@ -183,12 +197,14 @@ fn clear_progress(app: &AppHandle, id: i64) {
     let _ = app.emit("clip-progress", ClipProgress { id, stage: "idle", percent: 0 });
 }
 
-/// Lets the asset protocol read the clip folder, so the player can play the local H.264 file.
-/// Re-run whenever the folder changes; scopes only ever widen, which is fine for a folder the
-/// user chose themselves.
+/// Lets the asset protocol read the clip folder, so the player can play the local H.264 file,
+/// and its `Matches` folder, where the match files are. Re-run whenever the folder changes;
+/// scopes only ever widen, which is fine for a folder the user chose themselves.
 fn allow_clip_dir(app: &AppHandle, dir: &Path) {
-    if let Err(e) = app.asset_protocol_scope().allow_directory(dir, false) {
-        log::warn!("clip folder {} is not readable by the player: {e}", dir.display());
+    for dir in [dir.to_path_buf(), session_app::matches_dir(dir)] {
+        if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, false) {
+            log::warn!("{} is not readable by the player: {e}", dir.display());
+        }
     }
 }
 
@@ -228,6 +244,7 @@ fn get_status(state: State<AppState>) -> Status {
         ffmpeg_error: state.ffmpeg_error.lock().unwrap().clone(),
         account: settings.account.clone(),
         auto_upload: settings.auto_upload,
+        session: state.live_session.lock().unwrap().clone(),
     }
 }
 
@@ -1312,6 +1329,8 @@ fn start_pipeline(app: &AppHandle) {
     *state.worker.lock().unwrap() = Some(worker);
     log::info!("clip queue ready at {}", db.display());
     emit_clips_changed(app, None);
+    // Sessions that ended while ffmpeg was not yet located can be cut now.
+    session_app::process_pending(app);
 }
 
 /// Probes the freshly written file and enqueues it. libobs may still be flushing the MP4
@@ -1884,6 +1903,9 @@ pub fn run() {
             login: Mutex::new(None),
             bootstrap: Mutex::new(Bootstrap::default()),
             progress: Mutex::new(std::collections::HashMap::new()),
+            sessions: Mutex::new(None),
+            live_session: Mutex::new(None),
+            processing: Mutex::new(session_app::Processing::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -1912,7 +1934,16 @@ pub fn run() {
             logout,
             get_account,
             get_bootstrap,
-            finish_first_run
+            finish_first_run,
+            session_app::list_sessions,
+            session_app::match_events,
+            session_app::live_session,
+            session_app::delete_session,
+            session_app::delete_match,
+            session_app::retry_session,
+            session_app::clip_from_match,
+            session_app::open_match_folder,
+            session_app::match_thumbnail
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1938,6 +1969,10 @@ pub fn run() {
                 let verify_handle = handle.clone();
                 std::thread::spawn(move || verify_token(&verify_handle));
             }
+            // The session database and the watch that records whole game sessions. It asks
+            // the recorder for a recording and simply retries until one is running.
+            let sessions_handle = handle.clone();
+            std::thread::spawn(move || session_app::start(&sessions_handle));
             // ffmpeg lookup, encoder probe and queue open. Independent of libobs, so it
             // runs on its own thread rather than waiting for the recorder.
             std::thread::spawn(move || start_pipeline(&handle));

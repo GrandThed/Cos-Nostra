@@ -37,6 +37,8 @@ export interface Status {
   ffmpeg_error: string | null;
   account: Account | null;
   auto_upload: boolean;
+  /** The game session being recorded right now, if one is. */
+  session: LiveSession | null;
 }
 
 export type Quality = "small" | "balanced" | "high";
@@ -63,6 +65,8 @@ export interface Settings {
   auto_upload: boolean;
   delete_source_after_encode: boolean;
   storage_limit_gb: number;
+  record_sessions: boolean;
+  open_after_session: boolean;
   first_run_done: boolean;
   tray_hint_shown: boolean;
 }
@@ -180,3 +184,75 @@ export interface CleanResult {
   clips: number;
   bytes: number;
 }
+
+// ---------------------------------------------------------------------------
+// Sessions and matches. Keep in step with `sessions.rs`, `timeline.rs` and `session_watch.rs`.
+
+export type SessionGame = "valorant" | "league" | "counter_strike";
+
+/** The session the watch is recording right now. */
+export interface LiveSession {
+  id: number;
+  game: SessionGame;
+  game_name: string;
+  /** False between League games, while only the client runs. */
+  recording: boolean;
+  match_id: number | null;
+}
+
+export type SessionStatus = "recording" | "processing" | "ready" | "failed";
+export type MatchStatus = "live" | "pending" | "ready" | "missing" | "failed";
+export type Outcome = "win" | "loss" | "draw";
+
+export interface MatchRow {
+  id: number;
+  session_id: number;
+  started_at: string;
+  ended_at: string | null;
+  /** False for the stand-in that keeps a session's footage when nothing detected a match. */
+  detected: boolean;
+  map: string | null;
+  mode: string | null;
+  result: Outcome | null;
+  ally_score: number | null;
+  enemy_score: number | null;
+  path: string | null;
+  thumb_path: string | null;
+  /** Wall-clock time of the file's first frame; an event at `at` is `at - file_start_at` in. */
+  file_start_at: string | null;
+  duration_ms: number | null;
+  size: number | null;
+  status: MatchStatus;
+  error: string | null;
+  updated_at: string;
+}
+
+export interface SessionRow {
+  id: number;
+  game: SessionGame;
+  game_name: string;
+  started_at: string;
+  ended_at: string | null;
+  status: SessionStatus;
+  provider_reached: boolean;
+  error: string | null;
+  matches: MatchRow[];
+}
+
+export type EndReason = "finished" | "lost" | "session_ended" | "superseded";
+
+/** One mark on a match's timeline. The `kind` tag and fields are `timeline::Event`. */
+export type TimelineEvent = { id: number; match_id: number | null; at: string } & (
+  | { kind: "match_start"; map: string | null; mode: string | null }
+  | { kind: "round_end"; round: number; ally: number; enemy: number; won: boolean | null }
+  | {
+      kind: "match_end";
+      ally: number | null;
+      enemy: number | null;
+      result: Outcome | null;
+      reason: EndReason;
+    }
+  | { kind: "kill"; victim: string | null; weapon: string | null; headshot: boolean }
+  | { kind: "death"; killer: string | null; weapon: string | null }
+  | { kind: "assist"; victim: string | null }
+);

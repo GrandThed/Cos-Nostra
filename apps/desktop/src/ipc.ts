@@ -12,9 +12,11 @@ import type {
   Encoders,
   LoginStarted,
   Segment,
+  SessionRow,
   Settings,
   Status,
   StorageStats,
+  TimelineEvent,
 } from "./types";
 
 export const getStatus = () => invoke<Status>("get_status");
@@ -51,6 +53,17 @@ export const startLogin = () => invoke<LoginStarted>("start_login");
 export const cancelLogin = () => invoke<void>("cancel_login");
 export const logout = () => invoke<void>("logout");
 export const getAccount = () => invoke<Account | null>("get_account");
+
+export const listSessions = () => invoke<SessionRow[]>("list_sessions");
+export const matchEvents = (id: number) => invoke<TimelineEvent[]>("match_events", { id });
+export const deleteSession = (id: number) => invoke<void>("delete_session", { id });
+export const deleteMatch = (id: number) => invoke<void>("delete_match", { id });
+export const retrySession = (id: number) => invoke<void>("retry_session", { id });
+/** Puts `startMs..endMs` of a match file in the clip queue and returns the new clip's id. */
+export const clipFromMatch = (id: number, startMs: number, endMs: number) =>
+  invoke<number>("clip_from_match", { id, startMs, endMs });
+export const openMatchFolder = (id: number) => invoke<void>("open_match_folder", { id });
+export const matchThumbnail = (id: number) => invoke<string | null>("match_thumbnail", { id });
 
 export const getBootstrap = () => invoke<Bootstrap>("get_bootstrap");
 export const finishFirstRun = () => invoke<void>("finish_first_run");

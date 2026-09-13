@@ -4,14 +4,31 @@
  *  directly. That keeps a status push, a five second poll and a tab switch on the same path. */
 
 import * as ipc from "./ipc";
-import type { Bootstrap, ClipProgress, ClipRow, Settings, Status, StorageStats } from "./types";
+import type {
+  Bootstrap,
+  ClipProgress,
+  ClipRow,
+  SessionRow,
+  Settings,
+  Status,
+  StorageStats,
+} from "./types";
 
-export type Topic = "status" | "settings" | "clips" | "storage" | "progress" | "bootstrap";
+export type Topic =
+  | "status"
+  | "settings"
+  | "clips"
+  | "sessions"
+  | "storage"
+  | "progress"
+  | "bootstrap";
 
 interface Data {
   status: Status | null;
   settings: Settings | null;
   clips: ClipRow[];
+  /** Recorded game sessions with their matches, newest first. */
+  sessions: SessionRow[];
   storage: StorageStats | null;
   /** Live percentages, keyed by clip id. Only clips mid-job are in here. */
   progress: Map<number, ClipProgress>;
@@ -24,6 +41,7 @@ export const data: Data = {
   status: null,
   settings: null,
   clips: [],
+  sessions: [],
   storage: null,
   progress: new Map(),
   bootstrap: { phase: "ready" },
@@ -80,6 +98,10 @@ export const loadSettings = loader("settings", ipc.getSettings, (s) => {
 
 export const loadClips = loader("clips", ipc.listClips, (c) => {
   data.clips = c;
+});
+
+export const loadSessions = loader("sessions", ipc.listSessions, (s) => {
+  data.sessions = s;
 });
 
 export const loadStorage = loader("storage", ipc.storageStats, (s) => {

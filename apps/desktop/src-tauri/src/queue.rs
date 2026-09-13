@@ -318,12 +318,27 @@ impl Queue {
 
     /// Inserts a `saved` row and returns its id.
     pub fn enqueue(&self, clip: NewClip) -> Result<i64> {
+        self.insert(clip, None)
+    }
+
+    /// Inserts a `saved` row that already carries a cut, for a clip taken out of a longer
+    /// recording. One statement, so the worker never sees the row without its cut.
+    pub fn enqueue_with_cut(&self, clip: NewClip, cut: &[Segment]) -> Result<i64> {
+        self.insert(clip, Some(cut))
+    }
+
+    fn insert(&self, clip: NewClip, cut: Option<&[Segment]>) -> Result<i64> {
+        let cut = cut
+            .filter(|c| !c.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding cut")?;
         let now = now_rfc3339();
         let conn = self.lock();
         conn.execute(
             "INSERT INTO clips (source_path, game, title, recorded_at, duration_ms, width, height, \
-             fps, size_source, status, attempts, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10)",
+             fps, size_source, status, attempts, created_at, updated_at, cut) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10, ?11)",
             params![
                 clip.source_path,
                 clip.game,
@@ -335,6 +350,7 @@ impl Queue {
                 clip.fps,
                 clip.size_source,
                 now,
+                cut,
             ],
         )
         .with_context(|| format!("enqueueing {}", clip.source_path))?;
@@ -1521,5 +1537,18 @@ mod tests {
         assert_eq!(row.error.map(|e| e.chars().count()), Some(MAX_ERROR_CHARS));
         assert_eq!(row.status, ClipStatus::Failed);
         assert_eq!(row.attempts, 1);
+    }
+
+    #[test]
+    fn a_clip_can_arrive_with_its_cut() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let cut = [Segment { start_ms: 2_000, end_ms: 9_500 }];
+        let id = q.enqueue_with_cut(clip("from-match", "2026-09-13T21:00:00.000Z"), &cut).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!(row.cut.as_deref(), Some(&cut[..]));
+        // An empty cut is the whole recording, stored as no cut.
+        let whole = q.enqueue_with_cut(clip("whole", "2026-09-13T21:00:01.000Z"), &[]).unwrap();
+        assert_eq!(q.get(whole).unwrap().unwrap().cut, None);
     }
 }

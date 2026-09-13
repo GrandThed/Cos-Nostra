@@ -717,6 +717,127 @@ pub fn thumbnail(bins: &Binaries, src: &Path, dst: &Path, at_ms: i64) -> Result<
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct PacketProbe {
+    #[serde(default)]
+    packets: Vec<ProbePacket>,
+    format: Option<ProbeStart>,
+}
+
+#[derive(Deserialize)]
+struct ProbePacket {
+    pts_time: Option<String>,
+    flags: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStart {
+    start_time: Option<String>,
+}
+
+/// How far back from a cut point to look for its keyframe. Far past any GOP a recorder uses.
+const KEYFRAME_LOOKBACK_MS: i64 = 30_000;
+
+/// The time of the last video keyframe at or before `at_ms`, measured from the start of the
+/// file the way `-ss` measures it. A stream copy can only begin on a keyframe, so this is
+/// where a copy that wants `at_ms` really starts. Reads packet headers only, and only around
+/// the point, so it costs the same on a three hour recording as on a clip.
+pub fn keyframe_at_or_before(bins: &Binaries, src: &Path, at_ms: i64) -> Result<i64> {
+    if at_ms <= 0 {
+        return Ok(0);
+    }
+    let from = (at_ms - KEYFRAME_LOOKBACK_MS).max(0);
+    let mut cmd = command(&bins.ffprobe);
+    cmd.args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-read_intervals", &format!("{}%{}", seconds(from), seconds(at_ms + 500))])
+        .args(["-show_entries", "packet=pts_time,flags:format=start_time", "-of", "json"])
+        .arg(src);
+    let output = run(cmd, &format!("keyframes of {}", src.display()))?;
+    let parsed: PacketProbe = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("keyframes of {}: unparsable ffprobe output", src.display()))?;
+    let start = parsed
+        .format
+        .and_then(|f| f.start_time)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let best = parsed
+        .packets
+        .iter()
+        .filter(|p| p.flags.as_deref().is_some_and(|f| f.starts_with('K')))
+        .filter_map(|p| p.pts_time.as_deref()?.parse::<f64>().ok())
+        .map(|t| ((t - start) * 1000.0).round() as i64)
+        .filter(|&ms| ms <= at_ms)
+        .max();
+    match best {
+        Some(ms) => Ok(ms.clamp(0, at_ms)),
+        None => {
+            log::warn!(
+                "no keyframe found before {at_ms} ms in {}; cutting there anyway",
+                src.display()
+            );
+            Ok(at_ms)
+        }
+    }
+}
+
+/// Copies `from_ms..to_ms` of `src` into `dst` without re-encoding, video and any audio.
+/// `from_ms` should come from `keyframe_at_or_before`: starting exactly on a keyframe is what
+/// makes the new file's first frame `from_ms` of the old one.
+pub fn copy_range(bins: &Binaries, src: &Path, from_ms: i64, to_ms: i64, dst: &Path) -> Result<()> {
+    if to_ms <= from_ms {
+        bail!("copy {}: empty range {from_ms}..{to_ms}", src.display());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let part = part_path(dst);
+    let mut cmd = ffmpeg_command(bins);
+    // Seeking a millisecond past the keyframe still lands on it, and never on the one before
+    // when the point's timestamp rounds down.
+    cmd.args(["-v", "error", "-ss", &seconds(from_ms + 1)])
+        .arg("-i")
+        .arg(src)
+        .args(["-t", &seconds(to_ms - from_ms)])
+        .args(["-map", "0:v:0", "-map", "0:a?", "-c", "copy"])
+        .args(["-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(&part);
+    let started = Instant::now();
+    run(cmd, &format!("copy {}", src.display()))?;
+    fs::rename(&part, dst).with_context(|| format!("rename {} -> {}", part.display(), dst.display()))?;
+    log::info!(
+        "copied {:.1}s of {} in {:.1}s",
+        (to_ms - from_ms) as f64 / 1000.0,
+        src.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Joins files that share codecs and settings end to end, without re-encoding.
+pub fn concat_copy(bins: &Binaries, parts: &[PathBuf], dst: &Path) -> Result<()> {
+    let list = {
+        let mut name = dst.as_os_str().to_os_string();
+        name.push(".concat.txt");
+        PathBuf::from(name)
+    };
+    let body: String = parts
+        .iter()
+        .map(|p| format!("file '{}'\n", p.display().to_string().replace('\'', r"'\''")))
+        .collect();
+    fs::write(&list, body).with_context(|| format!("write {}", list.display()))?;
+    let part = part_path(dst);
+    let mut cmd = ffmpeg_command(bins);
+    cmd.args(["-v", "error", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(&part);
+    let result = run(cmd, &format!("concat into {}", dst.display()));
+    let _ = fs::remove_file(&list);
+    result?;
+    fs::rename(&part, dst).with_context(|| format!("rename {} -> {}", part.display(), dst.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +1079,46 @@ mod tests {
             "the failure lost ffmpeg's stderr: {err:#}"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A match is cut out of a session recording by stream copy, starting on a keyframe.
+    #[test]
+    fn copies_ranges_on_keyframes_and_joins_them() {
+        let bins = bins();
+        let dir = std::env::temp_dir().join(format!("cos-nostra-copy-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Six seconds with a keyframe every second, like a recorder with a short GOP.
+        let src = dir.join("session.mp4");
+        let mut cmd = ffmpeg_command(&bins);
+        cmd.args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=60"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-t", "6", "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-keyint_min", "60"])
+            .args(["-sc_threshold", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k"])
+            .arg(&src);
+        run(cmd, "sample").unwrap();
+
+        assert_eq!(keyframe_at_or_before(&bins, &src, 0).unwrap(), 0);
+        assert_eq!(keyframe_at_or_before(&bins, &src, 2_500).unwrap(), 2_000);
+        assert_eq!(keyframe_at_or_before(&bins, &src, 3_000).unwrap(), 3_000);
+        assert_eq!(keyframe_at_or_before(&bins, &src, 999).unwrap(), 0);
+
+        let first = dir.join("first.mp4");
+        copy_range(&bins, &src, 2_000, 4_500, &first).unwrap();
+        let info = probe(&bins, &first).unwrap();
+        assert!((info.duration_ms - 2_500).abs() <= 100, "copy duration {}", info.duration_ms);
+        assert!(info.has_audio);
+        assert!(!part_path(&first).exists());
+
+        let second = dir.join("second.mp4");
+        copy_range(&bins, &src, 5_000, 6_000, &second).unwrap();
+        let joined = dir.join("joined.mp4");
+        concat_copy(&bins, &[first.clone(), second.clone()], &joined).unwrap();
+        let info = probe(&bins, &joined).unwrap();
+        assert!((info.duration_ms - 3_500).abs() <= 150, "joined duration {}", info.duration_ms);
+        assert!(!dir.join("joined.mp4.concat.txt").exists());
+
+        assert!(copy_range(&bins, &src, 3_000, 3_000, &dir.join("empty.mp4")).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }
