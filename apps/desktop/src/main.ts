@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { el } from "./dom";
 import { mountEditor, unmountEditor } from "./editor";
 import { initFirstRun, loginFailed, syncFirstRun } from "./firstrun";
+import { t } from "./i18n";
 import { initLibrary, mountLibrary, unmountLibrary } from "./library";
 import { initMatches, mountMatches, unmountMatches } from "./matches";
 import { initPlayer, mountPlayer, unmountPlayer } from "./player";
@@ -107,7 +108,12 @@ void listen<Bootstrap>("obs-bootstrap", (e) => {
 });
 
 void listen<Account | null>("account-changed", (e) => {
-  onLoginStateChanged(null, e.payload ? `Logged in as ${e.payload.username}` : "Logged out");
+  onLoginStateChanged(
+    null,
+    e.payload
+      ? t("settings.loggedInAs", { username: e.payload.username })
+      : t("settings.loggedOut"),
+  );
   void loadStatus();
   void loadSettings().then(syncFirstRun);
 });

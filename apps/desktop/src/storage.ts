@@ -1,9 +1,10 @@
 /** What the clips cost on this PC: where the bytes went, what can be given back, and the cap
  *  that keeps it from happening again. */
 
-import { clipsNote } from "./clips";
+import { clipsNote, gameLabel } from "./clips";
 import { confirming, fill, h } from "./dom";
 import { fmtBytes, fmtCount } from "./format";
+import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { data, loadSettings, loadStorage, on } from "./store";
 import type { Bucket, CleanTarget, Settings, StorageStats } from "./types";
@@ -33,50 +34,25 @@ interface Slice {
   bytes: number;
 }
 
-const CLEANERS: {
-  target: CleanTarget;
-  label: string;
-  note: string;
-  verb: string;
-  confirmVerb: string;
-  of: (s: StorageStats) => Bucket;
-}[] = [
-  {
-    target: "sources",
-    label: "Original recordings",
-    note: "The raw buffer file of clips that already encoded. AV1 and H.264 stay.",
-    verb: "Delete",
-    confirmVerb: "delete",
-    of: (s) => s.reclaim_sources,
-  },
-  {
-    target: "published",
-    label: "Clips already on the site",
-    note: "Removes the video from this PC. Thumbnail, link and Discord post stay.",
-    verb: "Remove",
-    confirmVerb: "remove",
-    of: (s) => s.reclaim_published,
-  },
-  {
-    target: "failed",
-    label: "Clips that failed",
-    note: "Deletes the clip and every file it owns, for good.",
-    verb: "Delete",
-    confirmVerb: "delete",
-    of: (s) => s.reclaim_failed,
-  },
+const CLEANERS: { target: CleanTarget; of: (s: StorageStats) => Bucket }[] = [
+  { target: "sources", of: (s) => s.reclaim_sources },
+  { target: "published", of: (s) => s.reclaim_published },
+  { target: "failed", of: (s) => s.reclaim_failed },
 ];
 
 let root: HTMLElement | null = null;
 /** Result of the last cleanup, which survives the redraw that follows it. */
 let cleanResult: { text: string; bad: boolean } | null = null;
-let saveMsg = "";
+let saveMsg: { text: string; kind: "" | "ok" | "err" } | null = null;
 
 export function initStorage(): void {
   on("storage", () => {
     if (root) render();
   });
   on("settings", () => {
+    if (root) render();
+  });
+  onLanguage(() => {
     if (root) render();
   });
 }
@@ -91,7 +67,7 @@ export function mountStorage(node: HTMLElement): void {
 export function unmountStorage(): void {
   root = null;
   cleanResult = null;
-  saveMsg = "";
+  saveMsg = null;
 }
 
 function render(): void {
@@ -100,11 +76,30 @@ function render(): void {
   const settings = data.settings;
 
   if (data.errors.storage) {
-    fill(root, h("div", { class: "storage" }, h("div", { class: "banner err" }, h("div", { class: "body" }, h("b", { text: "Could not read the clip folder" }), h("div", { class: "detail", text: data.errors.storage })))));
+    fill(
+      root,
+      h(
+        "div",
+        { class: "storage" },
+        h(
+          "div",
+          { class: "banner err" },
+          h(
+            "div",
+            { class: "body" },
+            h("b", { text: t("storage.couldNotRead") }),
+            h("div", { class: "detail", text: data.errors.storage }),
+          ),
+        ),
+      ),
+    );
     return;
   }
   if (!stats || !settings) {
-    fill(root, h("div", { class: "storage" }, h("span", { class: "muted", text: "Reading the folder…" })));
+    fill(
+      root,
+      h("div", { class: "storage" }, h("span", { class: "muted", text: t("storage.reading") })),
+    );
     return;
   }
 
@@ -117,7 +112,7 @@ function render(): void {
       { class: "storage scroll" },
       headline(stats),
       block(
-        "By game",
+        t("storage.byGame"),
         bar(games, games.reduce((n, s) => n + s.bytes, 0)),
         legend(games),
       ),
@@ -131,7 +126,9 @@ function render(): void {
 
 function headline(s: StorageStats): HTMLElement {
   const sub = [clipsNote(s.clips)];
-  if (s.free_space !== null) sub.push(`${fmtBytes(s.free_space)} free on ${driveOf(s.clip_dir)}`);
+  if (s.free_space !== null) {
+    sub.push(t("storage.freeOn", { size: fmtBytes(s.free_space), drive: driveOf(s.clip_dir) }));
+  }
   return h(
     "div",
     { class: "headline" },
@@ -141,7 +138,7 @@ function headline(s: StorageStats): HTMLElement {
     h("button", {
       type: "button",
       class: "btn small",
-      text: "Open folder",
+      text: t("storage.openFolder"),
       onclick: () => void ipc.openClipDir(),
     }),
   );
@@ -149,7 +146,7 @@ function headline(s: StorageStats): HTMLElement {
 
 /** "D:" out of "D:\Videos\Cos Nostra", or "the drive" for a path with no letter. */
 function driveOf(dir: string): string {
-  return /^[A-Za-z]:/.test(dir) ? dir.slice(0, 2).toUpperCase() : "the drive";
+  return /^[A-Za-z]:/.test(dir) ? dir.slice(0, 2).toUpperCase() : t("storage.theDrive");
 }
 
 function block(label: string, ...children: HTMLElement[]): HTMLElement {
@@ -189,7 +186,7 @@ function legend(slices: Slice[]): HTMLElement {
 function gameSlices(s: StorageStats): Slice[] {
   const used = s.games.filter((g) => g.bytes > 0);
   const slices: Slice[] = used.slice(0, MAX_SLICES).map((g, i) => ({
-    label: g.game ?? "Unknown game",
+    label: gameLabel(g.game),
     color: PALETTE[i % PALETTE.length],
     note: clipsNote(g.clips),
     bytes: g.bytes,
@@ -197,7 +194,7 @@ function gameSlices(s: StorageStats): Slice[] {
   const rest = used.slice(MAX_SLICES);
   if (rest.length) {
     slices.push({
-      label: `${rest.length} more games`,
+      label: t("storage.moreGames", { n: rest.length }),
       color: COLOR_REST,
       note: clipsNote(rest.reduce((n, g) => n + g.clips, 0)),
       bytes: rest.reduce((n, g) => n + g.bytes, 0),
@@ -205,9 +202,9 @@ function gameSlices(s: StorageStats): Slice[] {
   }
   if (s.kinds.other > 0) {
     slices.push({
-      label: "Other files in the folder",
+      label: t("storage.otherInFolder"),
       color: COLOR_FOREIGN,
-      note: fmtCount(s.kinds.other_files, "file"),
+      note: fmtCount(s.kinds.other_files, t("storage.fileOne"), t("storage.fileMany")),
       bytes: s.kinds.other,
     });
   }
@@ -216,11 +213,11 @@ function gameSlices(s: StorageStats): Slice[] {
 
 function kinds(s: StorageStats): HTMLElement {
   const parts: [string, number][] = [
-    ["Originals", s.kinds.sources],
+    [t("storage.kinds.originals"), s.kinds.sources],
     ["AV1", s.kinds.av1],
     ["H.264", s.kinds.h264],
-    ["Thumbnails", s.kinds.thumbs],
-    ["Other files", s.kinds.other],
+    [t("storage.kinds.thumbnails"), s.kinds.thumbs],
+    [t("storage.kinds.other"), s.kinds.other],
   ];
   return h(
     "div",
@@ -239,11 +236,16 @@ function kinds(s: StorageStats): HTMLElement {
 function whereClipsLive(s: StorageStats): HTMLElement {
   const total = s.published.bytes + s.local_only.bytes;
   return block(
-    "Where clips live",
+    t("storage.whereClipsLive"),
     bar(
       [
-        { label: "On the site", color: "var(--ok)", note: "", bytes: s.published.bytes },
-        { label: "Only on this PC", color: "var(--panel2)", note: "", bytes: s.local_only.bytes },
+        { label: t("storage.onSite"), color: "var(--ok)", note: "", bytes: s.published.bytes },
+        {
+          label: t("storage.onlyHere"),
+          color: "var(--panel2)",
+          note: "",
+          bytes: s.local_only.bytes,
+        },
       ],
       total,
     ),
@@ -254,13 +256,19 @@ function whereClipsLive(s: StorageStats): HTMLElement {
         "span",
         null,
         h("span", { class: "on-site", text: "●" }),
-        ` On the site · ${clipsNote(s.published.clips)} · ${fmtBytes(s.published.bytes)} local`,
+        t("storage.onSiteLine", {
+          count: clipsNote(s.published.clips),
+          size: fmtBytes(s.published.bytes),
+        }),
       ),
       h(
         "span",
         null,
         h("span", { text: "●" }),
-        ` Only on this PC · ${clipsNote(s.local_only.clips)} · ${fmtBytes(s.local_only.bytes)}`,
+        t("storage.onlyHereLine", {
+          count: clipsNote(s.local_only.clips),
+          size: fmtBytes(s.local_only.bytes),
+        }),
       ),
     ),
   );
@@ -270,11 +278,12 @@ function freeUpSpace(s: StorageStats): HTMLElement {
   const cards = CLEANERS.map((c) => {
     const bucket = c.of(s);
     const empty = bucket.clips === 0;
+    const size = fmtBytes(bucket.bytes);
     const card = h(
       "div",
       { class: `cleaner${empty ? " nothing" : ""}` },
-      h("b", { text: c.label }),
-      h("span", { class: "note", text: c.note }),
+      h("b", { text: t(`storage.cleaner.${c.target}.label`) }),
+      h("span", { class: "note", text: t(`storage.cleaner.${c.target}.note`) }),
     );
     const button = h("button", {
       type: "button",
@@ -282,12 +291,19 @@ function freeUpSpace(s: StorageStats): HTMLElement {
       disabled: empty,
     }) as HTMLButtonElement;
     if (empty) {
-      button.textContent = "Nothing to free";
+      button.textContent = t("storage.nothingToFree");
     } else {
       confirming(
         button,
-        `${c.verb} · frees ${fmtBytes(bucket.bytes)} / ${clipsNote(bucket.clips)}`,
-        `Confirm — ${c.confirmVerb} ${fmtBytes(bucket.bytes)}?`,
+        t("storage.freeButton", {
+          verb: t(`storage.cleaner.${c.target}.verb`),
+          size,
+          count: clipsNote(bucket.clips),
+        }),
+        t("storage.freeConfirm", {
+          verb: t(`storage.cleaner.${c.target}.confirmVerb`),
+          size,
+        }),
         () => void runClean(c.target),
         (armed) => card.classList.toggle("armed", armed),
       );
@@ -300,12 +316,19 @@ function freeUpSpace(s: StorageStats): HTMLElement {
     s.kinds.other_files > 0
       ? h("span", {
           class: "aside",
-          text: ` · ${fmtCount(s.kinds.other_files, "leftover file")} the app doesn't own (${fmtBytes(s.kinds.other)}) are counted but never deleted.`,
+          text: t("storage.leftovers", {
+            count: fmtCount(
+              s.kinds.other_files,
+              t("storage.leftoverOne"),
+              t("storage.leftoverMany"),
+            ),
+            size: fmtBytes(s.kinds.other),
+          }),
         })
       : null;
 
   return block(
-    "Free up space",
+    t("storage.freeUpSpace"),
     h("div", { class: "cleaners" }, ...cards),
     h(
       "span",
@@ -317,14 +340,14 @@ function freeUpSpace(s: StorageStats): HTMLElement {
 }
 
 async function runClean(target: CleanTarget): Promise<void> {
-  cleanResult = { text: "Working…", bad: false };
+  cleanResult = { text: t("storage.working"), bad: false };
   render();
   try {
     const freed = await ipc.cleanStorage(target);
     cleanResult = {
       text: freed.clips
-        ? `Freed ${fmtBytes(freed.bytes)} from ${clipsNote(freed.clips)}.`
-        : "Nothing left to free there.",
+        ? t("storage.freed", { size: fmtBytes(freed.bytes), count: clipsNote(freed.clips) })
+        : t("storage.nothingLeft"),
       bad: false,
     };
   } catch (e) {
@@ -355,9 +378,9 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
   const save = h("button", {
     type: "button",
     class: "btn primary",
-    text: "Save",
+    text: t("storage.save"),
     onclick: async () => {
-      saveMsg = "Saving…";
+      saveMsg = { text: t("storage.saving"), kind: "" };
       render();
       try {
         await ipc.saveSettings({
@@ -365,11 +388,11 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
           delete_source_after_encode: deleteSources.checked,
           storage_limit_gb: Number(limit.value),
         });
-        saveMsg = "Saved";
+        saveMsg = { text: t("storage.saved"), kind: "ok" };
         await loadSettings();
         await loadStorage();
       } catch (e) {
-        saveMsg = ipc.errorText(e);
+        saveMsg = { text: ipc.errorText(e), kind: "err" };
         render();
       }
     },
@@ -378,29 +401,29 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
   return h(
     "div",
     { class: "cap" },
-    h("span", { class: "section-label", text: "Keep it in check" }),
+    h("span", { class: "section-label", text: t("storage.keepInCheck") }),
     h(
       "label",
       { class: "check" },
       deleteSources,
       h("span", { class: "box" }),
-      "Delete the original recording after encoding",
+      t("storage.deleteSources"),
     ),
     h(
       "div",
       { class: "limit" },
-      "Keep at most",
+      t("storage.keepAtMost"),
       limit,
       "GB",
-      h("span", {
-        class: "note",
-        text: "· 0 for no limit. Over the limit, the oldest clips the site already has give up their local video; clips only on this PC are never touched.",
-      }),
+      h("span", { class: "note", text: t("storage.limitNote") }),
     ),
     over
       ? h("div", {
           class: "over",
-          text: `Over the ${settings.storage_limit_gb} GB limit by ${fmtBytes(s.total - cap)}. Nothing more can go automatically: what is left is not on the site yet.`,
+          text: t("storage.over", {
+            limit: settings.storage_limit_gb,
+            size: fmtBytes(s.total - cap),
+          }),
         })
       : null,
     h(
@@ -408,8 +431,8 @@ function keepInCheck(s: StorageStats, settings: Settings): HTMLElement {
       { class: "save-row" },
       save,
       h("span", {
-        class: `msg${saveMsg === "Saved" ? " ok" : saveMsg && saveMsg !== "Saving…" ? " err" : ""}`,
-        text: saveMsg,
+        class: `msg${saveMsg?.kind ? ` ${saveMsg.kind}` : ""}`,
+        text: saveMsg?.text ?? "",
       }),
     ),
   );

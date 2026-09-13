@@ -8,18 +8,21 @@ import {
   clipsNote,
   countByGame,
   FILTERS,
+  filterLabel,
   gameLabel,
   isReleased,
   matchesSearch,
   metaLine,
   sortClips,
+  sortLabel,
   SORTS,
-  UNKNOWN,
+  unknownGame,
   type FilterId,
   type SortId,
 } from "./clips";
 import { confirming, editInline, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhen, hueFor } from "./format";
+import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { go } from "./router";
 import { data, loadClips, loadStorage, on } from "./store";
@@ -74,13 +77,16 @@ export function initLibrary(): void {
     lastStatusKey = key;
     renderMain();
   });
+  onLanguage(() => {
+    if (parts) renderAll();
+  });
 }
 
 let lastStatusKey = "";
 
 export function mountLibrary(root: HTMLElement): void {
-  const sidebar = searchBox("Search clips & games");
-  const compact = searchBox("Search");
+  const sidebar = searchBox(t("library.searchClipsAndGames"));
+  const compact = searchBox(t("library.search"));
   const compactGames = h("select", {
     class: "field",
     onchange: (e: Event) => {
@@ -158,7 +164,7 @@ function searchBox(placeholder: string): { box: HTMLElement; input: HTMLInputEle
     type: "button",
     class: "clear",
     text: "✕",
-    title: "Clear",
+    title: t("library.clear"),
     onclick: () => {
       search = "";
       syncSearchBoxes();
@@ -171,6 +177,8 @@ function searchBox(placeholder: string): { box: HTMLElement; input: HTMLInputEle
 
 function syncSearchBoxes(): void {
   if (!parts) return;
+  parts.sidebarSearch.placeholder = t("library.searchClipsAndGames");
+  parts.compactSearch.placeholder = t("library.search");
   for (const box of [parts.sidebarSearch, parts.compactSearch]) {
     if (box.value !== search) box.value = search;
     const clear = box.nextElementSibling as HTMLElement | null;
@@ -183,7 +191,7 @@ function sortSelect(): HTMLSelectElement {
     "select",
     {
       class: "field",
-      title: "Sort",
+      title: t("library.sort"),
       onchange: (e: Event) => {
         sort = (e.target as HTMLSelectElement).value as SortId;
         for (const other of document.querySelectorAll<HTMLSelectElement>(".sort-select")) {
@@ -192,7 +200,7 @@ function sortSelect(): HTMLSelectElement {
         renderMain();
       },
     },
-    ...SORTS.map((s) => h("option", { value: s.id, text: s.label, selected: s.id === sort })),
+    ...SORTS.map((id) => h("option", { value: id, text: sortLabel(id), selected: id === sort })),
   ) as HTMLSelectElement;
   select.classList.add("sort-select");
   select.value = sort;
@@ -217,7 +225,7 @@ function renderSidebar(): void {
   const unknown = counts.find((g) => g.game === null);
 
   const items: HTMLElement[] = [
-    gameItem("Recent — all games", null, selection.kind === "recent", () => {
+    gameItem(t("library.recentAllGames"), null, selection.kind === "recent", () => {
       selection = { kind: "recent" };
       renderAll();
     }),
@@ -238,8 +246,8 @@ function renderSidebar(): void {
 
   if (unknown) {
     const item = gameItem(
-      UNKNOWN,
-      `${unknown.clips} · fix`,
+      unknownGame(),
+      t("library.unknownCount", { clips: unknown.clips }),
       selection.kind === "game" && selection.game === null,
       () => {
         selection = { kind: "game", game: null };
@@ -247,7 +255,7 @@ function renderSidebar(): void {
       },
       "unknown",
     );
-    item.title = "Clips whose game could not be detected. Open one and name it.";
+    item.title = t("library.unknownTitle");
     item.prepend(h("span", { class: "dot" }));
     items.push(item);
   }
@@ -256,11 +264,13 @@ function renderSidebar(): void {
 
   fill(
     parts.compactGames,
-    h("option", { value: RECENT, text: "All games" }),
+    h("option", { value: RECENT, text: t("library.allGames") }),
     ...named.map((g) =>
       h("option", { value: gameValue(g.game as string), text: `${g.game} · ${g.clips}` }),
     ),
-    unknown ? h("option", { value: UNKNOWN_KEY, text: `${UNKNOWN} · ${unknown.clips}` }) : null,
+    unknown
+      ? h("option", { value: UNKNOWN_KEY, text: `${unknownGame()} · ${unknown.clips}` })
+      : null,
   );
   parts.compactGames.value =
     selection.kind === "recent"
@@ -290,8 +300,8 @@ function renderFooter(): void {
   const stats = data.storage;
   fill(
     parts.storageFoot,
-    stats ? `${fmtBytes(stats.total)} · ${clipsNote(stats.clips)} → ` : "Storage ",
-    h("em", { text: "Storage" }),
+    stats ? `${fmtBytes(stats.total)} · ${clipsNote(stats.clips)} → ` : `${t("library.storage")} `,
+    h("em", { text: t("library.storage") }),
   );
 }
 
@@ -300,9 +310,9 @@ function renderFooter(): void {
 
 /** What the player calls the list it is stepping through: "in this game", or what narrowed it. */
 export function selectionLabel(): string {
-  if (search) return `matching “${search}”`;
-  if (filters.size) return "in this filter";
-  return selection.kind === "game" ? "in this game" : "across all games";
+  if (search) return t("library.scopeSearch", { search });
+  if (filters.size) return t("library.scopeFilter");
+  return selection.kind === "game" ? t("library.scopeGame") : t("library.scopeAll");
 }
 
 /** The clips the current game, search and filters leave, in the current order. The player
@@ -347,16 +357,16 @@ function renderMain(): void {
   const clips = visibleClips();
   const recent = selection.kind === "recent";
 
-  const chips = FILTERS.map((f) => filterChip(f.id, f.label));
+  const chips = FILTERS.map((f) => filterChip(f.id, filterLabel(f.id)));
   if (recent) {
     fill(
       parts.head,
       search
         ? h("span", {
             class: "match-note",
-            text: `${clipsNote(clips.length)} match “${search}” — game name or window title`,
+            text: t("library.matchesSearchLong", { count: clipsNote(clips.length), search }),
           })
-        : h("h2", { text: "Recent" }),
+        : h("h2", { text: t("library.recent") }),
       h("span", { class: "grow" }),
       ...chips,
       sortSelect(),
@@ -371,7 +381,10 @@ function renderMain(): void {
       h("span", { class: "count", text: gameSummary(game) }),
       renameChip(game),
       search
-        ? h("span", { class: "match-note", text: `${clipsNote(clips.length)} match “${search}”` })
+        ? h("span", {
+            class: "match-note",
+            text: t("library.matchesSearch", { count: clipsNote(clips.length), search }),
+          })
         : null,
       h("span", { class: "grow" }),
       sortSelect(),
@@ -395,7 +408,7 @@ function renderMain(): void {
   if (!clips.length) {
     fill(
       parts.scroll,
-      h("div", { class: "empty-state" }, h("span", { text: "Nothing here matches those filters." })),
+      h("div", { class: "empty-state" }, h("span", { text: t("library.nothingMatchesFilters") })),
     );
     return;
   }
@@ -436,9 +449,9 @@ function filterChip(id: FilterId, label: string): HTMLElement {
 function renameChip(game: string | null): HTMLElement {
   const chip = h(
     "button",
-    { type: "button", class: "chip dashed", title: "Rename this game on every clip, or merge it into another" },
-    "Rename / merge game… ",
-    h("b", { class: "new", text: "NEW" }),
+    { type: "button", class: "chip dashed", title: t("library.renameMergeTitle") },
+    t("library.renameMerge"),
+    h("b", { class: "new", text: t("library.new") }),
   );
   chip.addEventListener("click", () => {
     editInline(
@@ -455,7 +468,7 @@ function renameChip(game: string | null): HTMLElement {
           })
           .catch((e) => console.error("rename", e));
       },
-      { placeholder: UNKNOWN },
+      { placeholder: unknownGame() },
     );
   });
   return chip;
@@ -509,7 +522,7 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
       h("button", {
         type: "button",
         class: "btn small",
-        text: "Open folder",
+        text: t("library.openFolder"),
         onclick: () => void ipc.openClipFolder(c.id),
       }),
     );
@@ -517,8 +530,8 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
   actions.append(
     confirming(
       h("button", { type: "button", class: "btn small danger" }) as HTMLButtonElement,
-      "Delete",
-      "Confirm delete",
+      t("library.delete"),
+      t("library.confirmDelete"),
       () => void ipc.deleteClip(c.id),
     ),
   );
@@ -570,7 +583,7 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
         ? h("button", {
             type: "button",
             class: "btn retry",
-            text: "Retry",
+            text: t("library.retry"),
             onclick: (e: Event) => {
               e.stopPropagation();
               void ipc.retryClip(c.id);
@@ -594,17 +607,17 @@ export function copyLinkButton(url: string, className: string): HTMLButtonElemen
   const button = h("button", {
     type: "button",
     class: className,
-    text: "Copy link",
+    text: t("library.copyLink"),
   }) as HTMLButtonElement;
   button.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(url);
-      button.textContent = "Copied";
+      button.textContent = t("library.copied");
       window.setTimeout(() => {
-        button.textContent = "Copy link";
+        button.textContent = t("library.copyLink");
       }, 1500);
     } catch {
-      button.textContent = "Could not copy";
+      button.textContent = t("library.copyFailed");
     }
   });
   return button;
@@ -618,9 +631,9 @@ function emptyLibrary(): HTMLElement {
     h(
       "span",
       null,
-      "No clips yet. Press ",
-      h("span", { class: "key", text: data.status?.hotkey ?? "the hotkey" }),
-      " while playing.",
+      t("library.noClipsYet"),
+      h("span", { class: "key", text: data.status?.hotkey ?? t("library.theHotkey") }),
+      t("library.whilePlaying"),
     ),
   );
 }

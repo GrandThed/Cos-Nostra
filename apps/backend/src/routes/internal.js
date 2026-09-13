@@ -31,10 +31,12 @@ const reactionBody = z.object({
 });
 
 // channelId is a Discord snowflake, so digits only; the emoji list is what the bot seeds on
-// every post, capped so a setup command cannot make the bot rate-limit itself.
+// every post, capped so a setup command cannot make the bot rate-limit itself. locale is one
+// of the bot's supported languages (see apps/bot/src/i18n.js SUPPORTED_LOCALES).
 const guildBody = z.object({
   channelId: z.string().regex(/^[0-9]+$/),
   seedEmojis: z.array(z.string().min(1)).min(1).max(5).optional(),
+  locale: z.enum(['en', 'es']).optional(),
 });
 
 /**
@@ -83,6 +85,7 @@ function guildToJson(row) {
     guildId: row.guildId,
     channelId: row.channelId,
     seedEmojis,
+    locale: row.locale,
   };
 }
 
@@ -222,14 +225,18 @@ async function internalRoutes(app) {
     if (!/^[0-9]+$/.test(guildId)) {
       return reply.code(400).send({ error: 'bad_request', issues: [{ path: ['guildId'], message: 'must be a snowflake' }] });
     }
-    const { channelId, seedEmojis } = parsed.data;
-    // Omitting seedEmojis means "leave it alone": a new row falls back to the column
-    // default, an existing row keeps whatever the guild configured earlier.
+    const { channelId, seedEmojis, locale } = parsed.data;
+    // Omitting seedEmojis or locale means "leave it alone": a new row falls back to the
+    // column default, an existing row keeps whatever the guild configured earlier.
     const values = { guildId, channelId, updatedAt: new Date() };
     const set = { channelId, updatedAt: new Date() };
     if (seedEmojis) {
       values.seedEmojis = JSON.stringify(seedEmojis);
       set.seedEmojis = values.seedEmojis;
+    }
+    if (locale) {
+      values.locale = locale;
+      set.locale = locale;
     }
     const [row] = await app.db
       .insert(guildSettings)

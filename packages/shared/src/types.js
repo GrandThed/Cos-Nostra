@@ -1,5 +1,5 @@
 // JSDoc typedefs mirroring the data model in docs/PLAN.md (phase 3). Import this module for
-// its types; the only runtime export is the clip status list.
+// its types; the only runtime exports are the clip status and locale lists.
 
 /**
  * @typedef {'pending' | 'ready' | 'failed' | 'deleted'} ClipStatus
@@ -7,6 +7,28 @@
 
 /** @type {readonly ClipStatus[]} */
 export const CLIP_STATUSES = Object.freeze(['pending', 'ready', 'failed', 'deleted']);
+
+/**
+ * A language the bot and desktop app can display. Add a code here, plus a locale file in each
+ * app, to support a new language everywhere that reads this list.
+ * @typedef {'en' | 'es'} Locale
+ */
+
+/** @type {readonly Locale[]} */
+export const SUPPORTED_LOCALES = Object.freeze(['en', 'es']);
+
+/** The bot's reply language when a guild has not set one. The community is Spanish-speaking. */
+export const DEFAULT_LOCALE = 'es';
+
+/**
+ * Per-guild bot configuration: where clips get posted, which emojis it seeds on every post,
+ * and what language it replies in.
+ * @typedef {object} GuildSettings
+ * @property {string} guildId
+ * @property {string | null} channelId
+ * @property {string[]} seedEmojis
+ * @property {Locale} locale
+ */
 
 /**
  * @typedef {object} User

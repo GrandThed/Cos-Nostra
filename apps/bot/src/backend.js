@@ -67,21 +67,32 @@ export function createBackend({ baseUrl, botToken, fetch }) {
     getPost: (messageId) => api.getPost(messageId),
 
     /**
-     * Guild configuration, or null when the guild has not been set up.
+     * Guild configuration - clip channel, seed emojis and reply language - or null when the
+     * guild has not been set up. A guild that exists but never picked a language comes back
+     * with the backend's default, so `locale` is always a supported code.
      * @param {string} guildId
+     * @returns {Promise<import('@cos-nostra/shared').GuildSettings | null>}
      */
     getGuild: (guildId) => orNull(() => api.getGuild(guildId)),
 
     /**
+     * The PUT replaces the row, so every field the caller still wants has to be in the body.
+     * `locale` is the exception: leaving it out keeps whatever language the guild has, which
+     * is what /clips setup relies on when the admin only changed the channel.
      * @param {string} guildId
-     * @param {{ channelId?: string | null, seedEmojis?: string[] }} body
+     * @param {{
+     *   channelId?: string | null,
+     *   seedEmojis?: string[],
+     *   locale?: import('@cos-nostra/shared').Locale,
+     * }} body
      */
-    putGuild: (guildId, { channelId, seedEmojis }) => api.putGuild(guildId, { channelId, seedEmojis }),
+    putGuild: (guildId, { channelId, seedEmojis, locale }) =>
+      api.putGuild(guildId, { channelId, seedEmojis, ...(locale ? { locale } : {}) }),
 
     /**
      * Every guild that has been set up. Wrapped in { items } by the backend, like the
      * other listings.
-     * @returns {Promise<{ items: { guildId: string, channelId: string, seedEmojis: string[] }[] }>}
+     * @returns {Promise<{ items: import('@cos-nostra/shared').GuildSettings[] }>}
      */
     listGuilds: () => api.listGuilds(),
 

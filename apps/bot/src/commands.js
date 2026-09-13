@@ -1,6 +1,7 @@
 // Slash commands: one top-level /clips with five subcommands (docs/PLAN.md, phase 4).
 //
-//   /clips setup channel:<#channel>   store the clip channel for this guild (Manage Server)
+//   /clips setup channel:<#channel> [language:]  store the clip channel and reply language
+//                                                for this guild (Manage Server)
 //   /clips latest                     the newest ready clip, as an embed
 //   /clips top [year] [game]          the yearly leaderboard for this guild
 //   /clips mine                       the caller's own clips, ephemeral
@@ -10,9 +11,18 @@
 // three seconds and all five have to cross the network to the backend. Ephemeral-ness is
 // fixed at defer time, which is why the defer, not the edit, carries the flag.
 //
+// Two different languages are in play here, and they are not the same mechanism:
+//
+//   - The *reply* language is the guild's, stored by the backend in guild_settings.locale and
+//     read through localeForGuild() once per interaction. Everything a handler says goes
+//     through t(locale, ...) so one server's members all read the same language.
+//   - The *picker* language is Discord's own: the name and description localizations below
+//     follow the invoking user's client language and are baked into the registered command.
+//     They are polish, and they cannot be per guild.
+//
 // The backend is injected (apps/bot/src/backend.js) so tests never touch HTTP. Errors are
 // duck-typed (name 'ApiError' or a numeric status) rather than imported from
-// @cos-nostra/shared, so this module keeps discord.js as its only import.
+// @cos-nostra/shared, so this module keeps discord.js as its only runtime import.
 
 import {
   ChannelType,
@@ -21,6 +31,10 @@ import {
   PermissionFlagsBits,
   SlashCommandBuilder,
 } from 'discord.js';
+
+import { SUPPORTED_LOCALES, localeForGuild, t } from './i18n.js';
+
+/** @typedef {import('@cos-nostra/shared').Locale} Locale */
 
 /** Brand red, shared by every embed the bot posts. */
 const COLOR = 0xc4302b;
@@ -33,48 +47,59 @@ const EPHEMERAL = new Set(['setup', 'mine', 'link']);
 
 // ---- command definition ----------------------------------------------------------------
 
+/**
+ * English description plus its localizations, from the same dictionaries the replies use.
+ * `es-419` gets the Spanish copy too: the community is Latin American and Discord does not
+ * fall back from one Spanish variant to the other.
+ * @template {{ setDescription: Function, setDescriptionLocalizations: Function }} T
+ * @param {T} builder
+ * @param {string} key  a key under commandDescriptions
+ * @returns {T}
+ */
+function described(builder, key) {
+  const path = `commandDescriptions.${key}`;
+  builder.setDescription(t('en', path));
+  builder.setDescriptionLocalizations({
+    'en-US': t('en', path),
+    'en-GB': t('en', path),
+    'es-ES': t('es', path),
+    'es-419': t('es', path),
+  });
+  return builder;
+}
+
 // A note on permissions. Discord only accepts default_member_permissions on a top-level
 // command, and /clips carries four subcommands every member is meant to use, so putting
 // ManageGuild here would hide /clips latest, top, mine and link from everyone without it.
 // The gate for /clips setup is therefore the runtime check in handleSetup, which is the one
 // that actually holds in any case: a server admin can override default permissions per guild.
-const clips = new SlashCommandBuilder()
-  .setName('clips')
-  .setDescription('Cos Nostra clips')
+const clips = described(new SlashCommandBuilder().setName('clips'), 'clips')
   .addSubcommand((sub) =>
-    sub
-      .setName('setup')
-      .setDescription('Choose the channel new clips are posted to (needs Manage Server)')
+    described(sub.setName('setup'), 'setup')
       .addChannelOption((opt) =>
-        opt
-          .setName('channel')
-          .setDescription('Text channel for new clips')
+        described(opt.setName('channel'), 'setupChannel')
           .addChannelTypes(...TEXT_CHANNELS)
           .setRequired(true),
-      ),
-  )
-  .addSubcommand((sub) => sub.setName('latest').setDescription('Show the most recent clip'))
-  .addSubcommand((sub) =>
-    sub
-      .setName('top')
-      .setDescription('Leaderboard of the most reacted clips')
-      .addIntegerOption((opt) =>
-        opt
-          .setName('year')
-          .setDescription('Year to rank (defaults to the current year)')
-          .setMinValue(2000)
-          .setMaxValue(2100),
       )
+      // Optional on purpose: a guild that never picks one stays on the backend's default,
+      // and an admin changing only the channel must not have to restate the language.
       .addStringOption((opt) =>
-        opt.setName('game').setDescription('Only clips from this game').setMaxLength(200),
+        described(opt.setName('language'), 'setupLanguage').addChoices(
+          { name: 'Español', value: 'es' },
+          { name: 'English', value: 'en' },
+        ),
       ),
   )
+  .addSubcommand((sub) => described(sub.setName('latest'), 'latest'))
   .addSubcommand((sub) =>
-    sub.setName('mine').setDescription('Show your own clips (only you see the reply)'),
+    described(sub.setName('top'), 'top')
+      .addIntegerOption((opt) =>
+        described(opt.setName('year'), 'topYear').setMinValue(2000).setMaxValue(2100),
+      )
+      .addStringOption((opt) => described(opt.setName('game'), 'topGame').setMaxLength(200)),
   )
-  .addSubcommand((sub) =>
-    sub.setName('link').setDescription('How to link the Cos Nostra desktop app to your account'),
-  );
+  .addSubcommand((sub) => described(sub.setName('mine'), 'mine'))
+  .addSubcommand((sub) => described(sub.setName('link'), 'link'));
 
 /**
  * Command payloads ready for Discord's REST API. Consumed by src/deploy-commands.js.
@@ -126,26 +151,31 @@ function formatDuration(ms) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-/** @param {unknown} n */
-function reactorCount(n) {
+/** @param {Locale} locale @param {unknown} n */
+function reactorCount(locale, n) {
   const count = Number(n ?? 0);
-  return `${count} reactor${count === 1 ? '' : 's'}`;
+  return t(locale, count === 1 ? 'top.reactorsOne' : 'top.reactorsMany', { count });
 }
 
-/** Best available human label for a clip. @param {any} clip */
-function clipLabel(clip) {
-  return String(clip?.title || clip?.game || 'Untitled clip').slice(0, 120);
+/** Best available human label for a clip. @param {Locale} locale @param {any} clip */
+function clipLabel(locale, clip) {
+  return String(clip?.title || clip?.game || t(locale, 'common.untitledClip')).slice(0, 120);
 }
 
 /** Markdown link to the player page, or bare text when the clip has no page URL. */
-function clipLink(clip) {
-  const label = clipLabel(clip).replace(/([[\]])/g, '\\$1');
+function clipLink(locale, clip) {
+  const label = clipLabel(locale, clip).replace(/([[\]])/g, '\\$1');
   return isHttpUrl(clip?.urls?.page) ? `[${label}](${clip.urls.page})` : label;
 }
 
-/** @param {any} clip */
-function ownerName(clip) {
-  return clip?.owner?.username || 'someone';
+/** @param {Locale} locale @param {any} clip */
+function ownerName(locale, clip) {
+  return clip?.owner?.username || t(locale, 'common.someone');
+}
+
+/** @param {Locale} locale @param {any} clip */
+function gameName(locale, clip) {
+  return String(clip?.game || t(locale, 'common.unknownGame'));
 }
 
 /** ISO string to a Date the embed builder accepts, or null. @param {unknown} iso */
@@ -157,18 +187,23 @@ function parsedDate(iso) {
 
 /**
  * Embed for a single clip: the thumbnail plus a link to the player page.
+ * @param {Locale} locale
  * @param {any} clip
  */
-function clipEmbed(clip) {
-  const embed = new EmbedBuilder().setColor(COLOR).setTitle(clipLabel(clip));
+function clipEmbed(locale, clip) {
+  const embed = new EmbedBuilder().setColor(COLOR).setTitle(clipLabel(locale, clip));
   if (isHttpUrl(clip?.urls?.page)) embed.setURL(clip.urls.page);
   if (isHttpUrl(clip?.urls?.thumb)) embed.setImage(clip.urls.thumb);
   embed.addFields(
-    { name: 'Game', value: String(clip?.game || 'Unknown'), inline: true },
-    { name: 'Length', value: formatDuration(clip?.durationMs), inline: true },
-    { name: 'Reactions', value: String(Number(clip?.reactions ?? 0)), inline: true },
+    { name: t(locale, 'embed.fieldGame'), value: gameName(locale, clip), inline: true },
+    { name: t(locale, 'embed.fieldLength'), value: formatDuration(clip?.durationMs), inline: true },
+    {
+      name: t(locale, 'embed.fieldReactions'),
+      value: String(Number(clip?.reactions ?? 0)),
+      inline: true,
+    },
   );
-  embed.setFooter({ text: `Clipped by ${ownerName(clip)}` });
+  embed.setFooter({ text: t(locale, 'embed.footer', { user: ownerName(locale, clip) }) });
   const recorded = parsedDate(clip?.recordedAt);
   if (recorded) embed.setTimestamp(recorded);
   return embed;
@@ -184,17 +219,15 @@ function isApiError(err) {
   return Boolean(err) && (err.name === 'ApiError' || typeof err.status === 'number');
 }
 
-/** One line a Discord user can act on. @param {any} err */
-function humanError(err) {
+/** One line a Discord user can act on. @param {Locale} locale @param {any} err */
+function humanError(locale, err) {
   const status = isApiError(err) ? Number(err.status) : 0;
-  if (status === 401 || status === 403) {
-    return 'The bot is not allowed to talk to the Cos Nostra backend. An admin should check BOT_SHARED_SECRET.';
-  }
-  if (status === 404) return 'The backend has nothing for that yet.';
-  if (status === 429) return 'The backend is rate limiting us. Try again in a minute.';
-  if (status >= 500) return 'The Cos Nostra backend is having a moment. Try again shortly.';
-  if (status >= 400) return 'The backend rejected that request, so nothing changed.';
-  return 'Could not reach the Cos Nostra backend. Try again in a moment.';
+  if (status === 401 || status === 403) return t(locale, 'errors.auth');
+  if (status === 404) return t(locale, 'errors.notFound');
+  if (status === 429) return t(locale, 'errors.rateLimited');
+  if (status >= 500) return t(locale, 'errors.server');
+  if (status >= 400) return t(locale, 'errors.badRequest');
+  return t(locale, 'errors.unreachable');
 }
 
 /** @param {any} err */
@@ -221,16 +254,17 @@ function normalizeLog(log) {
  * @typedef {object} HandlerContext
  * @property {any} backend  apps/bot/src/backend.js
  * @property {{ error: Function, warn: Function, info: Function }} log
+ * @property {Locale} locale  the guild's reply language, resolved once per interaction
  */
 
 /**
- * /clips setup - remember the clip channel for this guild.
+ * /clips setup - remember the clip channel, and optionally the reply language, for this guild.
  * @param {any} interaction
  * @param {HandlerContext} ctx
  */
-async function handleSetup(interaction, { backend, log }) {
+async function handleSetup(interaction, { backend, log, locale }) {
   if (!interaction.guildId) {
-    return respond(interaction, { content: 'Run this in the server you want clips posted to.' });
+    return respond(interaction, { content: t(locale, 'setup.guildOnly') });
   }
 
   // The gate that counts: default_member_permissions cannot be scoped to one subcommand and
@@ -240,29 +274,48 @@ async function handleSetup(interaction, { backend, log }) {
     log.info(
       `/clips setup refused for ${interaction.user?.id} in ${interaction.guildId}: no Manage Server`,
     );
-    return respond(interaction, {
-      content: 'You need the **Manage Server** permission to change the clip channel.',
-    });
+    return respond(interaction, { content: t(locale, 'setup.needsPermission') });
   }
 
   const channel = interaction.options.getChannel('channel');
   if (!channel || !TEXT_CHANNELS.includes(channel.type)) {
-    return respond(interaction, {
-      content: 'Pick a normal text channel. Clips cannot be posted to that one.',
-    });
+    return respond(interaction, { content: t(locale, 'setup.badChannel') });
   }
 
+  // Discord constrains `language` to the two choices, but an option is still user input:
+  // anything not in SUPPORTED_LOCALES is dropped rather than sent to the backend, which
+  // would answer 400 and lose the channel change with it.
+  const chosen = interaction.options.getString('language');
+  const language = SUPPORTED_LOCALES.includes(chosen) ? chosen : undefined;
+
   // PUT replaces the row, so read the current config and hand the seed emojis back rather
-  // than dropping them. getGuild returns null for a guild that was never set up.
+  // than dropping them. getGuild returns null for a guild that was never set up. Omitting
+  // `locale` leaves the stored one alone, which is why it is only sent when it was picked.
   const existing = await backend.getGuild(interaction.guildId);
   const seedEmojis = existing?.seedEmojis ?? undefined;
-  const saved = await backend.putGuild(interaction.guildId, { channelId: channel.id, seedEmojis });
+  const saved = await backend.putGuild(interaction.guildId, {
+    channelId: channel.id,
+    seedEmojis,
+    ...(language ? { locale: language } : {}),
+  });
 
+  // The confirmation speaks the language that is in force after the change, not before it.
+  const replyLocale = language ?? locale;
   const seeds = saved?.seedEmojis ?? seedEmojis;
-  const seedLine = Array.isArray(seeds) && seeds.length > 0 ? ` Seed reactions: ${seeds.join(' ')}` : '';
-  log.info(`clip channel for guild ${interaction.guildId} set to ${channel.id}`);
+  const seedLine =
+    Array.isArray(seeds) && seeds.length > 0
+      ? t(replyLocale, 'setup.seedLine', { emojis: seeds.join(' ') })
+      : '';
+  const languageLine = language
+    ? t(replyLocale, 'setup.languageLine', {
+        language: t(replyLocale, `setup.languages.${language}`),
+      })
+    : '';
+  log.info(
+    `clip channel for guild ${interaction.guildId} set to ${channel.id}${language ? `, language ${language}` : ''}`,
+  );
   return respond(interaction, {
-    content: `New clips will be posted to <#${channel.id}>.${seedLine}`,
+    content: `${t(replyLocale, 'setup.saved', { channel: channel.id })}${seedLine}${languageLine}`,
   });
 }
 
@@ -271,15 +324,13 @@ async function handleSetup(interaction, { backend, log }) {
  * @param {any} interaction
  * @param {HandlerContext} ctx
  */
-async function handleLatest(interaction, { backend }) {
+async function handleLatest(interaction, { backend, locale }) {
   const { items = [] } = (await backend.listClips({ sort: 'recent', limit: 1 })) ?? {};
   const clip = items[0];
   if (!clip) {
-    return respond(interaction, {
-      content: 'No clips yet. Press the hotkey in a game and this will fill up.',
-    });
+    return respond(interaction, { content: t(locale, 'latest.empty') });
   }
-  return respond(interaction, { embeds: [clipEmbed(clip)] });
+  return respond(interaction, { embeds: [clipEmbed(locale, clip)] });
 }
 
 /**
@@ -287,9 +338,9 @@ async function handleLatest(interaction, { backend }) {
  * @param {any} interaction
  * @param {HandlerContext} ctx
  */
-async function handleTop(interaction, { backend }) {
+async function handleTop(interaction, { backend, locale }) {
   if (!interaction.guildId) {
-    return respond(interaction, { content: 'Rankings are per server, so run this in one.' });
+    return respond(interaction, { content: t(locale, 'top.guildOnly') });
   }
   const year = interaction.options.getInteger('year') ?? new Date().getUTCFullYear();
   const game = interaction.options.getString('game');
@@ -309,22 +360,26 @@ async function handleTop(interaction, { backend }) {
     return respond(interaction, {
       // The game name is whatever the caller typed, so it is quoted rather than echoed raw.
       content: game
-        ? `No ranked ${quoted(game)} clips in ${year} yet.`
-        : `No clips have been reacted to in ${year} yet.`,
+        ? t(locale, 'top.emptyGame', { game: quoted(game), year })
+        : t(locale, 'top.empty', { year }),
     });
   }
 
   const lines = rows.map((row, i) => {
     const clip = row?.clip ?? {};
-    const parts = [ownerName(clip), clip.game || 'Unknown', reactorCount(row?.distinctReactors)];
-    return `**${i + 1}.** ${clipLink(clip)} - ${parts.join(' - ')}`;
+    const parts = [
+      ownerName(locale, clip),
+      gameName(locale, clip),
+      reactorCount(locale, row?.distinctReactors),
+    ];
+    return `**${i + 1}.** ${clipLink(locale, clip)} - ${parts.join(' - ')}`;
   });
 
   const embed = new EmbedBuilder()
     .setColor(COLOR)
-    .setTitle(`Top clips of ${year}`)
+    .setTitle(t(locale, 'top.title', { year }))
     .setDescription(lines.join('\n'));
-  if (game) embed.setFooter({ text: `Filtered to ${game} within this year's top 10` });
+  if (game) embed.setFooter({ text: t(locale, 'top.footer', { game }) });
   const best = rows[0]?.clip;
   if (isHttpUrl(best?.urls?.thumb)) embed.setThumbnail(best.urls.thumb);
   return respond(interaction, { embeds: [embed] });
@@ -335,26 +390,27 @@ async function handleTop(interaction, { backend }) {
  * @param {any} interaction
  * @param {HandlerContext} ctx
  */
-async function handleMine(interaction, { backend }) {
+async function handleMine(interaction, { backend, locale }) {
   // The backend's `user` filter matches users.discord_id, which is exactly this id.
   const { items = [] } = (await backend.listClips({ user: interaction.user.id, limit: 5 })) ?? {};
   if (items.length === 0) {
-    return respond(interaction, {
-      content:
-        'You have no uploaded clips yet. Link the desktop app with `/clips link` and save one.',
-    });
+    return respond(interaction, { content: t(locale, 'mine.empty') });
   }
   const lines = items.map((clip, i) => {
     const when = parsedDate(clip?.recordedAt);
-    const stamp = when ? `<t:${Math.floor(when.getTime() / 1000)}:R>` : 'unknown date';
+    // A Discord timestamp renders in each reader's own language and time zone, so it is
+    // left to the client rather than formatted here.
+    const stamp = when
+      ? `<t:${Math.floor(when.getTime() / 1000)}:R>`
+      : t(locale, 'mine.unknownDate');
     const length = formatDuration(clip?.durationMs);
-    return `**${i + 1}.** ${clipLink(clip)} - ${clip?.game || 'Unknown'} - ${length} - ${stamp}`;
+    return `**${i + 1}.** ${clipLink(locale, clip)} - ${gameName(locale, clip)} - ${length} - ${stamp}`;
   });
   const embed = new EmbedBuilder()
     .setColor(COLOR)
-    .setTitle('Your clips')
+    .setTitle(t(locale, 'mine.title'))
     .setDescription(lines.join('\n'))
-    .setFooter({ text: `Your ${items.length} most recent` });
+    .setFooter({ text: t(locale, 'mine.footer', { count: items.length }) });
   return respond(interaction, { embeds: [embed] });
 }
 
@@ -374,15 +430,11 @@ async function handleMine(interaction, { backend }) {
  * is what the user checks the browser against.
  *
  * @param {any} interaction
- * @param {HandlerContext} _ctx
+ * @param {HandlerContext} ctx
  */
-async function handleLink(interaction, _ctx) {
+async function handleLink(interaction, { locale }) {
   return respond(interaction, {
-    content: [
-      'Link the desktop app from the app itself: open **Cos Nostra**, go to **Settings**, and press **Link Discord**.',
-      'It opens your browser and shows an eight-character code. Check that the page shows the same code before you press Continue, and never approve a link page you did not start yourself.',
-      'Once it says linked, your clips upload on their own.',
-    ].join('\n'),
+    content: [t(locale, 'link.open'), t(locale, 'link.verify'), t(locale, 'link.done')].join('\n'),
   });
 }
 
@@ -434,14 +486,19 @@ async function handleInteraction(interaction, { backend, log }) {
     return;
   }
 
+  // After the defer, because this crosses the network too and the three-second window is
+  // spent on the acknowledgement, not on a language lookup. localeForGuild never throws, so
+  // a guild whose config cannot be read still gets an answer, in Spanish.
+  const locale = await localeForGuild(backend, interaction.guildId);
+
   try {
-    await handler(interaction, { backend, log });
+    await handler(interaction, { backend, log, locale });
   } catch (err) {
     const status = isApiError(err) ? ` (status ${err.status})` : '';
     log.error(`/clips ${sub} failed${status}: ${errorText(err)}`);
     if (!deferred) return;
     try {
-      await respond(interaction, { content: humanError(err), embeds: [] });
+      await respond(interaction, { content: humanError(locale, err), embeds: [] });
     } catch (editErr) {
       // The interaction token expires after 15 minutes; nothing left to do but log it.
       log.warn(`could not edit the deferred /clips ${sub} reply: ${errorText(editErr)}`);

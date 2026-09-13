@@ -1,5 +1,7 @@
 /** Numbers and dates as the design writes them. */
 
+import { locale, t } from "./i18n";
+
 /** Sizes as the design writes them: three significant figures at most, so "212 MB" and
  *  "6.1 MB" and "51.5 GB" but never "212.4 MB". */
 export function fmtBytes(n: number | null | undefined): string {
@@ -43,32 +45,32 @@ const TIME: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", h
 /** The day a clip belongs to, as a heading: "Tonight", "Yesterday", "Tuesday", "12 August". */
 export function dayLabel(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "Earlier";
+  if (Number.isNaN(d.getTime())) return t("format.earlier");
   const ago = daysAgo(d);
-  if (ago <= 0) return "Tonight";
-  if (ago === 1) return "Yesterday";
-  if (ago < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
-  return d.toLocaleDateString(undefined, { day: "numeric", month: "long" });
+  if (ago <= 0) return t("format.tonight");
+  if (ago === 1) return t("format.yesterday");
+  if (ago < 7) return d.toLocaleDateString(locale(), { weekday: "long" });
+  return d.toLocaleDateString(locale(), { day: "numeric", month: "long" });
 }
 
 /** "Tonight 01:12" — the day label plus the clock, which is how every clip is named. */
 export function fmtWhen(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return `${dayLabel(iso)} ${d.toLocaleTimeString(undefined, TIME)}`;
+  return `${dayLabel(iso)} ${d.toLocaleTimeString(locale(), TIME)}`;
 }
 
 /** The same, with a comma, for the metadata grid: "Tonight, 01:12". */
 export function fmtWhenLong(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return `${dayLabel(iso)}, ${d.toLocaleTimeString(undefined, TIME)}`;
+  return `${dayLabel(iso)}, ${d.toLocaleTimeString(locale(), TIME)}`;
 }
 
 export function fmtTimeOnly(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleTimeString(undefined, TIME);
+  return d.toLocaleTimeString(locale(), TIME);
 }
 
 /** A stable hue per clip, so the placeholder behind a missing thumbnail is at least its own. */

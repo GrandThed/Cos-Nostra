@@ -240,6 +240,33 @@ test('a 27 MB clip in a tier 0 guild is posted as an embed with the player link'
   );
   assert.ok(payload.content.includes('Ace on Ascent'), 'content still names the clip');
   assert.ok(payload.content.includes('benja'), 'content still names the owner');
+  // A guild with no stored language gets Spanish, the community default.
+  assert.ok(payload.content.startsWith('Ace on Ascent - por benja'), payload.content);
+});
+
+test('the message is written in each guild own language', async () => {
+  const clip = makeClip();
+  const spanish = makeChannel({ channelId: 'c1', guildId: 'g1', premiumTier: 0, messageId: 'm1' });
+  const english = makeChannel({ channelId: 'c2', guildId: 'g2', premiumTier: 0, messageId: 'm2' });
+  const backend = makeBackend({
+    clip,
+    guilds: [
+      { guildId: 'g1', channelId: 'c1', seedEmojis: [], locale: 'es' },
+      { guildId: 'g2', channelId: 'c2', seedEmojis: [], locale: 'en' },
+    ],
+  });
+  const poster = createPoster({
+    client: client({ c1: spanish, c2: english }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  // One clip, one postClip call, two languages: the locale belongs to the destination.
+  assert.ok(spanish.sent[0].content.startsWith('Ace on Ascent - por benja'));
+  assert.ok(english.sent[0].content.startsWith('Ace on Ascent - by benja'));
 });
 
 test('the safety margin keeps a clip just under the raw limit off the attachment path', async () => {

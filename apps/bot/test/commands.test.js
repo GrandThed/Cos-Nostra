@@ -155,10 +155,22 @@ test('commands is JSON for one /clips command with the five subcommands', () => 
     ['setup', 'latest', 'top', 'mine', 'link'],
   );
 
+  // The picker descriptions follow the caller's own Discord language, unlike the replies.
+  assert.equal(clips.description_localizations['es-ES'], 'Clips de Cos Nostra');
+  assert.equal(clips.description_localizations['es-419'], 'Clips de Cos Nostra');
+
   const setup = subs.find((opt) => opt.name === 'setup');
   const channel = setup.options.find((opt) => opt.name === 'channel');
   assert.equal(channel.required, true);
   assert.ok(channel.channel_types.includes(ChannelType.GuildText));
+
+  // The language option is optional: a guild that never picks one keeps the backend default.
+  const language = setup.options.find((opt) => opt.name === 'language');
+  assert.equal(language.required, false);
+  assert.deepEqual(
+    language.choices.map((choice) => choice.value),
+    ['es', 'en'],
+  );
 
   const top = subs.find((opt) => opt.name === 'top');
   const byName = Object.fromEntries(top.options.map((opt) => [opt.name, opt]));
@@ -188,8 +200,10 @@ test('/clips setup stores the channel and confirms ephemerally', async () => {
 });
 
 test('/clips setup is refused for a member without Manage Guild', async () => {
+  // getGuild is allowed here: every interaction reads the guild to pick a reply language.
+  // What must not happen is the write.
   const backend = {
-    getGuild: async () => assert.fail('getGuild must not be called'),
+    getGuild: async () => ({ guildId: 'guild-1', channelId: null, seedEmojis: [], locale: 'en' }),
     putGuild: async () => assert.fail('putGuild must not be called'),
   };
   const interaction = makeInteraction({
@@ -207,7 +221,7 @@ test('/clips setup is refused for a member without Manage Guild', async () => {
 
 test('/clips setup rejects a channel it cannot post clips into', async () => {
   const backend = {
-    getGuild: async () => assert.fail('getGuild must not be called'),
+    getGuild: async () => ({ guildId: 'guild-1', channelId: null, seedEmojis: [], locale: 'en' }),
     putGuild: async () => assert.fail('putGuild must not be called'),
   };
   const interaction = makeInteraction({
@@ -217,6 +231,66 @@ test('/clips setup rejects a channel it cannot post clips into', async () => {
   await run(interaction, backend);
 
   assert.match(lastEdit(interaction).content, /text channel/i);
+});
+
+test('/clips setup stores the chosen language and confirms in it', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => ({ guildId: 'guild-1', channelId: null, seedEmojis: [], locale: 'es' }),
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...body };
+    },
+  };
+  const interaction = makeInteraction({
+    sub: 'setup',
+    options: { channel: textChannel(), language: 'en' },
+  });
+  await run(interaction, backend);
+
+  assert.equal(putCalls[0][1].locale, 'en');
+  const { content } = lastEdit(interaction);
+  // The confirmation speaks the language that is in force after the change, not before it.
+  assert.match(content, /New clips will be posted to <#chan-9>/);
+  assert.match(content, /Language: English/);
+});
+
+test('/clips setup leaves the stored language alone when none was picked', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => ({ guildId: 'guild-1', channelId: null, seedEmojis: [], locale: 'en' }),
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...body };
+    },
+  };
+  const interaction = makeInteraction({ sub: 'setup', options: { channel: textChannel() } });
+  await run(interaction, backend);
+
+  // Omitting `locale` is what tells the backend to keep the guild's current language.
+  assert.equal('locale' in putCalls[0][1], false);
+  // And the reply is in that language, which is English for this guild.
+  assert.match(lastEdit(interaction).content, /New clips will be posted to/);
+});
+
+test('/clips setup ignores a language that is not supported', async () => {
+  const putCalls = [];
+  const backend = {
+    getGuild: async () => null,
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...body };
+    },
+  };
+  const interaction = makeInteraction({
+    sub: 'setup',
+    options: { channel: textChannel(), language: 'fr' },
+  });
+  await run(interaction, backend);
+
+  // Sending it on would be a 400 that also loses the channel change.
+  assert.equal('locale' in putCalls[0][1], false);
+  assert.match(lastEdit(interaction).content, /se van a publicar/);
 });
 
 // ---- /clips latest ---------------------------------------------------------------------
@@ -240,11 +314,27 @@ test('/clips latest embeds the newest clip with its thumbnail and player page', 
   assert.equal(embed.title, 'Ceiling shot');
   assert.equal(embed.url, CLIP.urls.page);
   assert.equal(embed.image.url, CLIP.urls.thumb);
+  // A guild with no config replies in Spanish, so the field names are the Spanish ones.
+  const fields = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+  assert.equal(fields.Juego, 'Rocket League');
+  assert.equal(fields.Duración, '0:33');
+  assert.equal(fields.Reacciones, '7');
+  assert.match(embed.footer.text, /Clipeado por benja/);
+});
+
+test('/clips latest embeds in English for a guild set to English', async () => {
+  const backend = {
+    getGuild: async () => ({ guildId: 'guild-1', channelId: 'c1', seedEmojis: [], locale: 'en' }),
+    listClips: async () => ({ items: [CLIP], nextCursor: null }),
+  };
+  const interaction = makeInteraction({ sub: 'latest' });
+  await run(interaction, backend);
+
+  const embed = embedOf(lastEdit(interaction));
   const fields = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
   assert.equal(fields.Game, 'Rocket League');
   assert.equal(fields.Length, '0:33');
-  assert.equal(fields.Reactions, '7');
-  assert.match(embed.footer.text, /benja/);
+  assert.match(embed.footer.text, /Clipped by benja/);
 });
 
 test('/clips latest says something friendly when there are no clips', async () => {
@@ -254,7 +344,7 @@ test('/clips latest says something friendly when there are no clips', async () =
 
   const payload = lastEdit(interaction);
   assert.equal(payload.embeds, undefined);
-  assert.match(payload.content, /no clips/i);
+  assert.match(payload.content, /no hay clips/i);
 });
 
 // ---- /clips top ------------------------------------------------------------------------
@@ -287,8 +377,28 @@ test('/clips top ranks this guild for the current UTC year', async () => {
   assert.match(lines[0], /\[Ceiling shot\]\(https:\/\/cosnostra\.benja\.ar\/c\/abc123456789\)/);
   assert.match(lines[0], /benja/);
   assert.match(lines[0], /Rocket League/);
-  assert.match(lines[0], /5 reactors/);
+  assert.match(lines[0], /5 personas/);
   assert.match(lines[1], /\*\*2\.\*\*/);
+  assert.match(lines[1], /1 persona\b/);
+});
+
+test('/clips top counts reactors in the guild language', async () => {
+  const backend = {
+    getGuild: async () => ({ guildId: 'guild-1', channelId: 'c1', seedEmojis: [], locale: 'en' }),
+    getRankings: async () => ({
+      items: [
+        { clip: CLIP, reactions: 7, distinctReactors: 5 },
+        { clip: OTHER_CLIP, reactions: 3, distinctReactors: 1 },
+      ],
+    }),
+  };
+  const interaction = makeInteraction({ sub: 'top' });
+  await run(interaction, backend);
+
+  const embed = embedOf(lastEdit(interaction));
+  assert.match(embed.title, /^Top clips of /);
+  const lines = embed.description.split('\n');
+  assert.match(lines[0], /5 reactors/);
   assert.match(lines[1], /1 reactor\b/);
 });
 
@@ -383,10 +493,11 @@ test('/clips link points at the desktop app and starts no device login', async (
     assert.equal(interaction.calls.editReply.length, 1);
 
     const { content } = lastEdit(interaction);
-    assert.match(content, /Settings/);
-    assert.match(content, /Link Discord/);
+    // Spanish, because this guild has no stored language.
+    assert.match(content, /Configuración/);
+    assert.match(content, /Vincular Discord/);
     // The confirmation page is only worth anything if people know to check the code.
-    assert.match(content, /code/i);
+    assert.match(content, /código/i);
     // No link to click: a login URL arriving in chat is the exact shape of the attack the
     // confirmation page exists to stop, and the bot should not teach people to trust one.
     assert.doesNotMatch(content, /https?:\/\//);
@@ -490,6 +601,80 @@ test('registerCommands rejects a missing client or backend', () => {
   assert.throws(() => registerCommands({ client: new EventEmitter() }), TypeError);
 });
 
+// ---- language --------------------------------------------------------------------------
+
+test('a guild with no configuration is answered in Spanish', async () => {
+  // getGuild answering null is the shape of a guild nobody has run /clips setup in.
+  const backend = {
+    getGuild: async () => null,
+    listClips: async () => ({ items: [], nextCursor: null }),
+  };
+  const interaction = makeInteraction({ sub: 'mine' });
+  await run(interaction, backend);
+
+  assert.match(lastEdit(interaction).content, /Todavía no subiste/);
+});
+
+test('an unreadable guild config still gets a reply, in Spanish', async () => {
+  const err = new Error('backend is redeploying');
+  err.name = 'ApiError';
+  err.status = 503;
+  const backend = {
+    getGuild: async () => {
+      throw err;
+    },
+    listClips: async () => ({ items: [], nextCursor: null }),
+  };
+  const interaction = makeInteraction({ sub: 'latest' });
+  const log = await run(interaction, backend);
+
+  // Failing to read a language is never the reason a command has no answer, and it is not
+  // reported as a command failure either.
+  assert.match(lastEdit(interaction).content, /no hay clips/i);
+  assert.deepEqual(log.lines.error, []);
+});
+
+test('a DM never asks the backend which language to use', async () => {
+  const backend = {
+    getGuild: async () => assert.fail('there is no guild to read'),
+  };
+  const interaction = makeInteraction({ sub: 'link', guildId: null });
+  await run(interaction, backend);
+
+  assert.match(lastEdit(interaction).content, /Vincular Discord/);
+});
+
+test('/clips link answers in English for a guild set to English', async () => {
+  const backend = {
+    getGuild: async () => ({ guildId: 'guild-1', channelId: 'c1', seedEmojis: [], locale: 'en' }),
+  };
+  const interaction = makeInteraction({ sub: 'link' });
+  await run(interaction, backend);
+
+  const { content } = lastEdit(interaction);
+  assert.match(content, /Link Discord/);
+  assert.doesNotMatch(content, /https?:\/\//);
+});
+
+test('the error line is translated too', async () => {
+  const err = new Error('down');
+  err.name = 'ApiError';
+  err.status = 500;
+  const failing = async () => {
+    throw err;
+  };
+  const spanish = makeInteraction({ sub: 'latest' });
+  await run(spanish, { getGuild: async () => null, listClips: failing });
+  assert.match(lastEdit(spanish).content, /mal momento/);
+
+  const english = makeInteraction({ sub: 'latest' });
+  await run(english, {
+    getGuild: async () => ({ guildId: 'guild-1', seedEmojis: [], locale: 'en' }),
+    listClips: failing,
+  });
+  assert.match(lastEdit(english).content, /having a moment/);
+});
+
 // ---- mentions --------------------------------------------------------------------------
 
 test('/clips top does not echo a mention in the game option back into the channel', async () => {
@@ -510,7 +695,7 @@ test('/clips top does not echo a mention in the game option back into the channe
   // And the value is quoted rather than echoed raw, so it reads as a value and cannot close
   // the code span it is in.
   assert.match(payload.content, /`@everyone <@&1234567890>`/);
-  assert.doesNotMatch(payload.content, /No ranked @everyone/);
+  assert.doesNotMatch(payload.content, /clips de @everyone/);
 });
 
 test('a game option full of backticks cannot break out of its code span', async () => {

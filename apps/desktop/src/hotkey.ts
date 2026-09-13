@@ -5,6 +5,7 @@
  *  Keyboard-first: the control takes focus, Enter starts listening, Esc cancels. */
 
 import { h } from "./dom";
+import { t } from "./i18n";
 
 const MODIFIER_CODES = new Set([
   "ControlLeft",
@@ -62,9 +63,12 @@ export function hotkeyControl(initial: string, onChange?: (hotkey: string) => vo
     type: "button",
     class: "btn small",
     hidden: true,
-    title: "Stop listening",
+    title: t("hotkey.stopListening"),
   });
-  cancel.append("Cancel ", h("span", { class: "mono", style: "font-size:11px", text: "Esc" }));
+  cancel.append(
+    t("hotkey.cancel"),
+    h("span", { class: "mono", style: "font-size:11px", text: "Esc" }),
+  );
   const warn = h("span", { class: "warn" });
 
   const paint = () => {
@@ -96,7 +100,7 @@ export function hotkeyControl(initial: string, onChange?: (hotkey: string) => vo
     }
     if (!mods.length && !F_KEY.test(code)) {
       showHeld([]);
-      warn.textContent = "Add a modifier (Ctrl, Alt, Shift) or use an F-key.";
+      warn.textContent = t("hotkey.needsModifier");
       return;
     }
     value = [...mods, prettyKey(code)].join("+");
@@ -134,13 +138,10 @@ export function hotkeyControl(initial: string, onChange?: (hotkey: string) => vo
   const node = h(
     "div",
     { class: "hotkey-block" },
-    h("span", { class: "name", text: "Save-clip hotkey" }),
+    h("span", { class: "name", text: t("hotkey.name") }),
     h("div", { class: "hotkey-row" }, box, cancel),
     warn,
-    h("span", {
-      class: "note",
-      text: "Tab to the control and press Enter to start listening — no mouse needed. Saving re-registers the key and warns if another app owns it.",
-    }),
+    h("span", { class: "note", text: t("hotkey.note") }),
   );
 
   return {

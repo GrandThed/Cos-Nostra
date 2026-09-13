@@ -1,0 +1,1 @@
+ALTER TABLE "guild_settings" ADD COLUMN "locale" text DEFAULT 'es' NOT NULL;

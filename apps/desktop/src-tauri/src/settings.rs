@@ -46,6 +46,16 @@ pub enum EncodeEngine {
     Cpu,
 }
 
+/// Language of everything the user reads: the web UI, the tray menu and the toasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    /// The default. The community this app is built for is Spanish-speaking.
+    #[default]
+    Es,
+    En,
+}
+
 /// The Discord user this device is linked to, as reported by the backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -84,6 +94,8 @@ pub struct Settings {
     /// Hardware or software encoding for finished clips. Not the replay buffer, which is
     /// always hardware.
     pub encode_engine: EncodeEngine,
+    /// Language of the interface, the tray menu and the toasts.
+    pub language: Language,
     /// Base URL of the Cos Nostra backend, no trailing slash.
     pub backend_url: String,
     /// Long-lived device token from the Discord device login. `None` when logged out.
@@ -135,6 +147,7 @@ impl Default for Settings {
             encode_while_gaming: false,
             quality: Quality::default(),
             encode_engine: EncodeEngine::default(),
+            language: Language::default(),
             backend_url: DEFAULT_BACKEND_URL.into(),
             device_token: None,
             account: None,
@@ -382,6 +395,8 @@ mod tests {
         // Session recording arrived after that, on by default.
         assert!(s.record_sessions);
         assert!(s.open_after_session);
+        // Localization arrived last; an install from before it reads as Spanish, like a new one.
+        assert_eq!(s.language, Language::Es);
         // A settings file is proof the app has run here, so the first-run flow stays away
         // even though the key that records it was only added with the new window.
         assert!(s.first_run_done);
@@ -412,5 +427,23 @@ mod tests {
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.quality, Quality::Small);
         assert_eq!(back.encode_engine, EncodeEngine::Gpu);
+    }
+
+    #[test]
+    fn the_language_round_trips_as_a_two_letter_code() {
+        // Same contract as quality and encode_engine: these are the <select> values in the UI.
+        let mut s = Settings::default();
+        assert_eq!(s.language, Language::Es);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""language":"es""#), "{json}");
+
+        s.language = Language::En;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""language":"en""#), "{json}");
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.language, Language::En);
+        let es: Settings = serde_json::from_str(r#"{"language":"es"}"#).unwrap();
+        assert_eq!(es.language, Language::Es);
     }
 }

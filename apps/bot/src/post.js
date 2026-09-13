@@ -14,6 +14,8 @@
 
 import { AttachmentBuilder } from 'discord.js';
 
+import { resolveLocale, t } from './i18n.js';
+
 const MB = 1024 * 1024;
 
 /**
@@ -86,9 +88,9 @@ function attachmentName(clip) {
   return base === id ? `${id}.mp4` : `${base}-${id}.mp4`;
 }
 
-/** @param {Clip} clip */
-function clipTitle(clip) {
-  return truncate(clip.title || clip.game || 'Clip', MAX_TITLE);
+/** @param {Clip} clip @param {import('@cos-nostra/shared').Locale} locale */
+function clipTitle(clip, locale) {
+  return truncate(clip.title || clip.game || t(locale, 'post.defaultTitle'), MAX_TITLE);
 }
 
 /**
@@ -99,12 +101,17 @@ function clipTitle(clip) {
  * an inline player for a clip too big to attach. Wrapping the URL in angle brackets
  * suppresses the preview, so it is only wrapped when a real attachment is already playing
  * inline and a second player would be noise.
+ *
+ * The language is the destination guild's, not the uploader's: the same clip goes out in
+ * Spanish to one server and in English to another in the same postClip() run.
  * @param {Clip} clip
- * @param {{ unfurl: boolean }} opts  unfurl: let Discord build its video preview
+ * @param {{ unfurl: boolean, locale: import('@cos-nostra/shared').Locale }} opts
+ *   unfurl: let Discord build its video preview
  */
-function messageContent(clip, { unfurl }) {
+function messageContent(clip, { unfurl, locale }) {
   const who = clip.owner?.username;
-  const head = who ? `${clipTitle(clip)} - ${who}` : clipTitle(clip);
+  const title = clipTitle(clip, locale);
+  const head = who ? t(locale, 'post.byOwner', { title, user: who }) : title;
   const link = unfurl ? clip.urls.page : `<${clip.urls.page}>`;
   return truncate(`${head}\n${link}`, MAX_CONTENT);
 }
@@ -136,6 +143,7 @@ function isSendableText(channel) {
  * @property {string} guildId
  * @property {string} channelId
  * @property {string[]} seedEmojis
+ * @property {import('@cos-nostra/shared').Locale} [locale]
  */
 
 /** @typedef {{ guildId: string, channelId: string, messageId: string }} PostedMessage */
@@ -188,6 +196,8 @@ export function createPoster({
     const limit = uploadLimitBytes(tier);
     const size = Number(clip.sizeH264);
     const fits = Number.isFinite(size) && size > 0 && size < limit * SIZE_MARGIN;
+    // GET /internal/guilds carries the locale, so posting needs no extra round trip for it.
+    const locale = resolveLocale(config.locale);
 
     if (fits) {
       try {
@@ -196,7 +206,7 @@ export function createPoster({
           `clip ${clip.id}: attaching ${size} B in guild ${config.guildId} (tier ${tier}, limit ${limit} B)`,
         );
         return {
-          content: messageContent(clip, { unfurl: false }),
+          content: messageContent(clip, { unfurl: false, locale }),
           files: [new AttachmentBuilder(bytes, { name: attachmentName(clip) })],
           allowedMentions: noMentions(),
         };
@@ -216,7 +226,10 @@ export function createPoster({
     // 2026-09-11 — a rich embed plus a bare URL produced one `type=rich` embed and no
     // player, while the URL alone produced `type=video` at 1920x1080. The page's og: tags
     // already supply the title, owner, game, duration and thumbnail, so nothing is lost.
-    return { content: messageContent(clip, { unfurl: true }), allowedMentions: noMentions() };
+    return {
+      content: messageContent(clip, { unfurl: true, locale }),
+      allowedMentions: noMentions(),
+    };
   }
 
   /**

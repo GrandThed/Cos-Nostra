@@ -9,6 +9,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { confirming, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhenLong, hueFor } from "./format";
+import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { go } from "./router";
 import { data, loadClips, loadSessions, on } from "./store";
@@ -60,6 +61,12 @@ const thumbs = new Map<number, { key: string; url: string | null }>();
 export function initMatches(): void {
   on("sessions", () => {
     if (parts) render();
+  });
+  onLanguage(() => {
+    if (!parts) return;
+    // The match on screen is keyed on its data, which the language does not touch.
+    teardown();
+    render();
   });
 }
 
@@ -135,11 +142,7 @@ function renderList(): void {
         { class: "session-empty" },
         error
           ? h("span", { class: "muted", text: error })
-          : h(
-              "span",
-              { class: "muted" },
-              "Nothing recorded yet. Play Valorant, League of Legends or Counter-Strike and every match lands here when you close the game.",
-            ),
+          : h("span", { class: "muted", text: t("matches.nothingRecorded") }),
       ),
     );
     return;
@@ -161,11 +164,11 @@ function renderList(): void {
 function sessionBlock(s: SessionRow): HTMLElement {
   const badge =
     s.status === "recording"
-      ? h("span", { class: "badge live", text: "● Recording" })
+      ? h("span", { class: "badge live", text: t("matches.recordingBadge") })
       : s.status === "processing"
-        ? h("span", { class: "badge encoding", text: "Cutting…" })
+        ? h("span", { class: "badge encoding", text: t("matches.cuttingBadge") })
         : s.status === "failed"
-          ? h("span", { class: "badge failed", text: "Failed" })
+          ? h("span", { class: "badge failed", text: t("matches.failedBadge") })
           : null;
   const current = selection?.kind === "session" && selection.id === s.id;
   return h(
@@ -232,20 +235,24 @@ function showThumb(img: HTMLImageElement, m: MatchRow): void {
 
 function timeRange(s: SessionRow): string {
   const from = fmtTimeOnly(s.started_at);
-  return s.ended_at ? `${from}–${fmtTimeOnly(s.ended_at)}` : `${from}–now`;
+  return s.ended_at ? `${from}–${fmtTimeOnly(s.ended_at)}` : `${from}–${t("matches.now")}`;
 }
 
 function sessionNote(s: SessionRow): string {
-  if (s.status === "recording") return "No match yet.";
-  if (s.status === "processing") return "Cutting into matches…";
-  if (s.status === "failed") return s.error ?? "Could not be cut.";
-  return "No matches.";
+  if (s.status === "recording") return t("matches.noMatchYet");
+  if (s.status === "processing") return t("matches.cuttingIntoMatches");
+  if (s.status === "failed") return s.error ?? t("matches.couldNotCut");
+  return t("matches.noMatches");
 }
 
 function matchTitle(m: MatchRow, index: number, s: SessionRow): string {
-  if (!m.detected) return s.matches.length > 1 ? `Recording ${index + 1}` : "Whole session";
+  if (!m.detected) {
+    return s.matches.length > 1
+      ? t("matches.recordingN", { n: index + 1 })
+      : t("matches.wholeSession");
+  }
   const parts = [m.map, m.mode].filter(Boolean);
-  return parts.length ? parts.join(" · ") : `Match ${index + 1}`;
+  return parts.length ? parts.join(" · ") : t("matches.matchN", { n: index + 1 });
 }
 
 function score(m: MatchRow): string | null {
@@ -255,20 +262,20 @@ function score(m: MatchRow): string | null {
 function matchMeta(m: MatchRow): string {
   switch (m.status) {
     case "live":
-      return ["in progress", score(m)].filter(Boolean).join(" · ");
+      return [t("matches.metaInProgress"), score(m)].filter(Boolean).join(" · ");
     case "pending":
-      return "waiting to be cut";
+      return t("matches.metaPending");
     case "missing":
-      return "no footage";
+      return t("matches.metaMissing");
     case "failed":
-      return "could not be cut";
+      return t("matches.metaFailed");
     case "ready":
       return [fmtDuration(m.duration_ms ?? 0), score(m)].filter(Boolean).join(" · ");
   }
 }
 
 function resultLetter(r: NonNullable<MatchRow["result"]>): string {
-  return r === "win" ? "W" : r === "loss" ? "L" : "D";
+  return t(`matches.resultLetter.${r}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +291,11 @@ function renderMain(): void {
     teardown();
     fill(
       main,
-      h("div", { class: "empty-state" }, session ? sessionNote(session) : "That session is gone."),
+      h(
+        "div",
+        { class: "empty-state" },
+        session ? sessionNote(session) : t("matches.sessionGone"),
+      ),
     );
     return;
   }
@@ -297,13 +308,9 @@ function renderMain(): void {
         "div",
         { class: "empty-state" },
         h("span", { class: "blob" }),
-        h(
-          "span",
-          null,
-          data.sessions.length
-            ? "Pick a match on the left."
-            : "Close a game you played and its matches show up here, ready to clip.",
-        ),
+        h("span", {
+          text: data.sessions.length ? t("matches.pickMatch") : t("matches.closeAGame"),
+        }),
       ),
     );
     return;
@@ -333,7 +340,7 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
     fmtWhenLong(match.started_at),
     match.duration_ms ? fmtDuration(match.duration_ms) : null,
     score(match),
-    match.result ? { win: "Win", loss: "Loss", draw: "Draw" }[match.result] : null,
+    match.result ? t(`matches.result.${match.result}`) : null,
     match.size ? fmtBytes(match.size) : null,
   ].filter(Boolean);
 
@@ -343,7 +350,7 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
       h("button", {
         type: "button",
         class: "btn small",
-        text: "Open folder",
+        text: t("matches.openFolder"),
         onclick: () => void ipc.openMatchFolder(match.id),
       }),
     );
@@ -353,8 +360,8 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
     actions.append(
       confirming(
         h("button", { type: "button", class: "btn small danger" }) as HTMLButtonElement,
-        "Delete match",
-        "Confirm delete",
+        t("matches.deleteMatch"),
+        t("matches.confirmDelete"),
         () => void removeMatch(match.id),
       ),
     );
@@ -362,8 +369,8 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
       actions.append(
         confirming(
           h("button", { type: "button", class: "btn small danger" }) as HTMLButtonElement,
-          "Delete session",
-          `Delete all ${session.matches.length}`,
+          t("matches.deleteSession"),
+          t("matches.deleteAll", { n: session.matches.length }),
           () => void removeSession(session.id),
         ),
       );
@@ -421,7 +428,7 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
   const clipButton = h("button", {
     type: "button",
     class: "btn primary",
-    text: "Make clip",
+    text: t("matches.makeClip"),
     disabled: true,
     onclick: () => void makeClip(),
   }) as HTMLButtonElement;
@@ -463,20 +470,37 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
         h(
           "div",
           { class: "clip-row" },
-          h("button", { type: "button", class: "btn small", onclick: () => setIn(), title: "I" }, "Set in ", h("span", { class: "key mono", text: "I" })),
-          h("button", { type: "button", class: "btn small", onclick: () => setOut(), title: "O" }, "Set out ", h("span", { class: "key mono", text: "O" })),
+          h(
+            "button",
+            { type: "button", class: "btn small", onclick: () => setIn(), title: "I" },
+            t("matches.setIn"),
+            h("span", { class: "key mono", text: "I" }),
+          ),
+          h(
+            "button",
+            { type: "button", class: "btn small", onclick: () => setOut(), title: "O" },
+            t("matches.setOut"),
+            h("span", { class: "key mono", text: "O" }),
+          ),
           range,
           h("span", { class: "grow" }),
-          h("button", { type: "button", class: "btn small", text: "Clear", onclick: () => setRange(null, null) }),
+          h("button", {
+            type: "button",
+            class: "btn small",
+            text: t("matches.clear"),
+            onclick: () => setRange(null, null),
+          }),
           clipButton,
         ),
         note,
-        h("span", {
-          class: "hint",
-          text: "Drag across the timeline to pick a clip, click it to jump. The clip goes to the library with a little extra either side, so you can still trim it there.",
-        }),
+        h("span", { class: "hint", text: t("matches.hint") }),
       ),
-      h("aside", { class: "match-rail scroll" }, h("span", { class: "section-label", text: "Timeline" }), eventList),
+      h(
+        "aside",
+        { class: "match-rail scroll" },
+        h("span", { class: "section-label", text: t("matches.timeline") }),
+        eventList,
+      ),
     ),
   );
 
@@ -499,16 +523,15 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
     })
     .catch((e) => fill(eventList, h("span", { class: "muted", text: ipc.errorText(e) })));
   paintBar();
-  fill(eventList, h("span", { class: "muted", text: "Reading the timeline…" }));
+  fill(eventList, h("span", { class: "muted", text: t("matches.readingTimeline") }));
 }
 
 function statusPanel(session: SessionRow, match: MatchRow): HTMLElement {
   let text: string;
-  if (match.status === "live") text = "This match is being played right now. It will be here once you close the game.";
-  else if (match.status === "pending") text = "Cutting this match out of the session recording…";
-  else if (match.status === "missing")
-    text = "Nothing was recorded while this match was played. The recorder was not running at the time.";
-  else text = match.error ?? "This match could not be cut.";
+  if (match.status === "live") text = t("matches.statusLive");
+  else if (match.status === "pending") text = t("matches.statusPending");
+  else if (match.status === "missing") text = t("matches.statusMissing");
+  else text = match.error ?? t("matches.statusFailed");
   return h(
     "div",
     { class: "empty-state" },
@@ -517,7 +540,7 @@ function statusPanel(session: SessionRow, match: MatchRow): HTMLElement {
       ? h("button", {
           type: "button",
           class: "btn small",
-          text: "Try again",
+          text: t("matches.tryAgain"),
           onclick: () => void ipc.retrySession(session.id).then(() => loadSessions()),
         })
       : null,
@@ -559,7 +582,7 @@ function paintBar(): void {
     h("span", {
       class: `tl-round ${r.won === true ? "won" : r.won === false ? "lost" : ""}`,
       style: `left:${pct(r.start)};width:calc(${pct(r.end)} - ${pct(r.start)})`,
-      title: `Round ${r.n} · ${r.ally}–${r.enemy}`,
+      title: t("matches.roundTitle", { n: r.n, ally: r.ally, enemy: r.enemy }),
     }),
   );
   for (const e of view.events) {
@@ -649,8 +672,8 @@ function paintRange(): void {
   view.range.textContent = complete
     ? `${fmtPrecise(inMs)} → ${fmtPrecise(outMs)} · ${fmtLength(outMs - inMs)}`
     : inMs !== null
-      ? `in ${fmtPrecise(inMs)} · set the out point`
-      : "No clip selected";
+      ? t("matches.rangeOpen", { in: fmtPrecise(inMs) })
+      : t("matches.rangeNone");
   view.clipButton.disabled = !complete || outMs - inMs < MIN_CLIP_MS;
 }
 
@@ -678,8 +701,8 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
       h("span", {
         class: "muted",
         text: match.detected
-          ? "The game reported nothing else about this match."
-          : `${undetectedReason(session)}, so the whole recording was kept. Drag across the timeline to pick a clip.`,
+          ? t("matches.nothingElse")
+          : t("matches.undetected", { reason: undetectedReason(session) }),
       }),
     ];
   }
@@ -709,7 +732,7 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
         {
           type: "button",
           class: "jump",
-          title: "Jump here",
+          title: t("matches.jumpHere"),
           onclick: () => seek(round ? round.start : at),
         },
         h("span", { class: "at mono", text: fmtDuration(Math.max(0, at)) }),
@@ -719,8 +742,8 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
         ? h("button", {
             type: "button",
             class: "btn small",
-            text: "Select",
-            title: "Select this round on the timeline",
+            text: t("matches.select"),
+            title: t("matches.selectRound"),
             onclick: () => {
               setRange(Math.max(0, round.start), Math.min(duration(), round.end + ROUND_TAIL_MS));
               seek(round.start);
@@ -733,39 +756,53 @@ function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
 
 /** Why a recording carries no matches. Only Valorant has a provider so far (`providers/mod.rs`). */
 function undetectedReason(session: SessionRow): string {
-  if (session.game !== "valorant") return `${session.game_name} has no match detection yet`;
+  if (session.game !== "valorant") {
+    return t("matches.noDetection", { game: session.game_name });
+  }
   return session.provider_reached
-    ? "Valorant reported no match while this was recorded"
-    : "Valorant's status could not be read from the Riot Client while this was recorded";
+    ? t("matches.noMatchReported")
+    : t("matches.statusUnreadable");
 }
 
 function eventLabel(e: TimelineEvent): string {
   switch (e.kind) {
     case "match_start":
-      return ["Match start", e.map, e.mode].filter(Boolean).join(" · ");
+      return [t("matches.event.matchStart"), e.map, e.mode].filter(Boolean).join(" · ");
     case "round_end": {
-      const verdict = e.won === true ? "won" : e.won === false ? "lost" : "decided";
-      return `Round ${e.round} ${verdict} · ${e.ally}–${e.enemy}`;
+      const verdict =
+        e.won === true
+          ? t("matches.event.won")
+          : e.won === false
+            ? t("matches.event.lost")
+            : t("matches.event.decided");
+      return t("matches.event.round", {
+        n: e.round,
+        verdict,
+        ally: e.ally,
+        enemy: e.enemy,
+      });
     }
     case "match_end": {
-      const result = e.result ? { win: "Win", loss: "Loss", draw: "Draw" }[e.result] : null;
+      const result = e.result ? t(`matches.result.${e.result}`) : null;
       const why =
         e.reason === "lost"
-          ? "the game went quiet"
+          ? t("matches.event.reasonLost")
           : e.reason === "session_ended"
-            ? "the game closed"
+            ? t("matches.event.reasonSessionEnded")
             : e.reason === "superseded"
-              ? "another match started"
+              ? t("matches.event.reasonSuperseded")
               : null;
       const scoreText = e.ally !== null && e.enemy !== null ? `${e.ally}–${e.enemy}` : null;
-      return ["Match end", result, scoreText, why].filter(Boolean).join(" · ");
+      return [t("matches.event.matchEnd"), result, scoreText, why].filter(Boolean).join(" · ");
     }
     case "kill":
-      return ["Kill", e.victim, e.weapon, e.headshot ? "headshot" : null].filter(Boolean).join(" · ");
+      return [t("matches.event.kill"), e.victim, e.weapon, e.headshot ? t("matches.event.headshot") : null]
+        .filter(Boolean)
+        .join(" · ");
     case "death":
-      return ["Death", e.killer, e.weapon].filter(Boolean).join(" · ");
+      return [t("matches.event.death"), e.killer, e.weapon].filter(Boolean).join(" · ");
     case "assist":
-      return ["Assist", e.victim].filter(Boolean).join(" · ");
+      return [t("matches.event.assist"), e.victim].filter(Boolean).join(" · ");
   }
 }
 
@@ -778,7 +815,7 @@ async function makeClip(): Promise<void> {
   if (inMs === null || outMs === null) return;
   clipButton.disabled = true;
   note.className = "match-msg";
-  fill(note, "Copying the footage…");
+  fill(note, t("matches.copying"));
   try {
     const id = await ipc.clipFromMatch(match.id, inMs, outMs);
     void loadClips();
@@ -786,8 +823,13 @@ async function makeClip(): Promise<void> {
     note.className = "match-msg ok";
     fill(
       note,
-      `Clip added to the library (${fmtLength(outMs - inMs)}). `,
-      h("button", { type: "button", class: "link", text: "Open it", onclick: () => go({ view: "player", id }) }),
+      t("matches.clipAdded", { length: fmtLength(outMs - inMs) }),
+      h("button", {
+        type: "button",
+        class: "link",
+        text: t("matches.openIt"),
+        onclick: () => go({ view: "player", id }),
+      }),
     );
   } catch (e) {
     if (view?.note !== note) return;

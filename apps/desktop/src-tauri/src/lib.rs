@@ -5,6 +5,7 @@ mod settings;
 mod storage;
 mod ffmpeg;
 mod games;
+mod i18n;
 mod providers;
 mod queue;
 mod session_app;
@@ -39,7 +40,7 @@ use queue::{
     ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, Refused,
     UploadResult, Uploader, Worker,
 };
-use settings::{Account, Settings};
+use settings::{Account, Language, Settings};
 
 /// How long the device login keeps polling before giving up.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1170,8 +1171,17 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
         t.elapsed(),
         done.urls.page
     );
-    if state.settings.lock().unwrap().notify_on_save {
-        show_toast(app, if replaced { "Clip updated" } else { "Clip uploaded" }, &done.urls.page);
+    let (notify, language) = {
+        let s = state.settings.lock().unwrap();
+        (s.notify_on_save, s.language)
+    };
+    if notify {
+        let title = if replaced {
+            i18n::clip_updated(language)
+        } else {
+            i18n::clip_uploaded(language)
+        };
+        show_toast(app, title, &done.urls.page);
     }
     Ok(UploadResult {
         remote_id: done.id,
@@ -1417,9 +1427,9 @@ fn hooked_game_as_detected(state: &State<AppState>) -> Option<games::DetectedGam
 
 fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
     let state = app.state::<AppState>();
-    let (notify, sound) = {
+    let (notify, sound, language) = {
         let s = state.settings.lock().unwrap();
-        (s.notify_on_save, s.sound_on_save)
+        (s.notify_on_save, s.sound_on_save, s.language)
     };
     let result = {
         let recorder = state.recorder.lock().unwrap();
@@ -1455,7 +1465,7 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                show_toast(app, "Clip saved", &name);
+                show_toast(app, i18n::clip_saved(language), &name);
             }
             if sound {
                 play_save_sound();
@@ -1464,7 +1474,7 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
         Err(e) => {
             log::error!("clip save failed: {e}");
             if notify {
-                show_toast(app, "Clip not saved", e);
+                show_toast(app, i18n::clip_not_saved(language), e);
             }
         }
     }
@@ -1579,9 +1589,10 @@ fn on_hook_changed(app: &AppHandle, game: Option<HookedGame>) {
 }
 
 fn update_tray_tooltip(app: &AppHandle, game: Option<&HookedGame>) {
+    let language = app.state::<AppState>().settings.lock().unwrap().language;
     let text = match game {
-        Some(g) => format!("Cos Nostra – recording {}", g.title),
-        None => "Cos Nostra – idle".to_string(),
+        Some(g) => i18n::tray_recording(language, &g.title),
+        None => i18n::tray_idle(language),
     };
     if let Some(tray) = app.tray_by_id("main") {
         if let Err(e) = tray.set_tooltip(Some(text)) {
@@ -1761,6 +1772,9 @@ fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()>
     if new.auto_upload && !old.auto_upload {
         state.wake_worker();
     }
+    if new.language != old.language {
+        relabel_tray(app, new.language);
+    }
 
     let mut deferred_error: Option<anyhow::Error> = None;
     if new.start_with_windows != old.start_with_windows {
@@ -1824,7 +1838,7 @@ fn quote_autostart_entry() -> anyhow::Result<()> {
 /// keeps recording, which is a surprise exactly once.
 fn explain_tray_once(app: &AppHandle) {
     let state = app.state::<AppState>();
-    {
+    let language = {
         let mut settings = state.settings.lock().unwrap();
         if settings.tray_hint_shown {
             return;
@@ -1833,23 +1847,47 @@ fn explain_tray_once(app: &AppHandle) {
         if let Err(e) = settings.save() {
             log::warn!("saving the tray hint flag: {e:#}");
         }
-    }
+        settings.language
+    };
     show_toast(
         app,
-        "Still recording in the tray",
-        "Cos Nostra keeps running. Quit it from the tray icon.",
+        i18n::tray_hint_title(language),
+        i18n::tray_hint_body(language),
     );
 }
 
+fn tray_menu(app: &AppHandle, language: Language) -> tauri::Result<Menu<tauri::Wry>> {
+    let clip = MenuItem::with_id(app, "clip", i18n::tray_save_clip(language), true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", i18n::tray_open(language), true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", i18n::tray_quit(language), true, None::<&str>)?;
+    Menu::with_items(app, &[&clip, &show, &quit])
+}
+
+/// The tray menu is built once at startup, so a language change has to relabel it or the menu
+/// stays in the old language until the app restarts.
+fn relabel_tray(app: &AppHandle, language: Language) {
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    match tray_menu(app, language) {
+        Ok(menu) => {
+            if let Err(e) = tray.set_menu(Some(menu)) {
+                log::warn!("tray menu relabel failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("rebuilding the tray menu: {e}"),
+    }
+    let game = app.state::<AppState>().hooked_game.lock().unwrap().clone();
+    update_tray_tooltip(app, game.as_ref());
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    let clip = MenuItem::with_id(app, "clip", "Save clip", true, None::<&str>)?;
-    let show = MenuItem::with_id(app, "show", "Open", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&clip, &show, &quit])?;
+    let language = app.state::<AppState>().settings.lock().unwrap().language;
+    let menu = tray_menu(app, language)?;
 
     let mut tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
-        .tooltip("Cos Nostra – idle")
+        .tooltip(i18n::tray_idle(language))
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "clip" => {

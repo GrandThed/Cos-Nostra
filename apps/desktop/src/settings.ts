@@ -2,24 +2,18 @@
  *  the Discord needs a bitrate. */
 
 import { fill, h } from "./dom";
+import { onLanguage, t } from "./i18n";
 import { hotkeyControl, type HotkeyControl } from "./hotkey";
 import * as ipc from "./ipc";
 import { renderAvatar } from "./shell";
 import { data, loadSettings, loadStatus, on } from "./store";
-import type { EncodeEngine, Quality, Settings } from "./types";
+import type { EncodeEngine, Language, Quality, Settings } from "./types";
 
 /** Measured on a 30 s 1080p60 clip by scripts/bench-encoders.mjs. Quoted in megabytes rather
  *  than bitrate because that is the number people actually feel, in upload time. */
-const QUALITIES: { id: Quality; label: string; hint: string }[] = [
-  { id: "small", label: "Smaller files", hint: "~3 MB typical, up to 17 MB" },
-  { id: "balanced", label: "Balanced", hint: "~6 MB typical, up to 26 MB" },
-  { id: "high", label: "Best quality", hint: "~8 MB typical, up to 42 MB" },
-];
-
-const ENGINES: { id: EncodeEngine; label: string; hint: string }[] = [
-  { id: "cpu", label: "Processor", hint: "smaller and better · about a minute a clip" },
-  { id: "gpu", label: "Graphics card", hint: "seconds · bigger files, no size ceiling" },
-];
+const QUALITIES: Quality[] = ["small", "balanced", "high"];
+const ENGINES: EncodeEngine[] = ["cpu", "gpu"];
+const LANGUAGES: Language[] = ["es", "en"];
 
 let root: HTMLElement | null = null;
 /** The edits in progress. Replaced from the store on mount and after every save. */
@@ -34,6 +28,9 @@ let loginNote = "";
 export function initSettings(): void {
   on("settings", () => {
     if (root && !draft) render();
+  });
+  onLanguage(() => {
+    if (root) render();
   });
 }
 
@@ -67,7 +64,10 @@ function render(): void {
   if (!root) return;
   if (!draft) {
     if (!data.settings) {
-      fill(root, h("div", { class: "settings" }, h("span", { class: "muted", text: "Loading…" })));
+      fill(
+        root,
+        h("div", { class: "settings" }, h("span", { class: "muted", text: t("settings.loading") })),
+      );
       return;
     }
     draft = { ...data.settings };
@@ -89,24 +89,24 @@ function card(title: string, ...children: (Node | string | null | false)[]): HTM
 
 function captureCard(s: Settings): HTMLElement {
   return card(
-    "Capture",
+    t("settings.capture"),
     hotkey!.node,
     h(
       "div",
       { class: "field-row" },
-      h("span", { class: "name", text: "Buffer length" }),
+      h("span", { class: "name", text: t("settings.bufferLength.name") }),
       number(s.buffer_seconds, 5, 300, 1, (v) => (s.buffer_seconds = v)),
-      h("span", { class: "hint", text: "seconds · 5–300 · the clip is the last N seconds" }),
+      h("span", { class: "hint", text: t("settings.bufferLength.hint") }),
     ),
     h(
       "div",
       { class: "field-row" },
-      h("span", { class: "name", text: "Clip folder" }),
+      h("span", { class: "name", text: t("settings.clipFolder") }),
       h("span", { class: "field mono grow", text: s.clip_dir, title: s.clip_dir }),
       h("button", {
         type: "button",
         class: "btn small",
-        text: "Browse…",
+        text: t("settings.browse"),
         onclick: async () => {
           const dir = await ipc.pickClipDir();
           if (dir) {
@@ -116,30 +116,31 @@ function captureCard(s: Settings): HTMLElement {
         },
       }),
     ),
-    h("span", { class: "note", text: "Changing a capture setting restarts the recorder for a second or two." }),
+    h("span", { class: "note", text: t("settings.captureNote") }),
   );
 }
 
 function behaviourCard(s: Settings): HTMLElement {
   return card(
-    "Behaviour",
-    toggle("Start with Windows", s.start_with_windows, (v) => (s.start_with_windows = v)),
-    toggle("Show a notification when a clip is saved", s.notify_on_save, (v) => (s.notify_on_save = v)),
-    toggle("Play a sound when a clip is saved", s.sound_on_save, (v) => (s.sound_on_save = v)),
+    t("settings.behaviour"),
+    languageRow(s),
+    toggle(t("settings.startWithWindows"), s.start_with_windows, (v) => (s.start_with_windows = v)),
+    toggle(t("settings.notifyOnSave"), s.notify_on_save, (v) => (s.notify_on_save = v)),
+    toggle(t("settings.soundOnSave"), s.sound_on_save, (v) => (s.sound_on_save = v)),
     toggle(
-      "Encode while a game is running",
+      t("settings.encodeWhileGaming.name"),
       s.encode_while_gaming,
       (v) => (s.encode_while_gaming = v),
-      "Off: clips wait until you stop playing, so the game keeps every frame. On: clips are ready sooner but encoding may cost frames.",
+      t("settings.encodeWhileGaming.detail"),
     ),
     toggle(
-      "Record whole matches",
+      t("settings.recordSessions.name"),
       s.record_sessions,
       (v) => (s.record_sessions = v),
-      "Valorant, League of Legends and Counter-Strike are recorded from start to finish and cut into matches when you close the game, so you can make clips afterwards. Costs about 9 GB an hour of disk while you play; menus and queues are thrown away.",
+      t("settings.recordSessions.detail"),
     ),
     toggle(
-      "Open Cos Nostra when you close the game",
+      t("settings.openAfterSession"),
       s.open_after_session,
       (v) => (s.open_after_session = v),
     ),
@@ -148,18 +149,26 @@ function behaviourCard(s: Settings): HTMLElement {
 
 function encodingCard(s: Settings): HTMLElement {
   return card(
-    "Encoding",
+    t("settings.encoding"),
     radioCards(
-      QUALITIES.map((q) => ({ id: q.id, label: q.label, hint: q.hint })),
+      QUALITIES.map((id) => ({
+        id,
+        label: t(`settings.quality.${id}.label`),
+        hint: t(`settings.quality.${id}.hint`),
+      })),
       s.quality,
       (id) => {
         s.quality = id as Quality;
         render();
       },
     ),
-    h("span", { class: "note", text: "Sizes for a 30 s 1080p60 clip." }),
+    h("span", { class: "note", text: t("settings.sizesNote") }),
     radioCards(
-      ENGINES.map((e) => ({ id: e.id, label: e.label, hint: e.hint })),
+      ENGINES.map((id) => ({
+        id,
+        label: t(`settings.engine.${id}.label`),
+        hint: t(`settings.engine.${id}.hint`),
+      })),
       s.encode_engine,
       (id) => {
         s.encode_engine = id as EncodeEngine;
@@ -169,26 +178,50 @@ function encodingCard(s: Settings): HTMLElement {
     h(
       "details",
       { class: "advanced" },
-      h("summary", { text: "Advanced" }),
+      h("summary", { text: t("settings.advanced") }),
       h(
         "div",
         { class: "body" },
         h(
           "div",
           { class: "field-row" },
-          h("span", { class: "name", text: "Buffer bitrate" }),
+          h("span", { class: "name", text: t("settings.bufferBitrate.name") }),
           number(s.video_bitrate_kbps, 2000, 60000, 500, (v) => (s.video_bitrate_kbps = v)),
-          h("span", { class: "hint", text: "kbps · 2000–60000" }),
+          h("span", { class: "hint", text: t("settings.bufferBitrate.hint") }),
         ),
         h(
           "div",
           { class: "field-row" },
-          h("span", { class: "name", text: "Backend URL" }),
+          h("span", { class: "name", text: t("settings.backendUrl.name") }),
           text(s.backend_url, (v) => (s.backend_url = v)),
-          h("span", { class: "hint", text: "https:// · http:// only for localhost" }),
+          h("span", { class: "hint", text: t("settings.backendUrl.hint") }),
         ),
       ),
     ),
+  );
+}
+
+function languageRow(s: Settings): HTMLElement {
+  const select = h(
+    "select",
+    {
+      class: "field",
+      onchange: (e: Event) => {
+        s.language = (e.target as HTMLSelectElement).value as Language;
+        render();
+      },
+    },
+    ...LANGUAGES.map((id) =>
+      h("option", { value: id, text: t(`settings.language.${id}`), selected: id === s.language }),
+    ),
+  ) as HTMLSelectElement;
+  select.value = s.language;
+  return h(
+    "div",
+    { class: "field-row" },
+    h("span", { class: "name", text: t("settings.language.name") }),
+    select,
+    h("span", { class: "hint", text: t("settings.language.hint") }),
   );
 }
 
@@ -205,13 +238,13 @@ function accountCard(s: Settings): HTMLElement {
         h(
           "div",
           { class: "who" },
-          h("b", { text: `Logged in as ${account.username}` }),
-          h("small", { text: "via Discord — the only login there is" }),
+          h("b", { text: t("settings.loggedInAs", { username: account.username }) }),
+          h("small", { text: t("settings.viaDiscord") }),
         ),
         h("button", {
           type: "button",
           class: "btn small",
-          text: "Log out",
+          text: t("settings.logOut"),
           onclick: () => void logOut(),
         }),
       )
@@ -224,12 +257,12 @@ function accountCard(s: Settings): HTMLElement {
             "div",
             { class: "note" },
             h("span", { class: "spinner" }),
-            " waiting for the browser… times out in 10 min",
+            t("settings.waitingBrowser"),
           ),
           h("button", {
             type: "button",
             class: "btn small",
-            text: "Cancel",
+            text: t("settings.cancel"),
             onclick: () => void ipc.cancelLogin().then(() => onLoginStateChanged(null, "")),
           }),
         )
@@ -239,26 +272,26 @@ function accountCard(s: Settings): HTMLElement {
           h(
             "div",
             { class: "who" },
-            h("b", { text: "Not linked" }),
-            h("small", { text: "Clips stay on this PC until you link Discord." }),
+            h("b", { text: t("settings.notLinked") }),
+            h("small", { text: t("settings.notLinkedDetail") }),
           ),
           h("button", {
             type: "button",
             class: "btn primary small",
-            text: "Link Discord",
+            text: t("settings.linkDiscord"),
             onclick: () => void startLogin(),
           }),
         );
 
   return card(
-    "Account & uploads",
+    t("settings.account"),
     identity,
     loginNote ? h("span", { class: "note", text: loginNote }) : null,
     toggle(
-      "Upload clips automatically",
+      t("settings.autoUpload.name"),
       s.auto_upload,
       (v) => (s.auto_upload = v),
-      'Off: clips stop at "Ready" and stay on this PC until you say so.',
+      t("settings.autoUpload.detail"),
     ),
     h("span", { class: "grow" }),
     h(
@@ -267,7 +300,7 @@ function accountCard(s: Settings): HTMLElement {
       h("button", {
         type: "button",
         class: "btn primary",
-        text: "Save settings",
+        text: t("settings.save"),
         onclick: () => void save(),
       }),
       h("span", { class: `msg ${messageKind}`, text: message }),
@@ -358,17 +391,18 @@ async function save(): Promise<void> {
   if (!draft || !keys) return;
   keys.stop();
   const next: Settings = { ...draft, hotkey: keys.value() };
-  message = "Saving…";
+  message = t("settings.saving");
   messageKind = "";
   render();
   try {
     await ipc.saveSettings(next);
-    message = "Saved";
-    messageKind = "ok";
     draft = null;
     hotkey = null;
     await loadSettings();
     await loadStatus();
+    // After the reload, so a language that just changed names the confirmation.
+    message = t("settings.saved");
+    messageKind = "ok";
     render();
   } catch (e) {
     // A rejected hotkey is the common failure and the old one is still registered, so say so
@@ -382,10 +416,13 @@ async function save(): Promise<void> {
 }
 
 async function startLogin(): Promise<void> {
-  onLoginStateChanged(null, "Contacting the backend…");
+  onLoginStateChanged(null, t("settings.contacting"));
   try {
     const started = await ipc.startLogin();
-    onLoginStateChanged(started.code, `If the browser did not open, go to ${started.verify_url}`);
+    onLoginStateChanged(
+      started.code,
+      t("settings.browserFallback", { url: started.verify_url }),
+    );
   } catch (e) {
     onLoginStateChanged(null, ipc.errorText(e));
   }
@@ -394,7 +431,7 @@ async function startLogin(): Promise<void> {
 async function logOut(): Promise<void> {
   try {
     await ipc.logout();
-    onLoginStateChanged(null, "Logged out");
+    onLoginStateChanged(null, t("settings.loggedOut"));
   } catch (e) {
     onLoginStateChanged(null, ipc.errorText(e));
   }

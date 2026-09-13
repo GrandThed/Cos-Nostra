@@ -5,6 +5,7 @@
  *  probe. Step 3 links Discord, and can be skipped — clips just stay on this PC. */
 
 import { el, fill, h } from "./dom";
+import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { data, loadSettings, loadStatus, on } from "./store";
 
@@ -23,6 +24,9 @@ export function initFirstRun(): void {
       if (visible) render();
     });
   }
+  onLanguage(() => {
+    if (visible) render();
+  });
 }
 
 /** Shows the flow when this machine has never run the app, or whenever the runtime is still
@@ -64,7 +68,7 @@ function render(): void {
 }
 
 function stepOf(n: number): HTMLElement {
-  return h("span", { class: "of", text: `Step ${n} of 3` });
+  return h("span", { class: "of", text: t("firstrun.step", { n }) });
 }
 
 function runtimeStep(): HTMLElement {
@@ -75,20 +79,19 @@ function runtimeStep(): HTMLElement {
     "div",
     { class: "step" },
     h("span", { class: "mark" }),
-    h("h2", { text: extracting ? "Unpacking the recorder" : "Getting the recorder" }),
-    h("span", {
-      class: "blurb",
-      text: "Cos Nostra needs its recording engine — about 400 MB, downloaded once. The app restarts by itself when it's done.",
+    h("h2", {
+      text: extracting ? t("firstrun.unpackingRecorder") : t("firstrun.gettingRecorder"),
     }),
+    h("span", { class: "blurb", text: t("firstrun.runtimeBlurb") }),
     h("div", { class: "progress" }, h("span", { style: `width:${Math.round(progress * 100)}%` })),
     h("span", {
       class: "counter",
       text:
         b.phase === "restarting"
-          ? "restarting…"
+          ? t("firstrun.restarting")
           : b.phase === "downloading" || b.phase === "extracting"
             ? (b.message || `${Math.round(progress * 100)}%`)
-            : "starting…",
+            : t("firstrun.starting"),
     }),
     stepOf(1),
   );
@@ -103,32 +106,39 @@ function probeStep(): HTMLElement {
       { class: value ? "done" : "pending" },
       h("span", { text: "●" }),
       h("span", { class: "muted" }, ` ${label} — `),
-      value ? h("span", { class: "mono", text: value }) : h("span", { text: "probing…" }),
+      value
+        ? h("span", { class: "mono", text: value })
+        : h("span", { text: t("firstrun.probing") }),
     );
 
   return h(
     "div",
     { class: "step" },
     h("span", { class: "big-spinner" }),
-    h("h2", { text: "Checking what your PC can do" }),
-    h("span", { class: "blurb", text: "Looking for hardware encoders so clips are ready in seconds." }),
+    h("h2", { text: t("firstrun.probeTitle") }),
+    h("span", { class: "blurb", text: t("firstrun.probeBlurb") }),
     h(
       "div",
       { class: "checklist" },
-      line("Replay buffer", s?.encoder ?? null),
+      line(t("firstrun.replayBuffer"), s?.encoder ?? null),
       line("AV1", encoders?.av1 ?? null),
       line("H.264", encoders?.h264 ?? null),
     ),
     s?.ffmpeg_error
       ? h("span", {
           class: "failure",
-          text: `ffmpeg is not available, so clips cannot be encoded: ${s.ffmpeg_error}`,
+          text: t("firstrun.ffmpegMissing", { error: s.ffmpeg_error }),
         })
       : null,
     h(
       "div",
       { class: "buttons" },
-      h("button", { type: "button", class: "btn", text: "Skip", onclick: () => void finish() }),
+      h("button", {
+        type: "button",
+        class: "btn",
+        text: t("firstrun.skip"),
+        onclick: () => void finish(),
+      }),
     ),
     stepOf(2),
   );
@@ -138,12 +148,10 @@ function discordStep(): HTMLElement {
   return h(
     "div",
     { class: "step" },
-    h("h2", { text: "Link Discord" }),
+    h("h2", { text: t("firstrun.linkDiscord") }),
     h("span", {
       class: "blurb",
-      text: pendingCode
-        ? "So your clips can land in the server. Your browser just opened — check this code matches:"
-        : "So your clips can land in the server. This opens your browser to log in with Discord.",
+      text: pendingCode ? t("firstrun.discordPending") : t("firstrun.discordBlurb"),
     }),
     pendingCode ? h("span", { class: "code", text: pendingCode }) : null,
     pendingCode
@@ -151,11 +159,16 @@ function discordStep(): HTMLElement {
           "span",
           { class: "waiting" },
           h("span", { class: "spinner" }),
-          " waiting for the browser… times out in 10 min",
+          t("firstrun.waitingBrowser"),
         )
       : null,
     pendingCode && verifyUrl
-      ? h("span", { class: "fallback" }, "Browser didn't open? Go to ", h("em", { text: verifyUrl }))
+      ? h(
+          "span",
+          { class: "fallback" },
+          t("firstrun.browserFallback"),
+          h("em", { text: verifyUrl }),
+        )
       : null,
     note ? h("span", { class: "failure", text: note }) : null,
     h(
@@ -165,7 +178,7 @@ function discordStep(): HTMLElement {
         ? h("button", {
             type: "button",
             class: "btn",
-            text: "Cancel",
+            text: t("firstrun.cancel"),
             onclick: () => {
               pendingCode = null;
               void ipc.cancelLogin();
@@ -175,13 +188,13 @@ function discordStep(): HTMLElement {
         : h("button", {
             type: "button",
             class: "btn primary",
-            text: "Link Discord",
+            text: t("firstrun.linkDiscord"),
             onclick: () => void startLogin(),
           }),
       h("button", {
         type: "button",
         class: "btn",
-        text: "Skip — clips stay on this PC",
+        text: t("firstrun.skipStayHere"),
         onclick: () => void finish(),
       }),
     ),

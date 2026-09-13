@@ -12,6 +12,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { gameLabel } from "./clips";
 import { confirming, fill, h } from "./dom";
 import { fmtClock, fmtWhen, hueFor } from "./format";
+import { t } from "./i18n";
 import * as ipc from "./ipc";
 import { frameStep, loopToggle, volume } from "./player";
 import { go } from "./router";
@@ -85,10 +86,10 @@ export function mountEditor(root: HTMLElement, id: number): void {
   mountedRoot = root;
   const clip = data.clips.find((c) => c.id === id);
   if (!clip) {
-    fill(root, h("div", { class: "empty-state", text: "That clip is gone." }));
+    fill(root, h("div", { class: "empty-state", text: t("editor.gone") }));
     return;
   }
-  fill(root, h("div", { class: "empty-state", text: "Opening the recording…" }));
+  fill(root, h("div", { class: "empty-state", text: t("editor.opening") }));
   ipc
     .editSource(id)
     .then((source) => {
@@ -105,7 +106,7 @@ export function mountEditor(root: HTMLElement, id: number): void {
           h("button", {
             type: "button",
             class: "btn small",
-            text: "Back to the clip",
+            text: t("editor.backToClip"),
             onclick: () => go({ view: "player", id }),
           }),
         ),
@@ -140,7 +141,12 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     ? source.cut.map((s) => ({ ...s }))
     : [{ start_ms: 0, end_ms: source.duration_ms }];
 
-  const playButton = h("button", { class: "play", type: "button", text: "▶", title: "Play (Space)" });
+  const playButton = h("button", {
+    class: "play",
+    type: "button",
+    text: "▶",
+    title: t("editor.play"),
+  });
   const time = h("span", { class: "time" });
   const ruler = h("div", { class: "ruler" });
   const filmCanvas = h("canvas", { class: "film" }) as HTMLCanvasElement;
@@ -150,8 +156,8 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   const track = h("div", { class: "track" }, ruler, filmCanvas, gaps, parts, playhead);
   const timeline = h("div", { class: "timeline" }, track);
   const zoomLabel = h("span", { class: "zoom-level", text: "1×" });
-  const inField = timeField("In point of the selected part (I sets it at the playhead)");
-  const outField = timeField("Out point of the selected part (O sets it at the playhead)");
+  const inField = timeField(t("editor.inField"));
+  const outField = timeField(t("editor.outField"));
   const summary = h("div", { class: "summary" });
   const partList = h("div", { class: "part-list" });
   const message = h("div", { class: "rail-msg" });
@@ -159,15 +165,15 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   const undoButton = h("button", {
     type: "button",
     class: "btn small",
-    text: "↶ Undo",
-    title: "Undo (Ctrl+Z)",
+    text: t("editor.undo"),
+    title: t("editor.undoTitle"),
     onclick: () => undo(),
   }) as HTMLButtonElement;
   const redoButton = h("button", {
     type: "button",
     class: "btn small",
-    text: "↷ Redo",
-    title: "Redo (Ctrl+Y)",
+    text: t("editor.redo"),
+    title: t("editor.redoTitle"),
     onclick: () => redo(),
   }) as HTMLButtonElement;
 
@@ -176,22 +182,26 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   const applyButton = h("button", {
     type: "button",
     class: source.original ? "btn primary" : "btn warn",
-    title: "Apply the cut and re-encode (Ctrl+Enter)",
+    title: t("editor.applyTitle"),
   }) as HTMLButtonElement;
   if (source.original) {
-    applyButton.textContent = "Apply cut";
+    applyButton.textContent = t("editor.apply");
     applyButton.addEventListener("click", () => void apply());
   } else {
-    confirming(applyButton, "Apply cut…", "Confirm — the uncut video goes", () => void apply());
+    confirming(applyButton, t("editor.applyArm"), t("editor.applyConfirm"), () => void apply());
   }
   const cancelButton = confirming(
     h("button", { type: "button", class: "btn" }) as HTMLButtonElement,
-    "Cancel",
-    "Discard changes?",
+    t("editor.cancel"),
+    t("editor.cancelConfirm"),
     () => go({ view: "player", id: clip.id }),
   );
 
-  const bigPlay = h("button", { type: "button", class: "big-play", title: "Play" }, h("span", { text: "▶" }));
+  const bigPlay = h(
+    "button",
+    { type: "button", class: "big-play", title: t("editor.playPlain") },
+    h("span", { text: "▶" }),
+  );
 
   const page = h(
     "div",
@@ -206,13 +216,13 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
         h("b", { text: gameLabel(clip.game) }),
         ` / ${fmtWhen(clip.recorded_at)}`,
       ),
-      h("span", { class: "mode", text: "Trim & cut" }),
+      h("span", { class: "mode", text: t("editor.mode") }),
       h("span", { class: "grow" }),
       h("div", { class: "steps" }, undoButton, redoButton, h("button", {
         type: "button",
         class: "btn small",
-        text: "Reset",
-        title: "Keep the whole recording again",
+        text: t("editor.reset"),
+        title: t("editor.resetTitle"),
         onclick: () => reset(),
       })),
     ),
@@ -236,8 +246,8 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
             h("button", {
               type: "button",
               class: "loop skip",
-              text: "Skip removed",
-              title: "Play only the kept parts, jumping over what the cut removes",
+              text: t("editor.skipRemoved"),
+              title: t("editor.skipRemovedTitle"),
               "aria-pressed": "true",
               onclick: (e: Event) => {
                 const button = e.currentTarget as HTMLElement;
@@ -250,7 +260,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
             volume(video),
             h(
               "span",
-              { class: "zoom", title: "Zoom the timeline (+ and −, or Ctrl+wheel)" },
+              { class: "zoom", title: t("editor.zoomTitle") },
               h("button", { type: "button", text: "−", onclick: () => zoomBy(-1) }),
               zoomLabel,
               h("button", { type: "button", text: "+", onclick: () => zoomBy(1) }),
@@ -263,57 +273,57 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
             h("button", {
               type: "button",
               class: "btn small",
-              text: "⇤ Set in",
-              title: "Start the part under the playhead here (I)",
+              text: t("editor.setIn"),
+              title: t("editor.setInTitle"),
               onclick: () => setIn(),
             }),
             h("button", {
               type: "button",
               class: "btn small",
-              text: "Set out ⇥",
-              title: "End the part under the playhead here (O)",
+              text: t("editor.setOut"),
+              title: t("editor.setOutTitle"),
               onclick: () => setOut(),
             }),
             h("button", {
               type: "button",
               class: "btn small",
-              text: "✂ Split",
-              title: "Split the part under the playhead in two (S)",
+              text: t("editor.split"),
+              title: t("editor.splitTitle"),
               onclick: () => split(),
             }),
             h("button", {
               type: "button",
               class: "btn small danger",
-              text: "Remove part",
-              title: "Drop the selected part (Delete)",
+              text: t("editor.removePart"),
+              title: t("editor.removePartTitle"),
               onclick: () => removeSelected(),
             }),
             h("span", { class: "grow" }),
-            h("label", { class: "field-label", text: "In" }),
+            h("label", { class: "field-label", text: t("editor.inLabel") }),
             inField,
-            h("label", { class: "field-label", text: "Out" }),
+            h("label", { class: "field-label", text: t("editor.outLabel") }),
             outField,
           ),
           h(
             "div",
             { class: "keys" },
-            h("span", { text: "I / O in & out" }),
-            h("span", { text: "S split" }),
-            h("span", { text: "Del remove" }),
-            h("span", { text: "[ ] jump cut" }),
-            h("span", { text: "Space play" }),
-            h("span", { text: "←/→ 5 s · ⇧ 1 s" }),
-            h("span", { text: ",/. frame" }),
-            h("span", { text: "Ctrl+Z undo" }),
-            h("span", { text: "Ctrl+↵ apply" }),
-            h("span", { text: "Esc back" }),
+            h("span", { text: t("editor.keys.inOut") }),
+            h("span", { text: t("editor.keys.split") }),
+            h("span", { text: t("editor.keys.remove") }),
+            h("span", { text: t("editor.keys.jump") }),
+            h("span", { text: t("editor.keys.play") }),
+            h("span", { text: t("editor.keys.seek") }),
+            h("span", { text: t("editor.keys.frame") }),
+            h("span", { text: t("editor.keys.undo") }),
+            h("span", { text: t("editor.keys.apply") }),
+            h("span", { text: t("editor.keys.back") }),
           ),
         ),
       ),
       h(
         "aside",
         { class: "rail" },
-        h("span", { class: "label", text: "Cut" }),
+        h("span", { class: "label", text: t("editor.railLabel") }),
         summary,
         partList,
         h("div", { class: "buttons" }, applyButton, cancelButton),
@@ -321,9 +331,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
         h("span", { class: "grow" }),
         h("span", {
           class: "note",
-          text: source.original
-            ? "The original recording stays on this PC, so a cut can be changed again later. Applying re-encodes the clip, and a clip that is on the site is replaced there under the same link."
-            : "The original recording is gone, so this cut is made on the encoded copy and cannot be undone once applied.",
+          text: source.original ? t("editor.noteOriginal") : t("editor.noteEncoded"),
         }),
       ),
     ),
@@ -437,9 +445,7 @@ function wireVideo(ed: Editor, bigPlay: HTMLElement): void {
   video.addEventListener("error", () => {
     const box = ed.root.querySelector(".video");
     if (box && !box.querySelector(".trouble")) {
-      box.appendChild(
-        h("div", { class: "trouble", text: "That file could not be played. It may have been moved or deleted." }),
-      );
+      box.appendChild(h("div", { class: "trouble", text: t("editor.playbackError") }));
     }
   });
 }
@@ -645,7 +651,7 @@ function paintPlayhead(ed: Editor, force: boolean): void {
   ed.playhead.style.left = pct(ed, ms);
   fill(ed.time, fmtPrecise(ms), h("span", { class: "total", text: ` / ${fmtClock(ed.durationMs / 1000)}` }));
   ed.playButton.textContent = ed.video.paused ? "▶" : "⏸";
-  ed.playButton.title = ed.video.paused ? "Play (Space)" : "Pause (Space)";
+  ed.playButton.title = ed.video.paused ? t("editor.play") : t("editor.pause");
 }
 
 function paintParts(ed: Editor): void {
@@ -669,11 +675,25 @@ function paintParts(ed: Editor): void {
           class: `part${i === ed.selected ? " selected" : ""}`,
           "data-seg": i,
           style: `left:${pct(ed, s.start_ms)};width:${pct(ed, len)}`,
-          title: `Part ${i + 1}: ${fmtPrecise(s.start_ms)} → ${fmtPrecise(s.end_ms)}`,
+          title: t("editor.partTitle", {
+            n: i + 1,
+            in: fmtPrecise(s.start_ms),
+            out: fmtPrecise(s.end_ms),
+          }),
         },
-        h("span", { class: "handle in", "data-seg": i, "data-edge": "in", title: "Drag to trim the start" }),
+        h("span", {
+          class: "handle in",
+          "data-seg": i,
+          "data-edge": "in",
+          title: t("editor.dragStart"),
+        }),
         h("span", { class: "len", text: fmtLen(len) }),
-        h("span", { class: "handle out", "data-seg": i, "data-edge": "out", title: "Drag to trim the end" }),
+        h("span", {
+          class: "handle out",
+          "data-seg": i,
+          "data-edge": "out",
+          title: t("editor.dragEnd"),
+        }),
       );
       if ((len / ed.durationMs) * width < 64) node.setAttribute("data-narrow", "");
       return node;
@@ -691,12 +711,16 @@ function paintParts(ed: Editor): void {
 function gapNode(ed: Editor, from: number, to: number, before: number): HTMLElement {
   return h(
     "div",
-    { class: "gap", style: `left:${pct(ed, from)};width:${pct(ed, to - from)}`, title: "Removed" },
+    {
+      class: "gap",
+      style: `left:${pct(ed, from)};width:${pct(ed, to - from)}`,
+      title: t("editor.removed"),
+    },
     h("button", {
       type: "button",
       class: "restore",
-      text: "↺ keep",
-      title: "Put this range back",
+      text: t("editor.restore"),
+      title: t("editor.restoreTitle"),
       onclick: (e: Event) => {
         e.stopPropagation();
         restoreGap(ed, before);
@@ -746,10 +770,19 @@ function paintSummary(ed: Editor): void {
   const whole = isWhole(ed);
   fill(
     ed.summary,
-    h("b", { text: whole ? "Whole recording" : `Keeps ${fmtClock(kept / 1000)} of ${fmtClock(ed.durationMs / 1000)}` }),
+    h("b", {
+      text: whole
+        ? t("editor.wholeRecording")
+        : t("editor.keeps", {
+            kept: fmtClock(kept / 1000),
+            total: fmtClock(ed.durationMs / 1000),
+          }),
+    }),
     h("span", {
       class: "muted",
-      text: whole ? ` · ${fmtClock(ed.durationMs / 1000)}` : ` · ${parts} ${parts === 1 ? "part" : "parts"}`,
+      text: whole
+        ? ` · ${fmtClock(ed.durationMs / 1000)}`
+        : ` · ${parts} ${parts === 1 ? t("editor.partOne") : t("editor.partMany")}`,
     }),
   );
   ed.applyButton.disabled = !isDirty(ed) && !(ed.clip.cut && whole);
@@ -907,16 +940,16 @@ function reset(): void {
 function setIn(): void {
   const ed = live;
   if (!ed) return;
-  const t = now(ed);
+  const at = now(ed);
   const segs = ed.segments;
-  const i = segs.findIndex((s) => t < s.end_ms - MIN_MS);
+  const i = segs.findIndex((s) => at < s.end_ms - MIN_MS);
   if (i < 0) {
-    note(ed, "Nothing is kept after here. Set the out point instead.");
+    note(ed, t("editor.nothingAfter"));
     return;
   }
   push(ed);
   const lo = i > 0 ? segs[i - 1].end_ms : 0;
-  segs[i].start_ms = Math.max(t, lo);
+  segs[i].start_ms = Math.max(at, lo);
   ed.selected = i;
   mergeTouching(ed);
   paintParts(ed);
@@ -926,19 +959,19 @@ function setIn(): void {
 function setOut(): void {
   const ed = live;
   if (!ed) return;
-  const t = now(ed);
+  const at = now(ed);
   const segs = ed.segments;
   let i = -1;
   segs.forEach((s, k) => {
-    if (s.start_ms + MIN_MS <= t) i = k;
+    if (s.start_ms + MIN_MS <= at) i = k;
   });
   if (i < 0) {
-    note(ed, "Nothing is kept before here. Set the in point instead.");
+    note(ed, t("editor.nothingBefore"));
     return;
   }
   push(ed);
   const hi = i < segs.length - 1 ? segs[i + 1].start_ms : ed.durationMs;
-  segs[i].end_ms = Math.min(t, hi);
+  segs[i].end_ms = Math.min(at, hi);
   ed.selected = i;
   mergeTouching(ed);
   paintParts(ed);
@@ -948,16 +981,16 @@ function setOut(): void {
 function split(): void {
   const ed = live;
   if (!ed) return;
-  const t = now(ed);
+  const at = now(ed);
   const segs = ed.segments;
-  const i = segs.findIndex((s) => t - s.start_ms >= MIN_MS && s.end_ms - t >= MIN_MS);
+  const i = segs.findIndex((s) => at - s.start_ms >= MIN_MS && s.end_ms - at >= MIN_MS);
   if (i < 0) {
-    note(ed, "Put the playhead inside a kept part, at least 0.1 s from its ends, to split it.");
+    note(ed, t("editor.splitInside"));
     return;
   }
   push(ed);
   const s = segs[i];
-  segs.splice(i, 1, { start_ms: s.start_ms, end_ms: t }, { start_ms: t, end_ms: s.end_ms });
+  segs.splice(i, 1, { start_ms: s.start_ms, end_ms: at }, { start_ms: at, end_ms: s.end_ms });
   ed.selected = i + 1;
   paintParts(ed);
   note(ed, "");
@@ -966,14 +999,14 @@ function split(): void {
 function removeSelected(): void {
   const ed = live;
   if (!ed) return;
-  const t = now(ed);
-  const i = ed.selected ?? ed.segments.findIndex((s) => t >= s.start_ms && t <= s.end_ms);
+  const at = now(ed);
+  const i = ed.selected ?? ed.segments.findIndex((s) => at >= s.start_ms && at <= s.end_ms);
   if (i === null || i < 0) {
-    note(ed, "Click a part, or put the playhead inside one, to remove it.");
+    note(ed, t("editor.pickPart"));
     return;
   }
   if (ed.segments.length === 1) {
-    note(ed, "At least one part has to stay. Trim its ends instead.");
+    note(ed, t("editor.onePartStays"));
     return;
   }
   push(ed);
@@ -1060,7 +1093,7 @@ async function apply(): Promise<void> {
     ? []
     : ed.segments.map((s) => ({ start_ms: Math.round(s.start_ms), end_ms: Math.round(s.end_ms) }));
   ed.applyButton.disabled = true;
-  note(ed, "Queuing the re-encode…");
+  note(ed, t("editor.queuing"));
   try {
     await ipc.applyCut(ed.id, payload);
     go({ view: "player", id: ed.id });

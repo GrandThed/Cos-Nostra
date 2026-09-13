@@ -3,6 +3,7 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { el, fill, h } from "./dom";
+import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { data, loadSettings, loadStatus, on } from "./store";
 import type { Account, Status } from "./types";
@@ -46,6 +47,30 @@ export function initShell(): void {
     renderToolbar();
     if (panelOpen) renderStatusPanel();
   });
+  // The frame is the only thing that outlives a screen, so it is the only thing that has to
+  // repaint itself when the language changes; the router rebuilds whichever screen is up.
+  onLanguage(() => {
+    renderChrome();
+    renderToolbar();
+    renderBanners();
+    if (panelOpen) renderStatusPanel();
+  });
+  renderChrome();
+}
+
+/** The copy that lives in `index.html`: the tabs, the window buttons and the save button. */
+export function renderChrome(): void {
+  el("win-minimize").title = t("app.minimise");
+  el("win-maximize").title = t("app.maximise");
+  el("win-close").title = t("app.closeToTray");
+  el("tab-library").textContent = t("app.tabs.library");
+  el("tab-matches").textContent = t("app.tabs.matches");
+  el("tab-storage").textContent = t("app.tabs.storage");
+  el("tab-settings").textContent = t("app.tabs.settings");
+  const tabs = document.querySelector(".tabs");
+  tabs?.setAttribute("aria-label", t("app.sections"));
+  const save = el("save-clip");
+  fill(save, `${t("app.saveClip")} `, h("span", { class: "key mono", id: "save-hotkey" }));
 }
 
 function setPanel(open: boolean): void {
@@ -58,16 +83,18 @@ function setPanel(open: boolean): void {
 async function saveClipNow(): Promise<void> {
   try {
     const path = await ipc.saveClip();
-    lastSave = `saved ${path.split(/[\\/]/).pop() ?? path}`;
+    lastSave = t("shell.saved", { file: fileName(path) });
   } catch (e) {
-    lastSave = `not saved: ${ipc.errorText(e)}`;
+    lastSave = t("shell.notSaved", { error: ipc.errorText(e) });
   }
   if (panelOpen) renderStatusPanel();
 }
 
+const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
 /** Called from main when a clip lands via the hotkey or the tray. */
 export function noteClipSaved(path: string): void {
-  lastSave = `saved ${path.split(/[\\/]/).pop() ?? path}`;
+  lastSave = t("shell.saved", { file: fileName(path) });
   if (panelOpen) renderStatusPanel();
 }
 
@@ -84,18 +111,18 @@ export function renderToolbar(): void {
   const session = s?.recording && s.session?.recording ? s.session : null;
   el("status-label").textContent = session
     ? session.match_id
-      ? "Recording match"
-      : "Recording session"
+      ? t("shell.recordingMatch")
+      : t("shell.recordingSession")
     : s?.recording
-      ? "Recording"
+      ? t("shell.recording")
       : s?.error
-        ? "Not recording"
-        : "Starting…";
+        ? t("shell.notRecording")
+        : t("shell.starting");
   el("status-game").textContent = session
     ? session.game_name
     : !s?.recording
       ? ""
-      : (s.hooked_game?.title ?? s.hooked_game?.executable ?? "desktop");
+      : (s.hooked_game?.title ?? s.hooked_game?.executable ?? t("shell.desktop"));
 
   el("save-hotkey").textContent = s?.hotkey ?? "";
   renderAvatar(el("account-avatar"), s?.account ?? null);
@@ -144,31 +171,31 @@ function alarms(s: Status | null): Alarm[] {
   if (s.error) {
     list.push({
       tone: "err",
-      title: "Recorder failed",
+      title: t("shell.alarm.recorderFailed"),
       detail: s.error,
-      action: { label: "Retry", run: () => void retryRecorder() },
+      action: { label: t("shell.alarm.retry"), run: () => void retryRecorder() },
     });
   }
   if (s.hotkey_error) {
     list.push({
       tone: "warn",
-      title: "Hotkey taken",
-      detail: `${s.hotkey} could not be registered. Pick a new one in Settings.`,
+      title: t("shell.alarm.hotkeyTaken"),
+      detail: t("shell.alarm.hotkeyTakenDetail", { hotkey: s.hotkey }),
     });
   }
   if (s.ffmpeg_error) {
     list.push({
       tone: "warn",
-      title: "Clips can't encode",
+      title: t("shell.alarm.cannotEncode"),
       detail: s.ffmpeg_error,
-      action: { label: "Probe again", run: () => void probeEncoders() },
+      action: { label: t("shell.alarm.probeAgain"), run: () => void probeEncoders() },
     });
   }
   if (s.conflict) {
     list.push({
       tone: "warn",
-      title: `${s.conflict.executable} is already captured by another tool`,
-      detail: "Close OBS, Discord or GeForce Experience, or clips will be black.",
+      title: t("shell.alarm.conflict", { executable: s.conflict.executable }),
+      detail: t("shell.alarm.conflictDetail"),
     });
   }
   return list;
@@ -213,15 +240,15 @@ function renderStatusPanel(): void {
   const panel = el("status-panel");
   const s = data.status;
   if (!s) {
-    fill(panel, h("div", { class: "muted", text: "Reading the recorder…" }));
+    fill(panel, h("div", { class: "muted", text: t("shell.panel.reading") }));
     return;
   }
 
   const bufferState = s.recording
-    ? h("span", null, h("span", { style: "color:var(--ok)", text: "●" }), " Running")
+    ? h("span", null, h("span", { style: "color:var(--ok)", text: "●" }), ` ${t("shell.panel.running")}`)
     : s.error
-      ? h("span", null, h("span", { style: "color:var(--err)", text: "●" }), " Failed — retry above")
-      : h("span", null, h("span", { style: "color:var(--mut)", text: "●" }), " Starting…");
+      ? h("span", null, h("span", { style: "color:var(--err)", text: "●" }), ` ${t("shell.panel.failed")}`)
+      : h("span", null, h("span", { style: "color:var(--mut)", text: "●" }), ` ${t("shell.panel.starting")}`);
 
   const capturing = s.hooked_game
     ? h(
@@ -231,26 +258,35 @@ function renderStatusPanel(): void {
         " ",
         h("span", { class: "mono muted", text: s.hooked_game.executable }),
       )
-    : h("span", null, "The desktop ", h("span", { class: "muted", text: "— no game hooked" }));
+    : h(
+        "span",
+        null,
+        t("shell.panel.theDesktop"),
+        h("span", { class: "muted", text: t("shell.panel.noGameHooked") }),
+      );
 
   const encoders = s.ffmpeg_error
-    ? h("span", { class: "muted", text: "unavailable" })
+    ? h("span", { class: "muted", text: t("shell.panel.unavailable") })
     : s.encoders
       ? h("span", { class: "mono", text: `${s.encoders.av1} / ${s.encoders.h264}` })
-      : h("span", { class: "muted", text: "probing…" });
+      : h("span", { class: "muted", text: t("shell.panel.probing") });
 
   const rows: (HTMLElement | string)[] = [
-    h("span", { class: "key", text: "Buffer" }),
+    h("span", { class: "key", text: t("shell.panel.buffer") }),
     h("span", { class: "value" }, bufferState),
-    h("span", { class: "key", text: "Capturing" }),
+    h("span", { class: "key", text: t("shell.panel.capturing") }),
     h(
       "span",
       { class: "value" },
       capturing,
       " ",
-      h("span", { class: "muted", style: "font-size:11px", text: "— follows the game you're in" }),
+      h("span", {
+        class: "muted",
+        style: "font-size:11px",
+        text: t("shell.panel.followsGame"),
+      }),
     ),
-    h("span", { class: "key", text: "Session" }),
+    h("span", { class: "key", text: t("shell.panel.session") }),
     h(
       "span",
       { class: "value" },
@@ -258,33 +294,41 @@ function renderStatusPanel(): void {
         ? `${s.session.game_name} — ${
             s.session.recording
               ? s.session.match_id
-                ? "recording, match in progress"
-                : "recording"
-              : "between games"
+                ? t("shell.panel.sessionRecordingMatch")
+                : t("shell.panel.sessionRecording")
+              : t("shell.panel.betweenGames")
           }`
-        : h("span", { class: "muted", text: "no supported game running" }),
+        : h("span", { class: "muted", text: t("shell.panel.noSupportedGame") }),
     ),
-    h("span", { class: "key", text: "Buffer encoder" }),
+    h("span", { class: "key", text: t("shell.panel.bufferEncoder") }),
     h("span", { class: "value mono", text: s.encoder ?? "–" }),
-    h("span", { class: "key", text: "Clip encoders" }),
+    h("span", { class: "key", text: t("shell.panel.clipEncoders") }),
     h(
       "span",
       { class: "value" },
       encoders,
       " ",
-      h("button", { type: "button", class: "link", text: "Probe again", onclick: () => void probeEncoders() }),
+      h("button", {
+        type: "button",
+        class: "link",
+        text: t("shell.alarm.probeAgain"),
+        onclick: () => void probeEncoders(),
+      }),
     ),
-    h("span", { class: "key", text: "Hotkey" }),
-    h("span", { class: "value mono", text: `${s.hotkey} · ${s.buffer_seconds} s buffer` }),
-    h("span", { class: "key", text: "Folder" }),
+    h("span", { class: "key", text: t("shell.panel.hotkey") }),
+    h("span", {
+      class: "value mono",
+      text: t("shell.panel.hotkeyValue", { hotkey: s.hotkey, seconds: s.buffer_seconds }),
+    }),
+    h("span", { class: "key", text: t("shell.panel.folder") }),
     h("span", { class: "value mono", text: s.clip_dir }),
-    h("span", { class: "key", text: "Account" }),
+    h("span", { class: "key", text: t("shell.panel.account") }),
     h(
       "span",
       { class: "value" },
-      s.account ? s.account.username : "not linked",
+      s.account ? s.account.username : t("shell.panel.notLinked"),
       s.account && !s.auto_upload
-        ? h("span", { style: "color:var(--warn)", text: " (uploads off)" })
+        ? h("span", { style: "color:var(--warn)", text: t("shell.panel.uploadsOff") })
         : null,
     ),
   ];
@@ -301,11 +345,11 @@ function renderStatusPanel(): void {
       h("button", {
         type: "button",
         class: "btn primary small",
-        text: "Save clip now",
+        text: t("shell.panel.saveClipNow"),
         onclick: () => void saveClipNow(),
       }),
       h("span", { class: "result mono", text: lastSave }),
     ),
-    h("span", { class: "refresh-note", text: "Refreshes every 5 s and on recorder events." }),
+    h("span", { class: "refresh-note", text: t("shell.panel.refreshNote") }),
   );
 }

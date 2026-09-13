@@ -57,6 +57,7 @@ test('PUT creates a guild, GET returns seedEmojis as an array', async () => {
       guildId: GUILD,
       channelId: CHANNEL,
       seedEmojis: ['🍿', '🎯'],
+      locale: 'es',
     });
 
     const res = await get(app, `/internal/guilds/${GUILD}`);
@@ -65,6 +66,7 @@ test('PUT creates a guild, GET returns seedEmojis as an array', async () => {
       guildId: GUILD,
       channelId: CHANNEL,
       seedEmojis: ['🍿', '🎯'],
+      locale: 'es',
     });
     assert.ok(Array.isArray(res.json().seedEmojis));
 
@@ -101,7 +103,12 @@ test('PUT with only channelId keeps the stored emojis and refreshes updated_at',
     const other = '444444444444444444';
     const res = await put(app, GUILD, { channelId: other });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), { guildId: GUILD, channelId: other, seedEmojis: ['🥇'] });
+    assert.deepEqual(res.json(), {
+      guildId: GUILD,
+      channelId: other,
+      seedEmojis: ['🥇'],
+      locale: 'es',
+    });
 
     const rows = await app.db.select().from(guildSettings);
     assert.equal(rows.length, 1, 'upsert must not insert a second row');
@@ -145,11 +152,28 @@ test('GET /internal/guilds lists every guild in guild_id order', async () => {
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), {
       items: [
-        { guildId: '111111111111111111', channelId: '2', seedEmojis: ['a'] },
-        { guildId: '222222222222222222', channelId: '3', seedEmojis: DEFAULT_EMOJIS },
-        { guildId: '333333333333333333', channelId: '1', seedEmojis: ['c'] },
+        { guildId: '111111111111111111', channelId: '2', seedEmojis: ['a'], locale: 'es' },
+        { guildId: '222222222222222222', channelId: '3', seedEmojis: DEFAULT_EMOJIS, locale: 'es' },
+        { guildId: '333333333333333333', channelId: '1', seedEmojis: ['c'], locale: 'es' },
       ],
     });
+  } finally {
+    await app.close();
+  }
+});
+
+test('PUT accepts a locale, GET returns it, and an unknown locale is rejected', async () => {
+  const app = await testApp();
+  try {
+    const res = await put(app, GUILD, { channelId: CHANNEL, locale: 'en' });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().locale, 'en');
+
+    const kept = await put(app, GUILD, { channelId: CHANNEL });
+    assert.equal(kept.json().locale, 'en', 'omitting locale must leave it alone');
+
+    const bad = await put(app, GUILD, { channelId: CHANNEL, locale: 'fr' });
+    assert.equal(bad.statusCode, 400);
   } finally {
     await app.close();
   }

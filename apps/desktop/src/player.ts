@@ -3,9 +3,10 @@
  *  Prev and Next step through whatever the library is currently showing, so a filter or a
  *  search narrows the player too. */
 
-import { badgeFor, canEdit, cutLabel, gameLabel, isReleased, mediaFor, UNKNOWN } from "./clips";
+import { badgeFor, canEdit, cutLabel, gameLabel, isReleased, mediaFor, unknownGame } from "./clips";
 import { confirming, editInline, fill, h } from "./dom";
 import { fmtBytes, fmtClock, fmtDuration, fmtWhen, fmtWhenLong, hueFor } from "./format";
+import { t } from "./i18n";
 import * as ipc from "./ipc";
 import { copyLinkButton, selectionLabel, visibleClips } from "./library";
 import { go } from "./router";
@@ -69,7 +70,7 @@ function show(): void {
       wanted.root,
       h("div", {
         class: "empty-state",
-        text: data.clips.length ? "That clip is gone." : "Opening the clip library…",
+        text: data.clips.length ? t("player.gone") : t("player.opening"),
       }),
     );
     return;
@@ -103,13 +104,18 @@ function build(root: HTMLElement, clip: ClipRow): void {
   const previewBox = h("div", { class: "preview", hidden: true }, preview, previewAt);
   const scrubber = h("div", { class: "scrubber" }, buffered, played, knob, previewBox);
   const time = h("span", { class: "time" });
-  const playButton = h("button", { class: "play", type: "button", text: "▶", title: "Play" });
+  const playButton = h("button", {
+    class: "play",
+    type: "button",
+    text: "▶",
+    title: t("player.play"),
+  });
   const message = h("div", { class: "rail-msg" });
   const strip = h("div", { class: "trim-slot" });
 
   const bigPlay = h(
     "button",
-    { type: "button", class: "big-play", title: "Play" },
+    { type: "button", class: "big-play", title: t("player.play") },
     h("span", { text: "▶" }),
   );
 
@@ -131,8 +137,12 @@ function build(root: HTMLElement, clip: ClipRow): void {
         class: "position",
         text:
           index >= 0
-            ? `clip ${index + 1} of ${list.length} ${selectionLabel()}`
-            : `${list.length} clips`,
+            ? t("player.position", {
+                n: index + 1,
+                total: list.length,
+                scope: selectionLabel(),
+              })
+            : t("player.positionPlain", { total: list.length }),
       }),
       h(
         "div",
@@ -140,14 +150,14 @@ function build(root: HTMLElement, clip: ClipRow): void {
         h("button", {
           type: "button",
           class: "btn small",
-          text: "‹ Prev",
+          text: t("player.prev"),
           disabled: index <= 0,
           onclick: () => go({ view: "player", id: list[index - 1].id }),
         }),
         h("button", {
           type: "button",
           class: "btn small",
-          text: "Next ›",
+          text: t("player.next"),
           disabled: index < 0 || index >= list.length - 1,
           onclick: () => go({ view: "player", id: list[index + 1].id }),
         }),
@@ -164,9 +174,9 @@ function build(root: HTMLElement, clip: ClipRow): void {
           { class: "video" },
           media ? video : null,
           media?.streaming
-            ? h("span", { class: "source-note", text: "Streaming from the site — local video freed" })
+            ? h("span", { class: "source-note", text: t("player.streaming") })
             : null,
-          media ? bigPlay : h("div", { class: "trouble", text: "This clip has no video to play." }),
+          media ? bigPlay : h("div", { class: "trouble", text: t("player.noVideo") }),
         ),
         h(
           "div",
@@ -184,7 +194,7 @@ function build(root: HTMLElement, clip: ClipRow): void {
             loopToggle(video),
             h("button", {
               type: "button",
-              title: "Theatre (F)",
+              title: t("player.theatre"),
               text: "⛶",
               onclick: () => toggleTheatre(),
             }),
@@ -192,13 +202,13 @@ function build(root: HTMLElement, clip: ClipRow): void {
           h(
             "div",
             { class: "keys" },
-            h("span", { text: "Space play" }),
-            h("span", { text: "←/→ 5 s" }),
-            h("span", { text: "J/L 10 s · K pause" }),
-            h("span", { text: ",/. frame" }),
-            h("span", { text: "M mute" }),
-            h("span", { text: "F theatre" }),
-            h("span", { text: "E trim & cut" }),
+            h("span", { text: t("player.keys.play") }),
+            h("span", { text: t("player.keys.seek") }),
+            h("span", { text: t("player.keys.jump") }),
+            h("span", { text: t("player.keys.frame") }),
+            h("span", { text: t("player.keys.mute") }),
+            h("span", { text: t("player.keys.theatre") }),
+            h("span", { text: t("player.keys.edit") }),
           ),
         ),
         strip,
@@ -274,9 +284,7 @@ function wireVideo(video: HTMLVideoElement, streaming: boolean): void {
   }
   video.addEventListener("error", () => {
     if (!live) return;
-    const why = streaming
-      ? "The site would not send this clip. Check your connection."
-      : "That file could not be played. It may have been moved or deleted.";
+    const why = streaming ? t("player.errorStreaming") : t("player.errorLocal");
     const box = live.root.querySelector(".video");
     if (box && !box.querySelector(".trouble")) {
       box.appendChild(h("div", { class: "trouble", text: why }));
@@ -307,7 +315,7 @@ function paint(): void {
     h("span", { class: "total", text: ` / ${fmtClock(duration)}` }),
   );
   live.playButton.textContent = video.paused ? "▶" : "⏸";
-  live.playButton.title = video.paused ? "Play" : "Pause";
+  live.playButton.title = video.paused ? t("player.play") : t("player.pause");
 }
 
 function wireScrubber(
@@ -355,9 +363,9 @@ export function frameStep(video: HTMLVideoElement, clip: { fps: number | null })
   };
   return h(
     "span",
-    { class: "frames", title: "One frame back or forward (, and .)" },
+    { class: "frames", title: t("player.frameStep") },
     h("button", { type: "button", text: "‹", onclick: () => move(-1) }),
-    "frame",
+    t("player.frame"),
     h("button", { type: "button", text: "›", onclick: () => move(1) }),
   );
 }
@@ -369,7 +377,7 @@ export function volume(video: HTMLVideoElement): HTMLElement {
     max: "1",
     step: "0.05",
     value: "1",
-    title: "Volume (M mutes)",
+    title: t("player.volume"),
     oninput: (e: Event) => {
       video.volume = Number((e.target as HTMLInputElement).value);
       video.muted = video.volume === 0;
@@ -378,7 +386,7 @@ export function volume(video: HTMLVideoElement): HTMLElement {
   const icon = h("button", {
     type: "button",
     text: "🔊",
-    title: "Mute (M)",
+    title: t("player.mute"),
     onclick: () => {
       video.muted = !video.muted;
     },
@@ -391,7 +399,12 @@ export function volume(video: HTMLVideoElement): HTMLElement {
 }
 
 function speed(video: HTMLVideoElement): HTMLElement {
-  const button = h("button", { type: "button", class: "speed", text: "1.0×", title: "Playback speed" });
+  const button = h("button", {
+    type: "button",
+    class: "speed",
+    text: "1.0×",
+    title: t("player.speed"),
+  });
   button.addEventListener("click", () => {
     const next = SPEEDS[(SPEEDS.indexOf(video.playbackRate) + 1) % SPEEDS.length];
     video.playbackRate = next;
@@ -404,7 +417,7 @@ export function loopToggle(video: HTMLVideoElement): HTMLElement {
   const button = h("button", {
     type: "button",
     class: "loop",
-    text: "Loop",
+    text: t("player.loop"),
     "aria-pressed": "false",
   });
   button.addEventListener("click", () => {
@@ -498,21 +511,24 @@ function cutStrip(clip: ClipRow): HTMLElement {
   );
   const note = !editable
     ? isReleased(clip)
-      ? "The video is only on the site, so there is nothing here to cut."
-      : "Wait for the current job to finish."
+      ? t("player.cut.released")
+      : t("player.cut.busy")
     : cut
-      ? `${cutLabel(cut)} — open to change the cut`
-      : "Trim the ends or take out the middle, then it re-uploads in place.";
+      ? t("player.cut.change", { cut: cutLabel(cut) })
+      : t("player.cut.invite");
   return h(
     "button",
     {
       type: "button",
       class: "trim",
       disabled: !editable,
-      title: "Trim & cut (E)",
+      title: t("player.cut.title"),
       onclick: () => go({ view: "editor", id: clip.id }),
     },
-    h("span", { class: `tag${cut ? " cut" : ""}`, text: cut ? "CUT" : "TRIM" }),
+    h("span", {
+      class: `tag${cut ? " cut" : ""}`,
+      text: cut ? t("player.cut.tagCut") : t("player.cut.tagTrim"),
+    }),
     h("span", { class: "strip" }, ...keeps),
     h("span", { class: "note", text: note }),
   );
@@ -557,19 +573,19 @@ function renderRail(): void {
     type: "button",
     class: "game-name",
     text: `${gameLabel(clip.game)} ✎`,
-    title: "Click to rename just this clip's game",
+    title: t("player.rail.renameTitle"),
   });
   name.addEventListener("click", () =>
     editInline(name, clip.game ?? "", (value) => void ipc.setClipGame(clip.id, value).then(loadClips), {
       class: "game-edit",
-      placeholder: UNKNOWN,
+      placeholder: unknownGame(),
     }),
   );
 
   const openFolder = h("button", {
     type: "button",
     class: "btn",
-    text: released ? "Open folder — video is on the site only" : "Open folder",
+    text: released ? t("player.rail.openFolderReleased") : t("player.rail.openFolder"),
     disabled: released,
     onclick: () => void ipc.openClipFolder(clip.id),
   }) as HTMLButtonElement;
@@ -579,31 +595,38 @@ function renderRail(): void {
     h(
       "div",
       { class: "game-block" },
-      h("span", { class: "label", text: "Game — click to edit" }),
+      h("span", { class: "label", text: t("player.rail.gameLabel") }),
       name,
-      clip.title ? h("span", { class: "window-title", text: `window was “${clip.title}”` }) : null,
+      clip.title
+        ? h("span", {
+            class: "window-title",
+            text: t("player.rail.windowTitle", { title: clip.title }),
+          })
+        : null,
     ),
     h("span", { class: `badge ${badge.kind}`, text: badge.label, title: badge.title }),
     h(
       "div",
       { class: "facts" },
-      h("span", { class: "k", text: "Recorded" }),
+      h("span", { class: "k", text: t("player.rail.recorded") }),
       h("span", { class: "v", text: fmtWhenLong(clip.recorded_at) }),
-      h("span", { class: "k", text: "Length" }),
+      h("span", { class: "k", text: t("player.rail.length") }),
       h("span", { class: "v mono", text: fmtDuration(clip.duration_ms) }),
-      h("span", { class: "k", text: "Video" }),
+      h("span", { class: "k", text: t("player.rail.video") }),
       h("span", { class: "v mono", text: videoLine(clip) }),
-      h("span", { class: "k", text: "Original" }),
+      h("span", { class: "k", text: t("player.rail.original") }),
       h("span", {
         class: "v mono",
-        text: released ? `${fmtBytes(clip.size_source)} — freed` : fmtBytes(clip.size_source),
+        text: released
+          ? t("player.rail.originalFreed", { size: fmtBytes(clip.size_source) })
+          : fmtBytes(clip.size_source),
       }),
-      h("span", { class: "k", text: "AV1 / H.264" }),
+      h("span", { class: "k", text: t("player.rail.sizes") }),
       h("span", {
         class: "v mono",
         text: `${fmtBytes(clip.size_av1)} / ${fmtBytes(clip.size_h264)}`,
       }),
-      clip.cut ? h("span", { class: "k", text: "Cut" }) : null,
+      clip.cut ? h("span", { class: "k", text: t("player.rail.cut") }) : null,
       clip.cut ? h("span", { class: "v", text: cutLabel(clip.cut) }) : null,
     ),
     h(
@@ -611,13 +634,19 @@ function renderRail(): void {
       { class: "buttons" },
       clip.page_url
         ? copyLinkButton(clip.page_url, "btn primary")
-        : h("button", { type: "button", class: "btn", text: "Copy link", disabled: true, title: "Not on the site yet" }),
+        : h("button", {
+            type: "button",
+            class: "btn",
+            text: t("library.copyLink"),
+            disabled: true,
+            title: t("player.rail.copyLinkPending"),
+          }),
       h("button", {
         type: "button",
         class: "btn",
-        text: "Trim & cut",
+        text: t("player.rail.trimCut"),
         disabled: !editable,
-        title: editable ? "Open the editor (E)" : "Nothing here to cut right now",
+        title: editable ? t("player.rail.trimCutTitle") : t("player.rail.trimCutDisabled"),
         onclick: () => go({ view: "editor", id: clip.id }),
       }),
       openFolder,
@@ -625,14 +654,14 @@ function renderRail(): void {
         ? h("button", {
             type: "button",
             class: "btn",
-            text: "Retry",
+            text: t("player.rail.retry"),
             onclick: () => void ipc.retryClip(clip.id),
           })
         : null,
       confirming(
         h("button", { type: "button", class: "btn danger" }) as HTMLButtonElement,
-        "Delete everywhere…",
-        "Confirm delete",
+        t("player.rail.delete"),
+        t("player.rail.confirmDelete"),
         () => void deleteClip(clip.id),
       ),
     ),
@@ -640,21 +669,20 @@ function renderRail(): void {
     h("span", { class: "grow" }),
     h("span", {
       class: "note",
-      text: clip.remote_id
-        ? "Deleting removes the clip from this PC and from the site. The Discord post stays, but its video stops working."
-        : "Deleting removes the clip and every file it owns from this PC.",
+      text: clip.remote_id ? t("player.rail.noteRemote") : t("player.rail.noteLocal"),
     }),
   );
 }
 
 function videoLine(clip: ClipRow): string {
-  const size = clip.width && clip.height ? `${clip.width}×${clip.height}` : "unknown size";
-  return clip.fps ? `${size} · ${Math.round(clip.fps)} fps` : size;
+  const size =
+    clip.width && clip.height ? `${clip.width}×${clip.height}` : t("player.rail.unknownSize");
+  return clip.fps ? t("player.rail.fps", { size, fps: Math.round(clip.fps) }) : size;
 }
 
 async function deleteClip(id: number): Promise<void> {
   if (!live) return;
-  live.message.textContent = "Deleting…";
+  live.message.textContent = t("player.rail.deleting");
   live.message.className = "rail-msg";
   try {
     await ipc.deleteClip(id);

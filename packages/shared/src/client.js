@@ -146,20 +146,20 @@ export function createClient(options) {
     getPost: (messageId) =>
       request('GET', `/internal/posts/${encodeURIComponent(messageId)}`, { auth: 'bot' }),
     /**
-     * Per-guild bot configuration: clip channel and seed emojis.
+     * Per-guild bot configuration: clip channel, seed emojis and reply language.
      * @param {string} guildId
-     * @returns {Promise<{ guildId: string, channelId: string | null, seedEmojis: string[] }>}
+     * @returns {Promise<import('./types.js').GuildSettings>}
      */
     getGuild: (guildId) =>
       request('GET', `/internal/guilds/${encodeURIComponent(guildId)}`, { auth: 'bot' }),
     /**
      * @param {string} guildId
-     * @param {{ channelId?: string | null, seedEmojis?: string[] }} body
-     * @returns {Promise<{ guildId: string, channelId: string | null, seedEmojis: string[] }>}
+     * @param {{ channelId?: string | null, seedEmojis?: string[], locale?: import('./types.js').Locale }} body
+     * @returns {Promise<import('./types.js').GuildSettings>}
      */
     putGuild: (guildId, body) =>
       request('PUT', `/internal/guilds/${encodeURIComponent(guildId)}`, { body, auth: 'bot' }),
-    /** @returns {Promise<{ items: { guildId: string, channelId: string | null, seedEmojis: string[] }[] }>} */
+    /** @returns {Promise<{ items: import('./types.js').GuildSettings[] }>} */
     listGuilds: () => request('GET', '/internal/guilds', { auth: 'bot' }),
   };
 }

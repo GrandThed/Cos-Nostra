@@ -4,6 +4,7 @@
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { fmtBytes, fmtCount } from "./format";
+import { t } from "./i18n";
 import type { ClipProgress, ClipRow, Segment, Settings, Status } from "./types";
 
 /** Matches `queue::MAX_ATTEMPTS`. */
@@ -47,7 +48,7 @@ export function canEdit(c: ClipRow): boolean {
 
 /** "Trimmed", "3 parts kept": how a cut reads in one phrase. */
 export function cutLabel(cut: Segment[]): string {
-  return cut.length === 1 ? "Trimmed" : `${cut.length} parts kept`;
+  return cut.length === 1 ? t("clips.trimmed") : t("clips.partsKept", { n: cut.length });
 }
 
 /** Encoding waits for the game to close unless the user opted out of that. The status only
@@ -63,47 +64,57 @@ export function badgeFor(
   settings: Settings | null,
 ): Badge {
   const percent = progress ? ` · ${progress.percent}%` : "";
+  const retrying = (): Badge => ({
+    kind: "retrying",
+    label: t("clips.badge.retrying", { attempts: c.attempts, max: MAX_ATTEMPTS }),
+    title: c.error
+      ? t("clips.badge.attemptFailed", { attempts: c.attempts, error: c.error })
+      : undefined,
+  });
   switch (c.status) {
     case "saved":
-      if (c.attempts > 0) {
-        return {
-          kind: "retrying",
-          label: `Retrying · ${c.attempts}/${MAX_ATTEMPTS}`,
-          title: c.error ? `Attempt ${c.attempts} failed: ${c.error}` : undefined,
-        };
-      }
+      if (c.attempts > 0) return retrying();
       if (encodingIsWaiting(status, settings)) {
-        return { kind: "waiting", label: "Waiting", title: "Encodes when you stop playing" };
+        return {
+          kind: "waiting",
+          label: t("clips.badge.waiting"),
+          title: t("clips.badge.waitingTitle"),
+        };
       }
       // A clip that has outputs and is `saved` again is one the editor sent back.
       return c.cut || c.av1_path
-        ? { kind: "saved", label: "Cut queued", title: "Re-encodes with your cut" }
-        : { kind: "saved", label: "Saved", title: "Just captured — original file only" };
+        ? {
+            kind: "saved",
+            label: t("clips.badge.cutQueued"),
+            title: t("clips.badge.cutQueuedTitle"),
+          }
+        : { kind: "saved", label: t("clips.badge.saved"), title: t("clips.badge.savedTitle") };
     case "encoding":
-      return { kind: "encoding", label: `${c.cut ? "Cutting" : "Encoding"}${percent}` };
+      return {
+        kind: "encoding",
+        label: `${c.cut ? t("clips.badge.cutting") : t("clips.badge.encoding")}${percent}`,
+      };
     case "encoded":
-      if (c.attempts > 0) {
-        return {
-          kind: "retrying",
-          label: `Retrying · ${c.attempts}/${MAX_ATTEMPTS}`,
-          title: c.error ? `Attempt ${c.attempts} failed: ${c.error}` : undefined,
-        };
-      }
+      if (c.attempts > 0) return retrying();
       return {
         kind: "ready",
-        label: "Ready",
-        title: settings?.auto_upload === false ? "Uploads are off, so it stops here" : undefined,
+        label: t("clips.badge.ready"),
+        title: settings?.auto_upload === false ? t("clips.badge.readyUploadsOff") : undefined,
       };
     case "uploading":
-      return { kind: "uploading", label: `Uploading${percent}` };
+      return { kind: "uploading", label: `${t("clips.badge.uploading")}${percent}` };
     case "done":
       return isReleased(c)
-        ? { kind: "released", label: "On the site only", title: "Local video freed — the link still works" }
-        : { kind: "done", label: "On the site" };
+        ? {
+            kind: "released",
+            label: t("clips.badge.released"),
+            title: t("clips.badge.releasedTitle"),
+          }
+        : { kind: "done", label: t("clips.badge.done") };
     case "failed":
       return {
         kind: "failed",
-        label: c.stage === "upload" ? "Upload failed" : "Failed",
+        label: c.stage === "upload" ? t("clips.badge.uploadFailed") : t("clips.badge.failed"),
         title: c.error ?? undefined,
       };
   }
@@ -114,20 +125,30 @@ export function metaLine(c: ClipRow, settings: Settings | null): string {
   const source = fmtBytes(c.size_source);
   switch (c.status) {
     case "saved":
-      if (c.attempts > 0) return `Attempt ${c.attempts} of ${MAX_ATTEMPTS} — hover for why`;
-      return c.cut || c.av1_path ? `${source} · waiting to cut` : `${source} · waiting to encode`;
+      if (c.attempts > 0) {
+        return t("clips.meta.attempt", { attempts: c.attempts, max: MAX_ATTEMPTS });
+      }
+      return c.cut || c.av1_path
+        ? t("clips.meta.waitingToCut", { size: source })
+        : t("clips.meta.waitingToEncode", { size: source });
     case "encoding":
-      return `${source} · ${c.cut ? "cutting" : "encoding"}`;
+      return c.cut
+        ? t("clips.meta.cutting", { size: source })
+        : t("clips.meta.encoding", { size: source });
     case "encoded":
-      return `${source} → ${fmtBytes(c.size_av1)}${settings?.auto_upload === false ? " · uploads off" : ""}`;
+      return t("clips.meta.encoded", {
+        source,
+        encoded: fmtBytes(c.size_av1),
+        uploads: settings?.auto_upload === false ? t("clips.meta.uploadsOff") : "",
+      });
     case "uploading":
-      return `${fmtBytes(c.size_av1)} · uploading`;
+      return t("clips.meta.uploading", { size: fmtBytes(c.size_av1) });
     case "done":
       return isReleased(c)
-        ? "Local video freed · link works"
-        : `${source} → ${fmtBytes(c.size_av1)}`;
+        ? t("clips.meta.released")
+        : t("clips.meta.done", { source, encoded: fmtBytes(c.size_av1) });
     case "failed":
-      return c.error ? firstLine(c.error) : "Failed";
+      return c.error ? firstLine(c.error) : t("clips.meta.failed");
   }
 }
 
@@ -156,10 +177,12 @@ export function mediaFor(
 }
 
 /** The name a clip is filed under. `null` is its own pile, never the string "Unknown game". */
-export const UNKNOWN = "Unknown game";
+export function unknownGame(): string {
+  return t("clips.unknownGame");
+}
 
 export function gameLabel(game: string | null): string {
-  return game ?? UNKNOWN;
+  return game ?? unknownGame();
 }
 
 // ---------------------------------------------------------------------------
@@ -167,12 +190,16 @@ export function gameLabel(game: string | null): string {
 
 export type FilterId = "not-uploaded" | "failed" | "released" | "local";
 
-export const FILTERS: { id: FilterId; label: string; match: (c: ClipRow) => boolean }[] = [
-  { id: "not-uploaded", label: "Not uploaded", match: (c) => c.remote_id === null },
-  { id: "failed", label: "Failed", match: (c) => c.status === "failed" },
-  { id: "released", label: "On the site only", match: isReleased },
-  { id: "local", label: "Still on this PC", match: isLocal },
+export const FILTERS: { id: FilterId; match: (c: ClipRow) => boolean }[] = [
+  { id: "not-uploaded", match: (c) => c.remote_id === null },
+  { id: "failed", match: (c) => c.status === "failed" },
+  { id: "released", match: isReleased },
+  { id: "local", match: isLocal },
 ];
+
+export function filterLabel(id: FilterId): string {
+  return t(`clips.filter.${id}`);
+}
 
 /** Search matches the game name or the window title the clip was saved from, which is how
  *  someone finds "the kitchen one" without remembering the game. */
@@ -184,11 +211,11 @@ export function matchesSearch(c: ClipRow, needle: string): boolean {
 
 export type SortId = "newest" | "oldest" | "longest";
 
-export const SORTS: { id: SortId; label: string }[] = [
-  { id: "newest", label: "Newest" },
-  { id: "oldest", label: "Oldest" },
-  { id: "longest", label: "Longest" },
-];
+export const SORTS: SortId[] = ["newest", "oldest", "longest"];
+
+export function sortLabel(id: SortId): string {
+  return t(`clips.sort.${id}`);
+}
 
 export function sortClips(clips: ClipRow[], sort: SortId): ClipRow[] {
   const by = [...clips];
@@ -210,5 +237,5 @@ export function countByGame(clips: ClipRow[]): { game: string | null; clips: num
 }
 
 export function clipsNote(n: number): string {
-  return fmtCount(n, "clip");
+  return fmtCount(n, t("clips.one"), t("clips.many"));
 }

@@ -43,6 +43,7 @@ export interface Status {
 
 export type Quality = "small" | "balanced" | "high";
 export type EncodeEngine = "cpu" | "gpu";
+export type Language = "en" | "es";
 
 export interface Settings {
   hotkey: string;
@@ -58,6 +59,7 @@ export interface Settings {
   encode_while_gaming: boolean;
   quality: Quality;
   encode_engine: EncodeEngine;
+  language: Language;
   backend_url: string;
   /** No `device_token`: `get_settings` blanks it, and `save_settings` puts the live one back.
    *  Whether a device is linked is `account` (or `get_account`), never the token itself. */

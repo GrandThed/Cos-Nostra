@@ -1,6 +1,8 @@
 /** The whole view layer's vocabulary: build an element, find one, swap one out. No framework,
  *  because every component in the design is one element and one class. */
 
+import { t } from "./i18n";
+
 type Child = Node | string | number | null | undefined | false;
 
 export interface Attrs {
@@ -92,7 +94,7 @@ export function editInline(
     type: "text",
     class: opts.class ?? "field",
     value: current,
-    placeholder: opts.placeholder ?? "Game name",
+    placeholder: opts.placeholder ?? t("clips.unknownGame"),
     spellcheck: "false",
   });
   let finished = false;
