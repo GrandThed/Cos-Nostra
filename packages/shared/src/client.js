@@ -105,9 +105,22 @@ export function createClient(options) {
       }),
     /** @returns {Promise<import('./types.js').User>} */
     me: () => request('GET', '/auth/me'),
+    /**
+     * Who is in the caller's Discord voice channel right now, asked at capture time so the
+     * ids can ride along with createClip as `participantDiscordIds`. Always resolves: if the
+     * bot is unreachable the backend answers with an empty list rather than an error.
+     * @returns {Promise<import('./types.js').VoiceSnapshot>}
+     */
+    voiceSnapshot: () => request('POST', '/discord/voice-snapshot'),
 
     // Clips (desktop and web)
-    /** @param {import('./types.js').CreateClipBody} body @returns {Promise<import('./types.js').CreateClipResponse>} */
+    /**
+     * Creates the clip record and mints its three upload URLs. `participantDiscordIds` on the
+     * body is what voiceSnapshot() returned; it is stored on the clip and only ever read back
+     * through internalClip(), never through the public clip JSON.
+     * @param {import('./types.js').CreateClipBody} body
+     * @returns {Promise<import('./types.js').CreateClipResponse>}
+     */
     createClip: (body) => request('POST', '/clips', { body }),
     /** @param {string} id @returns {Promise<import('./types.js').Clip>} */
     completeClip: (id) => request('POST', `/clips/${encodeURIComponent(id)}/complete`),
@@ -128,9 +141,23 @@ export function createClient(options) {
      * @param {{ messageId: string, userDiscordId: string, emoji: string, removed: boolean }} body
      */
     internalReaction: (body) => request('POST', '/internal/reactions', { body, auth: 'bot' }),
-    /** @param {string} id @returns {Promise<import('./types.js').Clip>} */
+    /**
+     * The bot's view of a clip: adds `participants`, the Discord ids of whoever was in voice
+     * with the owner at capture time, which the public clip JSON never carries.
+     * @param {string} id
+     * @returns {Promise<import('./types.js').Clip & { participants: string[] }>}
+     */
     internalClip: (id) =>
       request('GET', `/internal/clips/${encodeURIComponent(id)}`, { auth: 'bot' }),
+    /**
+     * Takes a clip down on the owner's behalf, for the manage menu on a Discord post. Same
+     * outcome as the owner's own deleteClip: the three objects are removed from the bucket and
+     * the row is marked deleted but kept, so posts and reactions still resolve.
+     * @param {string} id
+     * @returns {Promise<null>}
+     */
+    internalDeleteClip: (id) =>
+      request('DELETE', `/internal/clips/${encodeURIComponent(id)}`, { auth: 'bot' }),
     /**
      * One reaction add or remove. Rows are append-only, so "remove" closes the open row
      * rather than deleting it.
@@ -154,7 +181,8 @@ export function createClient(options) {
       request('GET', `/internal/guilds/${encodeURIComponent(guildId)}`, { auth: 'bot' }),
     /**
      * @param {string} guildId
-     * @param {{ channelId?: string | null, seedEmojis?: string[], locale?: import('./types.js').Locale }} body
+     * Any field but channelId may be omitted, and omitting one leaves the stored value alone.
+     * @param {{ channelId?: string | null, seedEmojis?: string[], locale?: import('./types.js').Locale, tagVoiceMembers?: boolean, name?: string, icon?: string | null, slug?: string }} body
      * @returns {Promise<import('./types.js').GuildSettings>}
      */
     putGuild: (guildId, body) =>

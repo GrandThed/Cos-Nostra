@@ -458,6 +458,7 @@ mod tests {
                 height: 1080,
                 fps: 60.0,
                 size_source: bytes as i64,
+                participants: None,
             })
             .unwrap()
     }

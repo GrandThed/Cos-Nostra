@@ -23,6 +23,18 @@ import { Client, GatewayIntentBits, Partials } from 'discord.js';
  * MessageReactionRemove action returns early when getUser() has nothing), so an un-reaction
  * would leave the vote row open forever and the rankings would keep counting it.
  *
+ * `GuildVoiceStates` keeps `guild.voiceStates.cache` filled, which is the whole of
+ * POST /voice-snapshot in server.js: the desktop app asks who was in the recorder's voice
+ * channel at the moment the hotkey was pressed, and those people get mentioned on the post.
+ * It is not a privileged intent, so nothing has to be toggled in the developer portal.
+ *
+ * `GuildMembers` is deliberately *not* requested. A voice state carries the user id on the
+ * gateway payload whatever the intents are, and `<@id>` renders the right name client-side
+ * without the bot ever holding a GuildMember or User object, so the snapshot needs nothing
+ * more. The accepted cost is that a *bot* sitting in the same voice channel cannot be told
+ * apart from a person and would be mentioned like one; fixing that would mean asking for a
+ * privileged intent to cache members, which is not worth it for a music bot in the corner.
+ *
  * @type {import('discord.js').ClientOptions}
  */
 export const clientOptions = {
@@ -30,6 +42,7 @@ export const clientOptions = {
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Message, Partials.Reaction, Partials.User],
   allowedMentions: { parse: [], repliedUser: false },

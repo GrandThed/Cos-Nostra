@@ -94,6 +94,9 @@ function makeInteraction({
       getString: (name) => options[name] ?? null,
       getInteger: (name) => options[name] ?? null,
       getChannel: (name) => options[name] ?? null,
+      // Discord answers null for an option that was not given, and `false` is a real answer
+      // that must not be confused with it - which is the whole of /clips config's semantics.
+      getBoolean: (name) => (name in options ? options[name] : null),
     },
     deferReply: record('deferReply', false),
     editReply: record('editReply', true),
@@ -138,7 +141,7 @@ function embedOf(payload) {
 
 // ---- command JSON ----------------------------------------------------------------------
 
-test('commands is JSON for one /clips command with the five subcommands', () => {
+test('commands is JSON for one /clips command with its subcommands', () => {
   assert.ok(Array.isArray(commands));
   assert.equal(commands.length, 1);
   // Everything below runs on the serialized copy, which is what the REST client actually
@@ -152,7 +155,7 @@ test('commands is JSON for one /clips command with the five subcommands', () => 
   const subs = clips.options.filter((opt) => opt.type === 1);
   assert.deepEqual(
     subs.map((opt) => opt.name),
-    ['setup', 'latest', 'top', 'mine', 'link'],
+    ['setup', 'config', 'latest', 'top', 'mine', 'link'],
   );
 
   // The picker descriptions follow the caller's own Discord language, unlike the replies.
@@ -176,6 +179,17 @@ test('commands is JSON for one /clips command with the five subcommands', () => 
   const byName = Object.fromEntries(top.options.map((opt) => [opt.name, opt]));
   assert.equal(byName.year.required, false);
   assert.equal(byName.game.required, false);
+
+  // Both /clips config options are optional: with neither, the command reads the settings
+  // back instead of writing anything.
+  const config = subs.find((opt) => opt.name === 'config');
+  const configOptions = Object.fromEntries(config.options.map((opt) => [opt.name, opt]));
+  assert.deepEqual(Object.keys(configOptions), ['emojis', 'tag_voice_members']);
+  assert.equal(configOptions.emojis.required, false);
+  assert.equal(configOptions.tag_voice_members.required, false);
+  // Type 5 is BOOLEAN: a checkbox in the client, not free text to parse.
+  assert.equal(configOptions.tag_voice_members.type, 5);
+  assert.equal(configOptions.emojis.type, 3);
 });
 
 // ---- /clips setup ----------------------------------------------------------------------
@@ -195,7 +209,9 @@ test('/clips setup stores the channel and confirms ephemerally', async () => {
   assert.equal(interaction.calls.deferReply.length, 1);
   assert.equal(interaction.calls.deferReply[0].flags, EPHEMERAL);
   // Seed emojis survive a PUT that only meant to change the channel.
-  assert.deepEqual(putCalls, [['guild-1', { channelId: 'chan-9', seedEmojis: ['🔥', '😂'] }]]);
+  assert.deepEqual(putCalls, [
+    ['guild-1', { channelId: 'chan-9', seedEmojis: ['🔥', '😂'], icon: null }],
+  ]);
   assert.match(lastEdit(interaction).content, /<#chan-9>/);
 });
 
@@ -291,6 +307,178 @@ test('/clips setup ignores a language that is not supported', async () => {
   // Sending it on would be a 400 that also loses the channel change.
   assert.equal('locale' in putCalls[0][1], false);
   assert.match(lastEdit(interaction).content, /se van a publicar/);
+});
+
+// ---- /clips config ---------------------------------------------------------------------
+
+/**
+ * A guild that has been through /clips setup, plus a putGuild that records what it was sent.
+ * @param {object} [settings] overrides for the stored row, or null for a guild with no config
+ */
+function configBackend(settings = {}) {
+  const putCalls = [];
+  const stored =
+    settings === null ? null : { guildId: 'guild-1', channelId: 'chan-9', seedEmojis: ['🔥'], locale: 'es', ...settings };
+  return {
+    putCalls,
+    getGuild: async () => stored,
+    putGuild: async (guildId, body) => {
+      putCalls.push([guildId, body]);
+      return { guildId, ...stored, ...body };
+    },
+  };
+}
+
+test('/clips config with only emojis keeps everything else', async () => {
+  const backend = configBackend({ tagVoiceMembers: false });
+  const interaction = makeInteraction({ sub: 'config', options: { emojis: '🔥 😂  💀' } });
+  await run(interaction, backend);
+
+  assert.equal(interaction.calls.deferReply[0].flags, EPHEMERAL);
+  // PUT replaces the row, so the channel and the language have to be handed back, and the
+  // setting that was not named keeps its stored value rather than reverting to the default.
+  assert.deepEqual(backend.putCalls, [
+    [
+      'guild-1',
+      {
+        channelId: 'chan-9',
+        seedEmojis: ['🔥', '😂', '💀'],
+        locale: 'es',
+        tagVoiceMembers: false,
+      },
+    ],
+  ]);
+  const { content } = lastEdit(interaction);
+  assert.match(content, /🔥 😂 💀/);
+  assert.match(content, /llamada: no/);
+});
+
+test('/clips config with only tag_voice_members keeps the seed emojis', async () => {
+  const backend = configBackend();
+  const interaction = makeInteraction({
+    sub: 'config',
+    options: { tag_voice_members: false },
+  });
+  await run(interaction, backend);
+
+  assert.deepEqual(backend.putCalls[0][1], {
+    channelId: 'chan-9',
+    seedEmojis: ['🔥'],
+    locale: 'es',
+    tagVoiceMembers: false,
+  });
+  // false is a value, not a missing option: turning tagging off has to reach the backend.
+  assert.equal(backend.putCalls[0][1].tagVoiceMembers, false);
+  assert.match(lastEdit(interaction).content, /llamada: no/);
+});
+
+test('/clips config with both options writes both', async () => {
+  const backend = configBackend({ seedEmojis: [], tagVoiceMembers: false });
+  const interaction = makeInteraction({
+    sub: 'config',
+    options: { emojis: '👑', tag_voice_members: true },
+  });
+  await run(interaction, backend);
+
+  assert.deepEqual(backend.putCalls[0][1], {
+    channelId: 'chan-9',
+    seedEmojis: ['👑'],
+    locale: 'es',
+    tagVoiceMembers: true,
+  });
+  const { content } = lastEdit(interaction);
+  assert.match(content, /guardado/i);
+  assert.match(content, /👑/);
+  assert.match(content, /llamada: sí/);
+});
+
+test('/clips config with no options echoes the current settings and writes nothing', async () => {
+  const backend = configBackend({ seedEmojis: ['🔥', '😂'], tagVoiceMembers: true });
+  const interaction = makeInteraction({ sub: 'config' });
+  await run(interaction, backend);
+
+  assert.deepEqual(backend.putCalls, [], 'reading the settings must not rewrite the row');
+  const { content } = lastEdit(interaction);
+  assert.match(content, /Configuración actual/);
+  assert.match(content, /🔥 😂/);
+  assert.match(content, /llamada: sí/);
+});
+
+test('/clips config reads a guild that never touched the setting as tagging on', async () => {
+  // undefined is what a row written before the column existed looks like, and the backend
+  // column defaults to true, so the echo must not claim it is off.
+  const backend = configBackend({ seedEmojis: [], tagVoiceMembers: undefined });
+  const interaction = makeInteraction({ sub: 'config' });
+  await run(interaction, backend);
+
+  const { content } = lastEdit(interaction);
+  assert.match(content, /llamada: sí/);
+  assert.match(content, /ninguna/);
+});
+
+test('/clips config refuses an emoji list that is empty or too long', async () => {
+  for (const emojis of ['   ', '1 2 3 4 5 6']) {
+    const backend = configBackend();
+    const interaction = makeInteraction({ sub: 'config', options: { emojis } });
+    await run(interaction, backend);
+
+    assert.deepEqual(backend.putCalls, [], `${JSON.stringify(emojis)} must not be saved`);
+    assert.match(lastEdit(interaction).content, /entre 1 y 5/);
+  }
+});
+
+test('/clips config is refused for a member without Manage Guild', async () => {
+  const backend = configBackend();
+  backend.putGuild = async () => assert.fail('putGuild must not be called');
+  const interaction = makeInteraction({
+    sub: 'config',
+    options: { tag_voice_members: false },
+    manageGuild: false,
+  });
+  await run(interaction, backend);
+
+  assert.deepEqual(interaction.calls.permissionChecks, [PermissionFlagsBits.ManageGuild]);
+  assert.match(lastEdit(interaction).content, /Gestionar servidor/);
+});
+
+test('/clips config tells a guild with no clip channel to run setup first', async () => {
+  const backend = configBackend(null);
+  const interaction = makeInteraction({ sub: 'config', options: { emojis: '🔥' } });
+  await run(interaction, backend);
+
+  assert.deepEqual(backend.putCalls, [], 'the PUT needs a channel this guild does not have');
+  assert.match(lastEdit(interaction).content, /\/clips setup/);
+});
+
+test('/clips config outside a guild says so', async () => {
+  const backend = configBackend();
+  const interaction = makeInteraction({ sub: 'config', guildId: null });
+  await run(interaction, backend);
+
+  assert.deepEqual(backend.putCalls, []);
+  assert.match(lastEdit(interaction).content, /servidor/);
+});
+
+test('/clips config answers in the guild language', async () => {
+  const backend = configBackend({ locale: 'en', seedEmojis: ['🔥'], tagVoiceMembers: true });
+  const interaction = makeInteraction({ sub: 'config' });
+  await run(interaction, backend);
+
+  const { content } = lastEdit(interaction);
+  assert.match(content, /Current settings/);
+  assert.match(content, /in voice: on/);
+});
+
+test('/clips config never lets its reply mention anyone', async () => {
+  // Seed emojis are free text from an admin; a custom emoji and a role mention look alike.
+  const backend = configBackend();
+  const interaction = makeInteraction({
+    sub: 'config',
+    options: { emojis: '<@&1234567890> @everyone' },
+  });
+  await run(interaction, backend);
+
+  assert.deepEqual(lastEdit(interaction).allowedMentions, { parse: [] });
 });
 
 // ---- /clips latest ---------------------------------------------------------------------

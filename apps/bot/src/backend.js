@@ -45,6 +45,18 @@ export function createBackend({ baseUrl, botToken, fetch }) {
     getClip: (clipId) => orNull(() => api.internalClip(clipId)),
 
     /**
+     * Delete a clip everywhere: files, row, votes and every post of it. Bot-authenticated,
+     * because the caller is a Discord button, not a device token.
+     *
+     * Unlike the reads above this one keeps its ApiError: 404 means the clip was already
+     * gone, which every caller should treat as success (two people pressing Confirm, or a
+     * double click), while anything else has to be visible. See registerManage in manage.js.
+     * @param {string} clipId
+     * @returns {Promise<void>}
+     */
+    deleteClip: (clipId) => api.internalDeleteClip(clipId),
+
+    /**
      * Remember the Discord message a clip was posted as. Idempotent on messageId.
      * @param {{ clipId: string, guildId: string, channelId: string, messageId: string }} body
      */
@@ -77,17 +89,32 @@ export function createBackend({ baseUrl, botToken, fetch }) {
 
     /**
      * The PUT replaces the row, so every field the caller still wants has to be in the body.
-     * `locale` is the exception: leaving it out keeps whatever language the guild has, which
-     * is what /clips setup relies on when the admin only changed the channel.
+     * `locale`, `tagVoiceMembers`, `name` and `slug` are exceptions: leaving any of them out
+     * keeps whatever the guild has, which is what /clips setup relies on when the admin only
+     * changed the channel and what /clips config relies on when they only changed the emojis.
+     * `icon` is different - `null` explicitly clears a removed custom icon - so it is sent
+     * whenever given, `null` included.
      * @param {string} guildId
      * @param {{
      *   channelId?: string | null,
      *   seedEmojis?: string[],
      *   locale?: import('@cos-nostra/shared').Locale,
+     *   tagVoiceMembers?: boolean,
+     *   name?: string,
+     *   icon?: string | null,
+     *   slug?: string,
      * }} body
      */
-    putGuild: (guildId, { channelId, seedEmojis, locale }) =>
-      api.putGuild(guildId, { channelId, seedEmojis, ...(locale ? { locale } : {}) }),
+    putGuild: (guildId, { channelId, seedEmojis, locale, tagVoiceMembers, name, icon, slug }) =>
+      api.putGuild(guildId, {
+        channelId,
+        seedEmojis,
+        ...(locale ? { locale } : {}),
+        ...(typeof tagVoiceMembers === 'boolean' ? { tagVoiceMembers } : {}),
+        ...(name ? { name } : {}),
+        ...(icon !== undefined ? { icon } : {}),
+        ...(slug ? { slug } : {}),
+      }),
 
     /**
      * Every guild that has been set up. Wrapped in { items } by the backend, like the

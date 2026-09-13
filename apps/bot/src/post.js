@@ -15,6 +15,7 @@
 import { AttachmentBuilder } from 'discord.js';
 
 import { resolveLocale, t } from './i18n.js';
+import { manageRow } from './manage.js';
 
 const MB = 1024 * 1024;
 
@@ -48,17 +49,39 @@ const MAX_CONTENT = 2000;
 const MAX_TITLE = 256;
 
 /**
- * Mentions this module is willing to send: none.
+ * Everyone this post is allowed to ping: the owner, plus whoever was in their voice channel
+ * when they pressed the hotkey.
  *
- * The content below carries a clip title and an owner username, neither of which the bot
- * controls - a title of "@everyone" or "<@&12345>" typed in the desktop app would otherwise
- * make the bot ping the whole server. The client in client.js already defaults to this; it is
- * repeated on every payload so a change to that default cannot quietly re-open it. A fresh
- * object per message, because discord.js resolves the payload in place.
+ * `parse: []` stays on every payload, so the only mentions that fire are the ids listed here.
+ * That is what keeps the rest of the message inert: the title and the game name come from the
+ * desktop app, so a clip titled "@everyone" or "<@&12345>" still renders as text, because
+ * `allowedMentions.users` is an allow-list of ids and not a blessing for whatever the content
+ * happens to contain.
+ *
+ * Participants are dropped when the guild has turned voice tagging off. `undefined` counts as
+ * on, matching the backend column's default: a guild that has never touched the setting gets
+ * the feature.
+ *
+ * @param {Clip} clip
+ * @param {GuildConfig} [config]
+ * @returns {string[]} deduped, owner first
+ */
+export function mentionedIds(clip, config) {
+  const others = config?.tagVoiceMembers !== false ? (clip?.participants ?? []) : [];
+  return [clip?.owner?.discordId, ...others].filter(
+    (id, i, arr) => typeof id === 'string' && id.length > 0 && arr.indexOf(id) === i,
+  );
+}
+
+/**
+ * The mention allow-list for one message. A fresh object and a fresh array per message,
+ * because discord.js resolves the payload it is handed in place.
+ * @param {Clip} clip
+ * @param {GuildConfig} [config]
  * @returns {import('discord.js').MessageMentionOptions}
  */
-function noMentions() {
-  return { parse: [] };
+function mentions(clip, config) {
+  return { parse: [], users: mentionedIds(clip, config) };
 }
 
 /**
@@ -104,14 +127,32 @@ function clipTitle(clip, locale) {
  *
  * The language is the destination guild's, not the uploader's: the same clip goes out in
  * Spanish to one server and in English to another in the same postClip() run.
+ *
+ * The owner is named with `<@id>` rather than with the username the backend stored: it is a
+ * real ping, it renders the nickname each reader knows them by, and it survives a rename.
+ * Everyone else who was in the voice channel follows in the same form. Only the ids in
+ * mentionedIds() actually notify - see mentions().
+ *
  * @param {Clip} clip
- * @param {{ unfurl: boolean, locale: import('@cos-nostra/shared').Locale }} opts
+ * @param {{
+ *   unfurl: boolean,
+ *   locale: import('@cos-nostra/shared').Locale,
+ *   config?: GuildConfig,
+ * }} opts
  *   unfurl: let Discord build its video preview
  */
-function messageContent(clip, { unfurl, locale }) {
-  const who = clip.owner?.username;
+function messageContent(clip, { unfurl, locale, config }) {
   const title = clipTitle(clip, locale);
-  const head = who ? t(locale, 'post.byOwner', { title, user: who }) : title;
+  const [owner, ...others] = mentionedIds(clip, config);
+  // An owner with no Discord id should not happen, but a clip is not worth losing over it.
+  const who = owner ? `<@${owner}>` : clip.owner?.username;
+  let head = who ? t(locale, 'post.byOwner', { title, user: who }) : title;
+  if (others.length > 0) {
+    const withThem = t(locale, 'post.withOthers', {
+      mentions: others.map((id) => `<@${id}>`).join(' '),
+    });
+    head = `${head} ${withThem}`;
+  }
   const link = unfurl ? clip.urls.page : `<${clip.urls.page}>`;
   return truncate(`${head}\n${link}`, MAX_CONTENT);
 }
@@ -135,6 +176,8 @@ function isSendableText(channel) {
  * @property {number | null} sizeH264
  * @property {string | null} recordedAt
  * @property {{ discordId: string, username: string }} owner
+ * @property {string[]} participants  Discord ids of everyone who was in the owner's voice
+ *   channel when the hotkey was pressed, recorded by the desktop app at capture time
  * @property {{ h264: string, thumb: string, page: string }} urls
  */
 
@@ -144,6 +187,7 @@ function isSendableText(channel) {
  * @property {string} channelId
  * @property {string[]} seedEmojis
  * @property {import('@cos-nostra/shared').Locale} [locale]
+ * @property {boolean} [tagVoiceMembers]  undefined means on, like the backend's default
  */
 
 /** @typedef {{ guildId: string, channelId: string, messageId: string }} PostedMessage */
@@ -206,9 +250,12 @@ export function createPoster({
           `clip ${clip.id}: attaching ${size} B in guild ${config.guildId} (tier ${tier}, limit ${limit} B)`,
         );
         return {
-          content: messageContent(clip, { unfurl: false, locale }),
+          content: messageContent(clip, { unfurl: false, locale, config }),
           files: [new AttachmentBuilder(bytes, { name: attachmentName(clip) })],
-          allowedMentions: noMentions(),
+          allowedMentions: mentions(clip, config),
+          // Components are not embeds: they sit in their own field and leave the link
+          // unfurl alone, so the button can ride along on both paths.
+          components: [manageRow(clip.id)],
         };
       } catch (err) {
         // Small enough to attach, but we could not get the bytes. The link still works.
@@ -226,9 +273,12 @@ export function createPoster({
     // 2026-09-11 — a rich embed plus a bare URL produced one `type=rich` embed and no
     // player, while the URL alone produced `type=video` at 1920x1080. The page's og: tags
     // already supply the title, owner, game, duration and thumbnail, so nothing is lost.
+    // `components` is a different field and does not suppress the unfurl, which is how the
+    // manage button can sit under a post that still plays inline.
     return {
-      content: messageContent(clip, { unfurl: true, locale }),
-      allowedMentions: noMentions(),
+      content: messageContent(clip, { unfurl: true, locale, config }),
+      allowedMentions: mentions(clip, config),
+      components: [manageRow(clip.id)],
     };
   }
 

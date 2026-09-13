@@ -14,6 +14,7 @@ import { createPoster } from './post.js';
 import { createOutbox } from './outbox.js';
 import { registerReactions } from './reactions.js';
 import { registerCommands } from './commands.js';
+import { registerManage } from './manage.js';
 
 // Reaction writes are retried on this schedule so a backend deploy (a minute or so of 502s)
 // never loses a vote. The same shape as the backend's notifyBot retries, with a longer tail.
@@ -77,8 +78,11 @@ const poster = createPoster({ client, backend, log });
 
 registerReactions({ client, backend, outbox, log });
 registerCommands({ client, backend, log });
+registerManage({ client, backend, log });
 
-const server = createServer({ config, poster, log });
+// The client goes in too: POST /voice-snapshot answers out of the gateway's voice state
+// cache, which is the only copy of that anywhere in the system.
+const server = createServer({ config, poster, log, client });
 
 client.once('clientReady', () => log.info(`Logged in as ${client.user.tag}`));
 

@@ -2,6 +2,8 @@
 //
 //   /clips setup channel:<#channel> [language:]  store the clip channel and reply language
 //                                                for this guild (Manage Server)
+//   /clips config [emojis:] [tag_voice_members:] the rest of the guild settings, and an echo
+//                                                of the current ones (Manage Server)
 //   /clips latest                     the newest ready clip, as an embed
 //   /clips top [year] [game]          the yearly leaderboard for this guild
 //   /clips mine                       the caller's own clips, ephemeral
@@ -43,7 +45,10 @@ const COLOR = 0xc4302b;
 const TEXT_CHANNELS = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
 /** Subcommands whose reply only the caller should see. */
-const EPHEMERAL = new Set(['setup', 'mine', 'link']);
+const EPHEMERAL = new Set(['setup', 'config', 'mine', 'link']);
+
+/** How many seed reactions a guild may have. Discord allows more; five is plenty to vote on. */
+const MAX_SEED_EMOJIS = 5;
 
 // ---- command definition ----------------------------------------------------------------
 
@@ -88,6 +93,23 @@ const clips = described(new SlashCommandBuilder().setName('clips'), 'clips')
           { name: 'Español', value: 'es' },
           { name: 'English', value: 'en' },
         ),
+      )
+      // The public clip site's URL segment (docs/PLAN.md phase 5), e.g. "famafia" for
+      // cosnostra.benja.ar/famafia. Optional and sticky like language: most setup runs are
+      // just a channel change and should not have to restate it.
+      .addStringOption((opt) =>
+        described(opt.setName('slug'), 'setupSlug').setMinLength(1).setMaxLength(50),
+      ),
+  )
+  // Everything about a guild that is not the channel. Both options are optional, and running
+  // it with neither echoes the current settings back, so it doubles as "what is set here?".
+  .addSubcommand((sub) =>
+    described(sub.setName('config'), 'config')
+      .addStringOption((opt) =>
+        described(opt.setName('emojis'), 'configEmojis').setMaxLength(200),
+      )
+      .addBooleanOption((opt) =>
+        described(opt.setName('tag_voice_members'), 'configTagVoiceMembers'),
       ),
   )
   .addSubcommand((sub) => described(sub.setName('latest'), 'latest'))
@@ -288,16 +310,49 @@ async function handleSetup(interaction, { backend, log, locale }) {
   const chosen = interaction.options.getString('language');
   const language = SUPPORTED_LOCALES.includes(chosen) ? chosen : undefined;
 
+  // The public clip site's URL segment (docs/PLAN.md phase 5). Optional and sticky, like
+  // language: most setup runs are just a channel change and should not have to restate it.
+  const slug = interaction.options.getString('slug')?.trim().toLowerCase() || undefined;
+
   // PUT replaces the row, so read the current config and hand the seed emojis back rather
   // than dropping them. getGuild returns null for a guild that was never set up. Omitting
   // `locale` leaves the stored one alone, which is why it is only sent when it was picked.
   const existing = await backend.getGuild(interaction.guildId);
   const seedEmojis = existing?.seedEmojis ?? undefined;
-  const saved = await backend.putGuild(interaction.guildId, {
-    channelId: channel.id,
-    seedEmojis,
-    ...(language ? { locale: language } : {}),
-  });
+  // interaction.guild carries the live Discord object (name, icon hash) with no extra API
+  // call, since /clips setup only runs inside a guild. Sent every run, not just when changed,
+  // so a renamed or re-iconned server's clip site catches up the next time an admin touches
+  // setup for any reason.
+  const guildName = interaction.guild?.name;
+  const guildIcon = interaction.guild?.icon ?? null;
+
+  let saved;
+  let slugTaken = false;
+  try {
+    saved = await backend.putGuild(interaction.guildId, {
+      channelId: channel.id,
+      seedEmojis,
+      ...(language ? { locale: language } : {}),
+      ...(guildName ? { name: guildName } : {}),
+      icon: guildIcon,
+      ...(slug ? { slug } : {}),
+    });
+  } catch (err) {
+    // A taken slug must not lose the channel/language change riding along with it: retry
+    // once without it and tell the admin separately that the URL specifically did not save.
+    if (slug && isApiError(err) && Number(err.status) === 409) {
+      slugTaken = true;
+      saved = await backend.putGuild(interaction.guildId, {
+        channelId: channel.id,
+        seedEmojis,
+        ...(language ? { locale: language } : {}),
+        ...(guildName ? { name: guildName } : {}),
+        icon: guildIcon,
+      });
+    } else {
+      throw err;
+    }
+  }
 
   // The confirmation speaks the language that is in force after the change, not before it.
   const replyLocale = language ?? locale;
@@ -311,11 +366,123 @@ async function handleSetup(interaction, { backend, log, locale }) {
         language: t(replyLocale, `setup.languages.${language}`),
       })
     : '';
+  const slugLine = slugTaken
+    ? t(replyLocale, 'setup.slugTaken', { slug })
+    : saved?.slug
+      ? t(replyLocale, 'setup.slugLine', { slug: saved.slug })
+      : '';
   log.info(
-    `clip channel for guild ${interaction.guildId} set to ${channel.id}${language ? `, language ${language}` : ''}`,
+    `clip channel for guild ${interaction.guildId} set to ${channel.id}${language ? `, language ${language}` : ''}${slugTaken ? ' (slug taken)' : ''}`,
   );
   return respond(interaction, {
-    content: `${t(replyLocale, 'setup.saved', { channel: channel.id })}${seedLine}${languageLine}`,
+    content: `${t(replyLocale, 'setup.saved', { channel: channel.id })}${seedLine}${languageLine}${slugLine}`,
+  });
+}
+
+/**
+ * Seed emojis as typed, or null when the option was given and is not usable.
+ *
+ * Whitespace-separated, because that is how someone types three emojis in a row, and because
+ * a custom emoji (`<:name:id>`) contains no space of its own. The cap is ours, not Discord's:
+ * every seed is a reaction the bot adds one at a time to every post in the guild.
+ *
+ * @param {string} raw
+ * @returns {string[] | null}
+ */
+function parseSeedEmojis(raw) {
+  const tokens = String(raw)
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
+  if (tokens.length === 0 || tokens.length > MAX_SEED_EMOJIS) return null;
+  return tokens;
+}
+
+/** @param {Locale} locale @param {unknown} on */
+function onOff(locale, on) {
+  return t(locale, on === false ? 'config.off' : 'config.on');
+}
+
+/**
+ * The settings line both branches of /clips config end on.
+ * @param {Locale} locale
+ * @param {{ seedEmojis?: string[], tagVoiceMembers?: boolean }} settings
+ */
+function configLines(locale, settings) {
+  const seeds = Array.isArray(settings?.seedEmojis) ? settings.seedEmojis : [];
+  return [
+    t(locale, 'config.seedLine', {
+      emojis: seeds.length > 0 ? seeds.join(' ') : t(locale, 'config.noEmojis'),
+    }),
+    t(locale, 'config.tagLine', { state: onOff(locale, settings?.tagVoiceMembers) }),
+  ].join('\n');
+}
+
+/**
+ * /clips config - the guild settings that are not the channel: seed reactions, and whether a
+ * post mentions the people who were in voice when the clip was recorded.
+ *
+ * Given no options at all it changes nothing and reads the settings back instead, which is
+ * the only way to see them. Given some, it PUTs the whole row, because the backend's PUT
+ * replaces it: whatever was not named has to be handed back or it is dropped, exactly as
+ * handleSetup does with the seed emojis.
+ *
+ * @param {any} interaction
+ * @param {HandlerContext} ctx
+ */
+async function handleConfig(interaction, { backend, log, locale }) {
+  if (!interaction.guildId) {
+    return respond(interaction, { content: t(locale, 'config.guildOnly') });
+  }
+
+  const permissions = interaction.memberPermissions;
+  if (!permissions || !permissions.has(PermissionFlagsBits.ManageGuild)) {
+    log.info(
+      `/clips config refused for ${interaction.user?.id} in ${interaction.guildId}: no Manage Server`,
+    );
+    return respond(interaction, { content: t(locale, 'config.needsPermission') });
+  }
+
+  // Validated before the round trip: a bad emoji list should not cost a read.
+  const rawEmojis = interaction.options.getString('emojis');
+  const seedEmojis = rawEmojis === null || rawEmojis === undefined ? undefined : parseSeedEmojis(rawEmojis);
+  if (seedEmojis === null) {
+    return respond(interaction, { content: t(locale, 'config.badEmojis', { max: MAX_SEED_EMOJIS }) });
+  }
+  // getBoolean answers null when the option was not given, which is what "leave it alone"
+  // looks like here - false is a real value and must not be mistaken for it.
+  const tagVoiceMembers = interaction.options.getBoolean('tag_voice_members');
+
+  const existing = await backend.getGuild(interaction.guildId);
+  if (!existing?.channelId) {
+    // channelId is required by the PUT and /clips config has no channel option, so there is
+    // nothing this command can do for a guild that never ran /clips setup.
+    return respond(interaction, { content: t(locale, 'config.needsSetupFirst') });
+  }
+
+  if (seedEmojis === undefined && tagVoiceMembers === null) {
+    return respond(interaction, {
+      content: `${t(locale, 'config.current')}\n${configLines(locale, existing)}`,
+    });
+  }
+
+  const saved = await backend.putGuild(interaction.guildId, {
+    channelId: existing.channelId,
+    seedEmojis: seedEmojis ?? existing.seedEmojis,
+    locale: existing.locale,
+    tagVoiceMembers: tagVoiceMembers ?? existing.tagVoiceMembers,
+  });
+
+  const settings = {
+    seedEmojis: saved?.seedEmojis ?? seedEmojis ?? existing.seedEmojis,
+    tagVoiceMembers: saved?.tagVoiceMembers ?? tagVoiceMembers ?? existing.tagVoiceMembers,
+  };
+  log.info(
+    `config for guild ${interaction.guildId} updated${seedEmojis ? `, seeds ${seedEmojis.join(' ')}` : ''}${
+      tagVoiceMembers === null ? '' : `, voice mentions ${tagVoiceMembers ? 'on' : 'off'}`
+    }`,
+  );
+  return respond(interaction, {
+    content: `${t(locale, 'config.saved')}\n${configLines(locale, settings)}`,
   });
 }
 
@@ -441,6 +608,7 @@ async function handleLink(interaction, { locale }) {
 /** @type {Record<string, (interaction: any, ctx: HandlerContext) => Promise<unknown>>} */
 const handlers = {
   setup: handleSetup,
+  config: handleConfig,
   latest: handleLatest,
   top: handleTop,
   mine: handleMine,

@@ -48,7 +48,23 @@ const log = {
   debug: (...a) => logged.push(`debug ${a.join(' ')}`),
 };
 
-/** @param {{ poster?: ReturnType<typeof fakePoster> }} [opts] */
+/**
+ * A fake discord.js client whose guilds and voice states are the same Map-shaped caches
+ * discord.js hands out: `.get(id)` and `.values()` are all the route uses.
+ * @param {Array<Record<string, string | null>>} guilds  one object per guild, user id to channel id
+ */
+function fakeClient(guilds) {
+  const built = guilds.map((states) => ({
+    voiceStates: {
+      cache: new Map(
+        Object.entries(states).map(([id, channelId]) => [id, { id, channelId }]),
+      ),
+    },
+  }));
+  return { guilds: { cache: new Map(built.map((guild, i) => [`g${i}`, guild])) } };
+}
+
+/** @param {{ poster?: ReturnType<typeof fakePoster>, client?: any }} [opts] */
 async function start(opts = {}) {
   // BOT_PORT 0 keeps parallel test runs from colliding.
   poster = opts.poster ?? fakePoster();
@@ -56,9 +72,22 @@ async function start(opts = {}) {
     config: { BOT_SHARED_SECRET: SECRET, BOT_PORT: 0 },
     poster,
     log,
+    client: opts.client,
   });
   await server.listen();
   return `http://127.0.0.1:${server.port}`;
+}
+
+/** @param {string} base @param {unknown} body @param {string} [authorization] */
+function snapshot(base, body, authorization = `Bearer ${SECRET}`) {
+  return fetch(`${base}/voice-snapshot`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(authorization ? { authorization } : {}),
+    },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
 }
 
 beforeEach(() => {
@@ -209,6 +238,77 @@ test('a body without a usable clipId answers 400', async () => {
     assert.equal((await res.json()).error, 'bad_request');
   }
   assert.deepEqual(poster.calls, []);
+});
+
+// ---- POST /voice-snapshot ----------------------------------------------------------------
+
+test('/voice-snapshot answers with everyone else in the caller voice channel', async () => {
+  // Two guilds, and the user is only in voice in the second one: the route has to look past
+  // a guild that knows the user but has them nowhere.
+  const client = fakeClient([
+    { '1': 'chan-a', '2': 'chan-a' },
+    { '4242': 'chan-b', '99': 'chan-b', '100': 'chan-b', '7': 'other-chan' },
+  ]);
+  const base = await start({ client });
+
+  const res = await snapshot(base, { discordId: '4242' });
+
+  assert.equal(res.status, 200);
+  const { participants } = await res.json();
+  // The caller is never in their own participant list, and neither is someone in another
+  // channel of the same guild.
+  assert.deepEqual([...participants].sort(), ['100', '99']);
+});
+
+test('/voice-snapshot answers an empty list when the user is in no voice channel', async () => {
+  const client = fakeClient([{ '1': 'chan-a' }, { '4242': null, '99': 'chan-b' }]);
+  const base = await start({ client });
+
+  for (const discordId of ['4242', 'nobody']) {
+    const res = await snapshot(base, { discordId });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { participants: [] }, `for ${discordId}`);
+  }
+});
+
+test('/voice-snapshot is empty rather than broken without a client or a cache', async () => {
+  // index.js always passes one, but a route that answers 500 here would fail an upload.
+  const base = await start({ client: undefined });
+  const res = await snapshot(base, { discordId: '4242' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { participants: [] });
+});
+
+test('/voice-snapshot alone in the channel is an empty list, not the caller', async () => {
+  const base = await start({ client: fakeClient([{ '4242': 'chan-a' }]) });
+  const res = await snapshot(base, { discordId: '4242' });
+  assert.deepEqual(await res.json(), { participants: [] });
+});
+
+test('/voice-snapshot needs the shared secret', async () => {
+  const base = await start({ client: fakeClient([{ '4242': 'chan-a', '99': 'chan-a' }]) });
+  for (const authorization of [`Bearer ${'y'.repeat(SECRET.length)}`, 'Bearer short', SECRET, '']) {
+    const res = await snapshot(base, { discordId: '4242' }, authorization);
+    assert.equal(res.status, 401, `expected 401 for ${JSON.stringify(authorization)}`);
+    assert.deepEqual(await res.json(), { error: 'unauthorized' });
+  }
+});
+
+test('/voice-snapshot rejects a body without a usable discordId', async () => {
+  const base = await start({ client: fakeClient([{ '4242': 'chan-a', '99': 'chan-a' }]) });
+  for (const body of ['{}', '{"discordId":""}', '{"discordId":42}', 'null', '[]']) {
+    const res = await snapshot(base, body);
+    assert.equal(res.status, 400, `expected 400 for ${body}`);
+    assert.equal((await res.json()).error, 'bad_request');
+  }
+  const bad = await snapshot(base, '{not json');
+  assert.equal(bad.status, 400);
+  assert.deepEqual(await bad.json(), { error: 'bad_json' });
+});
+
+test('a GET on /voice-snapshot is a 404 like any other unknown route', async () => {
+  const base = await start({ client: fakeClient([]) });
+  assert.equal((await fetch(`${base}/voice-snapshot`)).status, 404);
 });
 
 test('close() is safe to call twice', async () => {

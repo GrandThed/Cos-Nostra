@@ -22,10 +22,41 @@ export const en = {
     saved: 'New clips will be posted to <#{channel}>.',
     seedLine: ' Seed reactions: {emojis}',
     languageLine: ' Language: {language}.',
+    slugLine: ' Clip site: /{slug}.',
+    slugTaken: ' The URL "{slug}" is already used by another server; everything else was saved.',
     languages: {
       es: 'Spanish',
       en: 'English',
     },
+  },
+
+  config: {
+    guildOnly: 'Run this in the server you want to configure.',
+    needsPermission: 'You need the **Manage Server** permission to change the bot settings.',
+    badEmojis: 'Give me between 1 and {max} emojis, separated by spaces.',
+    needsSetupFirst: 'Run `/clips setup` first: this server has no clip channel yet.',
+    current: 'Current settings for this server:',
+    saved: 'Saved.',
+    seedLine: '• Seed reactions: {emojis}',
+    tagLine: '• Mention everyone who was in voice: {state}',
+    noEmojis: 'none',
+    on: 'on',
+    off: 'off',
+  },
+
+  manage: {
+    menu: 'Managing {clip}. **Hide** only removes this message; **delete** removes the clip everywhere.',
+    hideButton: 'Hide here',
+    deleteButton: 'Delete everywhere',
+    confirmButton: 'Yes, delete it',
+    cancelButton: 'Cancel',
+    confirmPrompt:
+      'Delete {clip} for good? The video, its page and every post of it go away, and nothing brings them back.',
+    hidden: 'Hidden from this channel. The clip itself is untouched.',
+    deleted: 'Clip deleted. It is gone from the site and from every server it was posted to.',
+    notYours: 'That clip is not yours. Only whoever recorded it, or someone with **Manage Server**, can manage it.',
+    gone: 'That clip does not exist any more.',
+    failed: 'Something went wrong and nothing was changed. Try again in a moment.',
   },
 
   latest: {
@@ -67,6 +98,7 @@ export const en = {
 
   post: {
     byOwner: '{title} - by {user}',
+    withOthers: 'with {mentions}',
     defaultTitle: 'Clip',
   },
 
@@ -75,6 +107,10 @@ export const en = {
     setup: 'Choose the channel new clips are posted to (needs Manage Server)',
     setupChannel: 'Text channel for new clips',
     setupLanguage: 'Language the bot replies in on this server',
+    setupSlug: 'URL for this server\'s public clip site, e.g. "famafia"',
+    config: 'See or change the rest of the bot settings (needs Manage Server)',
+    configEmojis: 'Space-separated seed emojis (max 5)',
+    configTagVoiceMembers: 'Mention everyone who was in voice when the clip was recorded',
     latest: 'Show the most recent clip',
     top: 'Leaderboard of the most reacted clips',
     topYear: 'Year to rank (defaults to the current year)',

@@ -26,10 +26,43 @@ export const es = {
     saved: 'Los clips nuevos se van a publicar en <#{channel}>.',
     seedLine: ' Reacciones iniciales: {emojis}',
     languageLine: ' Idioma: {language}.',
+    slugLine: ' Sitio de clips: /{slug}.',
+    slugTaken: ' La URL "{slug}" ya la usa otro servidor; el resto se guardó igual.',
     languages: {
       es: 'Español',
       en: 'Inglés',
     },
+  },
+
+  config: {
+    guildOnly: 'Ejecutá esto en el servidor que querés configurar.',
+    needsPermission:
+      'Necesitás el permiso **Gestionar servidor** para cambiar la configuración del bot.',
+    badEmojis: 'Pasame entre 1 y {max} emojis, separados por espacios.',
+    needsSetupFirst: 'Primero corré `/clips setup`: este servidor todavía no tiene canal de clips.',
+    current: 'Configuración actual de este servidor:',
+    saved: 'Listo, guardado.',
+    seedLine: '• Reacciones iniciales: {emojis}',
+    tagLine: '• Mencionar a los que estaban en la llamada: {state}',
+    noEmojis: 'ninguna',
+    on: 'sí',
+    off: 'no',
+  },
+
+  manage: {
+    menu: 'Gestionando {clip}. **Ocultar** solo borra este mensaje; **borrar** elimina el clip de todos lados.',
+    hideButton: 'Ocultar acá',
+    deleteButton: 'Borrar de todos lados',
+    confirmButton: 'Sí, borralo',
+    cancelButton: 'Cancelar',
+    confirmPrompt:
+      '¿Borrar {clip} para siempre? Se van el video, su página y todas las publicaciones, y no hay vuelta atrás.',
+    hidden: 'Oculto de este canal. El clip queda intacto.',
+    deleted: 'Clip borrado. Ya no está en el sitio ni en ningún servidor donde se publicó.',
+    notYours:
+      'Ese clip no es tuyo. Solo lo puede gestionar quien lo grabó o alguien con **Gestionar servidor**.',
+    gone: 'Ese clip ya no existe.',
+    failed: 'Algo salió mal y no se cambió nada. Probá de nuevo en un momento.',
   },
 
   latest: {
@@ -72,6 +105,7 @@ export const es = {
 
   post: {
     byOwner: '{title} - por {user}',
+    withOthers: 'con {mentions}',
     defaultTitle: 'Clip',
   },
 
@@ -80,6 +114,11 @@ export const es = {
     setup: 'Elegí el canal donde se publican los clips nuevos (necesita Gestionar servidor)',
     setupChannel: 'Canal de texto para los clips nuevos',
     setupLanguage: 'Idioma en el que el bot responde en este servidor',
+    setupSlug: 'URL del sitio público de clips de este servidor, ej. "famafia"',
+    config: 'Ver o cambiar el resto de la configuración del bot (necesita Gestionar servidor)',
+    configEmojis: 'Reacciones iniciales, separadas por espacios (máx. 5)',
+    configTagVoiceMembers:
+      'Mencionar a todos los que estaban en la llamada cuando se grabó el clip',
     latest: 'Mostrar el clip más reciente',
     top: 'Ranking de los clips con más reacciones',
     topYear: 'Año a rankear (por defecto, el año actual)',

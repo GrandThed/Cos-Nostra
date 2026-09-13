@@ -22,7 +22,9 @@ pub const MAX_ATTEMPTS: i32 = 5;
 /// Current schema, stored in `PRAGMA user_version` so later phases can migrate.
 /// 1: initial. 2: `stage`, `remote_id`, `page_url` for uploads. 3: `fps`, which the player
 /// needs to step a frame at a time. 4: `cut`, the kept parts the editor chose.
-const SCHEMA_VERSION: i32 = 4;
+/// 5: `participants`, JSON array of Discord user ids seen in the owner's voice channel at
+/// capture time.
+const SCHEMA_VERSION: i32 = 5;
 
 /// How often the worker polls when nobody calls `wake`.
 #[cfg(not(test))]
@@ -118,6 +120,11 @@ pub struct NewClip {
     /// Frames per second the source was captured at, as ffprobe read it.
     pub fps: f64,
     pub size_source: i64,
+    /// Discord ids who were in the owner's voice channel when the clip was taken. Always
+    /// `None` at insert time: the snapshot is fetched from the backend on its own thread and
+    /// written later with `set_participants`, so a slow or missing backend never delays the
+    /// row appearing in the UI.
+    pub participants: Option<Vec<String>>,
 }
 
 /// One row of the clips table, as shown in the UI.
@@ -152,6 +159,11 @@ pub struct ClipRow {
     /// whole recording. Measured against `source_path`; once that file is gone and a cut has
     /// been baked into the outputs, the processor clears this so the next edit starts fresh.
     pub cut: Option<Vec<Segment>>,
+    /// Discord ids of everyone in the owner's voice channel at the moment the clip was taken,
+    /// so the bot can mention them when it posts. `None` on a clip saved before the column
+    /// existed, on one whose snapshot has not landed yet, and on one whose lookup failed —
+    /// all of which read the same as "nobody to mention" by the time the clip uploads.
+    pub participants: Option<Vec<String>>,
     /// When the row last changed. The UI keys its thumbnail cache on it, since a re-encode
     /// rewrites the thumbnail in place under the same path.
     pub updated_at: String,
@@ -233,25 +245,27 @@ CREATE TABLE IF NOT EXISTS clips (
     stage TEXT NOT NULL DEFAULT 'encode',
     remote_id TEXT,
     page_url TEXT,
-    cut TEXT
+    cut TEXT,
+    participants TEXT
 );
 CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 ";
 
 /// Columns added after version 1, applied with ALTER TABLE to databases that predate them.
 /// Every one is nullable or has a default, so an older row needs no backfill.
-const ADDED_COLUMNS: [(&str, &str); 5] = [
+const ADDED_COLUMNS: [(&str, &str); 6] = [
     ("stage", "TEXT NOT NULL DEFAULT 'encode'"),
     ("remote_id", "TEXT"),
     ("page_url", "TEXT"),
     ("fps", "REAL"),
     ("cut", "TEXT"),
+    ("participants", "TEXT"),
 ];
 
 /// Column list shared by every SELECT so `row_from` stays in sync.
 const COLUMNS: &str = "id, source_path, game, title, recorded_at, duration_ms, width, height, \
     size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts, \
-    stage, remote_id, page_url, fps, cut, updated_at";
+    stage, remote_id, page_url, fps, cut, updated_at, participants";
 
 pub struct Queue {
     conn: Mutex<Connection>,
@@ -333,12 +347,21 @@ impl Queue {
             .map(serde_json::to_string)
             .transpose()
             .context("encoding cut")?;
+        // Normally absent: the voice snapshot arrives after the row does. Honoured anyway so a
+        // caller that already has one does not silently lose it.
+        let participants = clip
+            .participants
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding participants")?;
         let now = now_rfc3339();
         let conn = self.lock();
         conn.execute(
             "INSERT INTO clips (source_path, game, title, recorded_at, duration_ms, width, height, \
-             fps, size_source, status, attempts, created_at, updated_at, cut) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10, ?11)",
+             fps, size_source, status, attempts, created_at, updated_at, cut, participants) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10, ?11, ?12)",
             params![
                 clip.source_path,
                 clip.game,
@@ -351,6 +374,7 @@ impl Queue {
                 clip.size_source,
                 now,
                 cut,
+                participants,
             ],
         )
         .with_context(|| format!("enqueueing {}", clip.source_path))?;
@@ -468,6 +492,20 @@ impl Queue {
             params![id, now_rfc3339()],
         )
         .with_context(|| format!("clearing cut of clip {id}"))?;
+        Ok(())
+    }
+
+    /// Records who was in voice with the owner when the clip was taken. Written after the row
+    /// exists, because the answer comes from the backend and the clip must not wait on it.
+    /// An empty list is stored as such: "the lookup ran and found nobody".
+    pub fn set_participants(&self, id: i64, participants: &[String]) -> Result<()> {
+        let json = serde_json::to_string(participants).context("serializing participants")?;
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET participants = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, json, now_rfc3339()],
+        )
+        .with_context(|| format!("setting participants on clip {id}"))?;
         Ok(())
     }
 
@@ -690,6 +728,13 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         })?
         // An empty list would mean the same as no cut; keep one spelling.
         .filter(|segments| !segments.is_empty());
+    // Unlike the cut, a broken participants list is not worth failing a row over: the clip is
+    // still perfectly encodable and uploadable, only the mentions are lost, so junk reads as
+    // no snapshot. An empty list is stored as no snapshot too, since both mention nobody.
+    let participants = r
+        .get::<_, Option<String>>(23)?
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .filter(|ids| !ids.is_empty());
     Ok(ClipRow {
         id: r.get(0)?,
         source_path: r.get(1)?,
@@ -719,6 +764,7 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         page_url: r.get(19)?,
         fps: r.get(20)?,
         cut,
+        participants,
         updated_at: r.get(22)?,
     })
 }
@@ -945,6 +991,7 @@ mod tests {
             height: 1080,
             fps: 60.0,
             size_source: 12_345,
+            participants: None,
         }
     }
 
@@ -1481,6 +1528,7 @@ mod tests {
         assert_eq!(row.remote_id, None);
         assert_eq!(row.fps, None, "a row that predates the column has no frame rate");
         assert_eq!(row.cut, None, "and no cut");
+        assert_eq!(row.participants, None, "and nobody in voice");
         let version: i32 = q
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1537,6 +1585,68 @@ mod tests {
         assert_eq!(row.error.map(|e| e.chars().count()), Some(MAX_ERROR_CHARS));
         assert_eq!(row.status, ClipStatus::Failed);
         assert_eq!(row.attempts, 1);
+    }
+
+    /// The voice snapshot lands after the row does, so it has to survive a round trip through
+    /// the column and mean the same thing whether it never ran, found nobody, or found four.
+    #[test]
+    fn participants_are_written_after_the_clip_and_round_trip() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let id = q.enqueue(clip("v", "2026-09-13T22:00:00.000Z")).unwrap();
+        let before = q.get(id).unwrap().unwrap();
+        assert_eq!(before.participants, None, "no snapshot yet");
+
+        let ids = vec!["123".to_string(), "456".to_string(), "789".to_string()];
+        q.set_participants(id, &ids).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.participants, Some(ids));
+        assert!(row.updated_at >= before.updated_at);
+        // Nothing else about the row moved.
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!(row.source_path, before.source_path);
+        // The list also comes back through `list`, which is what the UI reads.
+        assert_eq!(q.list().unwrap()[0].participants.as_ref().unwrap().len(), 3);
+
+        // A lookup that found nobody reads the same as no lookup at all.
+        q.set_participants(id, &[]).unwrap();
+        assert_eq!(q.get(id).unwrap().unwrap().participants, None);
+
+        // Junk in the column is not worth failing the row over.
+        q.lock()
+            .execute(
+                "UPDATE clips SET participants = 'not json' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        assert_eq!(q.get(id).unwrap().unwrap().participants, None);
+    }
+
+    /// A database written by the build before this feature gains the column on open, and its
+    /// existing rows read as "no snapshot" rather than erroring.
+    #[test]
+    fn v4_database_gains_participants() {
+        let path = temp_db();
+        let id = {
+            let q = Queue::open(&path).unwrap();
+            let id = q.enqueue(clip("old", "2026-09-12T10:00:00.000Z")).unwrap();
+            // Rewind to a v4 file: drop the column and the version with it.
+            let conn = q.lock();
+            conn.execute("ALTER TABLE clips DROP COLUMN participants", []).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            id
+        };
+        let q = Queue::open(&path).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.participants, None, "a row that predates the column has no snapshot");
+        assert_eq!(row.status, ClipStatus::Saved);
+        let version: i32 = q
+            .lock()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // And the migrated column is writable straight away.
+        q.set_participants(id, &["42".to_string()]).unwrap();
+        assert_eq!(q.get(id).unwrap().unwrap().participants, Some(vec!["42".to_string()]));
     }
 
     #[test]

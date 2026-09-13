@@ -157,6 +157,36 @@ test('internal routes use botToken, not the user token', async () => {
   assert.equal(last().headers.authorization, 'Bearer bot-secret');
 });
 
+test('internalDeleteClip takes a clip down as the bot, with an encoded id', async () => {
+  answer = { status: 204 };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  assert.equal(await api.internalDeleteClip('c1/x'), null);
+  assert.equal(last().method, 'DELETE');
+  assert.equal(last().url, '/internal/clips/c1%2Fx');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret', 'not the user token');
+  assert.equal(last().body, '', 'no body on a delete');
+});
+
+test('voiceSnapshot posts as the device, not the bot', async () => {
+  answer = { status: 200, body: { participants: ['1', '2'] } };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  const out = await api.voiceSnapshot();
+  assert.deepEqual(out, { participants: ['1', '2'] });
+  assert.equal(last().method, 'POST');
+  assert.equal(last().url, '/discord/voice-snapshot');
+  // The route reads the caller's Discord id from the token, so there is nothing to send.
+  assert.equal(last().headers.authorization, 'Bearer user-token');
+  assert.equal(last().body, '');
+});
+
+test('createClip carries participantDiscordIds through untouched', async () => {
+  answer = { status: 201, body: { id: 'c1', uploads: {}, expiresIn: 900 } };
+  const api = createClient({ baseUrl, token: 'user-token' });
+  await api.createClip({ durationMs: 1, participantDiscordIds: ['1', '2'] });
+  assert.equal(last().url, '/clips');
+  assert.deepEqual(JSON.parse(last().body).participantDiscordIds, ['1', '2']);
+});
+
 test('non-2xx throws ApiError with status and parsed body', async () => {
   answer = { status: 404, body: { statusCode: 404, error: 'Not Found', message: 'clip not found' } };
   const api = createClient({ baseUrl, token: 't' });

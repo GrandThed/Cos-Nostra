@@ -96,6 +96,15 @@ pub struct Me {
     pub user: User,
 }
 
+/// Who was in this account's Discord voice channel just now. The backend answers with an
+/// empty list rather than an error when it cannot reach the bot, so an empty `participants`
+/// is an answer, not a failure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceSnapshot {
+    pub participants: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewClipUpload {
@@ -116,6 +125,12 @@ pub struct NewClipUpload {
     pub size_av1: i64,
     pub size_h264: i64,
     pub size_thumb: i64,
+    /// Discord ids who were in voice with the owner when the clip was taken, for the bot to
+    /// mention. Omitted rather than sent as `[]` or null when there is nobody to report, for
+    /// consistency with `game` and `title` above; being a new field, an older backend ignores
+    /// it either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_discord_ids: Option<Vec<String>>,
 }
 
 /// Body of `POST /clips/:id/replace`: the new files for a clip the site already has. The
@@ -267,6 +282,14 @@ impl Api {
     pub fn me(&self) -> Result<Me> {
         let req = self.auth(self.client.get(self.url("/auth/me")))?;
         Self::send_json(req, "GET /auth/me")
+    }
+
+    /// Asks who is in the owner's Discord voice channel right now. Called the instant a clip
+    /// is saved, since by the time it has encoded and uploaded the channel may have emptied.
+    /// Bodyless: the backend knows the account from the device token.
+    pub fn voice_snapshot(&self) -> Result<VoiceSnapshot> {
+        let req = self.auth(self.client.post(self.url("/discord/voice-snapshot")))?;
+        Self::send_json(req, "POST /discord/voice-snapshot")
     }
 
     /// Revokes this device's token on the backend.
@@ -492,6 +515,7 @@ mod tests {
                 size_av1: 3000,
                 size_h264: 2000,
                 size_thumb: 100,
+                participant_discord_ids: Some(vec!["123".into(), "456".into()]),
             })
             .unwrap();
         assert_eq!(created.id, "clip1");
@@ -541,6 +565,8 @@ mod tests {
         assert_eq!(clip_body["sizeAv1"], 3000);
         assert_eq!(clip_body["sizeThumb"], 100);
         assert_eq!(clip_body["recordedAt"], "2026-09-10T10:00:00Z");
+        assert_eq!(clip_body["participantDiscordIds"][1], "456");
+        assert!(clip_body.get("title").is_none(), "an optional None is left out entirely");
 
         for (i, (path, len, ct)) in [
             ("/s3/av1?sig=1", 3000usize, "video/mp4"),
@@ -614,6 +640,39 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].path, "/auth/device/ABCD");
         assert_eq!(seen[0].header("authorization"), Some("Bearer wrong"));
+    }
+
+    /// The snapshot is a bodyless authenticated POST. A backend too old to have the route, or
+    /// one that is down, must surface as an `Err` here: swallowing it is the caller's job, and
+    /// an empty list has to keep meaning "asked, nobody there".
+    #[test]
+    fn voice_snapshot_reads_the_ids_and_surfaces_failures() {
+        let (base, seen) = stub(|_| {
+            let s = |x: &str| x.to_string();
+            vec![
+                ("200 OK", s(r#"{"participants":["123","456"]}"#)),
+                ("200 OK", s(r#"{"participants":[]}"#)),
+                ("404 Not Found", s(r#"{"error":"not_found"}"#)),
+            ]
+        });
+        let api = Api::new(&base, Some("tok".into())).unwrap();
+        assert_eq!(api.voice_snapshot().unwrap().participants, vec!["123", "456"]);
+        assert!(api.voice_snapshot().unwrap().participants.is_empty());
+        let err = api.voice_snapshot().unwrap_err();
+        assert_eq!(status_of(&err), Some(404));
+
+        // Without a token there is nothing to ask with, and no request is made.
+        let anonymous = Api::new(&base, None).unwrap();
+        assert!(anonymous.voice_snapshot().is_err());
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "the anonymous call never reached the wire");
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("POST", "/discord/voice-snapshot")
+        );
+        assert_eq!(seen[0].header("authorization"), Some("Bearer tok"));
+        assert!(seen[0].body.is_empty(), "no request body");
     }
 
     #[test]

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AttachmentBuilder } from 'discord.js';
 
-import { createPoster, uploadLimitBytes } from '../src/post.js';
+import { createPoster, mentionedIds, uploadLimitBytes } from '../src/post.js';
 
 const MB = 1024 * 1024;
 
@@ -22,6 +22,7 @@ function makeClip(overrides = {}) {
     sizeH264: 27 * MB,
     recordedAt: '2026-09-10T12:00:00.000Z',
     owner: { discordId: '4242', username: 'benja' },
+    participants: [],
     urls: {
       h264: 'https://cosnostra.test/clips/clip1/h264',
       thumb: 'https://cosnostra.test/clips/clip1/thumb',
@@ -239,9 +240,11 @@ test('a 27 MB clip in a tier 0 guild is posted as an embed with the player link'
     'the URL must not be wrapped in angle brackets, which suppresses the preview',
   );
   assert.ok(payload.content.includes('Ace on Ascent'), 'content still names the clip');
-  assert.ok(payload.content.includes('benja'), 'content still names the owner');
+  // The owner is a real mention now, not the stored username: it pings, it renders the
+  // nickname each reader knows, and it survives a rename.
+  assert.ok(payload.content.includes('<@4242>'), 'content mentions the owner');
   // A guild with no stored language gets Spanish, the community default.
-  assert.ok(payload.content.startsWith('Ace on Ascent - por benja'), payload.content);
+  assert.ok(payload.content.startsWith('Ace on Ascent - por <@4242>'), payload.content);
 });
 
 test('the message is written in each guild own language', async () => {
@@ -265,8 +268,8 @@ test('the message is written in each guild own language', async () => {
   await poster.postClip('clip1');
 
   // One clip, one postClip call, two languages: the locale belongs to the destination.
-  assert.ok(spanish.sent[0].content.startsWith('Ace on Ascent - por benja'));
-  assert.ok(english.sent[0].content.startsWith('Ace on Ascent - by benja'));
+  assert.ok(spanish.sent[0].content.startsWith('Ace on Ascent - por <@4242>'));
+  assert.ok(english.sent[0].content.startsWith('Ace on Ascent - by <@4242>'));
 });
 
 test('the safety margin keeps a clip just under the raw limit off the attachment path', async () => {
@@ -560,7 +563,147 @@ test('a clip that cannot be loaded rejects so the caller can retry the whole pos
 
 // ---- mentions ----------------------------------------------------------------------------
 
-test('every message disables mentions, on both the attachment and the link path', async () => {
+test('mentionedIds is the owner plus the voice channel, deduped', () => {
+  const clip = makeClip({ participants: ['99', '100'] });
+  assert.deepEqual(mentionedIds(clip, { tagVoiceMembers: true }), ['4242', '99', '100']);
+  // Undefined is on: it is what a guild that has never touched the setting looks like, and
+  // the backend column defaults to true.
+  assert.deepEqual(mentionedIds(clip, {}), ['4242', '99', '100']);
+  assert.deepEqual(mentionedIds(clip, undefined), ['4242', '99', '100']);
+  // Off drops the participants and keeps the owner: the owner is not a "voice member".
+  assert.deepEqual(mentionedIds(clip, { tagVoiceMembers: false }), ['4242']);
+});
+
+test('mentionedIds never lists anyone twice or lists a non-id', () => {
+  // The desktop app builds `participants` from the bot's own voice snapshot, which excludes
+  // the recorder - but a duplicate here would mean the same person pinged twice in one line.
+  const clip = makeClip({ participants: ['99', '4242', '99'] });
+  assert.deepEqual(mentionedIds(clip, {}), ['4242', '99']);
+
+  assert.deepEqual(mentionedIds(makeClip({ participants: undefined }), {}), ['4242']);
+  assert.deepEqual(
+    mentionedIds(makeClip({ participants: ['', null, undefined, 7, '99'] }), {}),
+    ['4242', '99'],
+    'anything that is not a snowflake string would make discord.js throw at send time',
+  );
+  assert.deepEqual(mentionedIds(makeClip({ owner: { username: 'benja' }, participants: ['99'] }), {}), [
+    '99',
+  ]);
+});
+
+test('the post mentions the people who were in voice, in the guild language', async () => {
+  const clip = makeClip({ participants: ['99', '100'] });
+  const spanish = makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' });
+  const english = makeChannel({ channelId: 'c2', guildId: 'g2', messageId: 'm2' });
+  const backend = makeBackend({
+    clip,
+    guilds: [
+      { guildId: 'g1', channelId: 'c1', seedEmojis: [] },
+      { guildId: 'g2', channelId: 'c2', seedEmojis: [], locale: 'en' },
+    ],
+  });
+  const poster = createPoster({
+    client: client({ c1: spanish, c2: english }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  assert.ok(
+    spanish.sent[0].content.startsWith('Ace on Ascent - por <@4242> con <@99> <@100>'),
+    spanish.sent[0].content,
+  );
+  assert.ok(
+    english.sent[0].content.startsWith('Ace on Ascent - by <@4242> with <@99> <@100>'),
+    english.sent[0].content,
+  );
+  assert.deepEqual(spanish.sent[0].allowedMentions, { parse: [], users: ['4242', '99', '100'] });
+});
+
+test('a guild with tagVoiceMembers off mentions only the owner', async () => {
+  const clip = makeClip({ participants: ['99', '100'] });
+  const channel = makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' });
+  const backend = makeBackend({
+    clip,
+    guilds: [{ guildId: 'g1', channelId: 'c1', seedEmojis: [], tagVoiceMembers: false }],
+  });
+  const poster = createPoster({
+    client: client({ c1: channel }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  const payload = channel.sent[0];
+  assert.deepEqual(payload.allowedMentions, { parse: [], users: ['4242'] });
+  assert.ok(!payload.content.includes('<@99>'), payload.content);
+  assert.ok(payload.content.startsWith('Ace on Ascent - por <@4242>\n'), payload.content);
+});
+
+test('the same clip tags voice members in one guild and not in another', async () => {
+  // The setting belongs to the destination guild, like the language does.
+  const clip = makeClip({ participants: ['99'] });
+  const on = makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' });
+  const off = makeChannel({ channelId: 'c2', guildId: 'g2', messageId: 'm2' });
+  const backend = makeBackend({
+    clip,
+    guilds: [
+      { guildId: 'g1', channelId: 'c1', seedEmojis: [], tagVoiceMembers: true },
+      { guildId: 'g2', channelId: 'c2', seedEmojis: [], tagVoiceMembers: false },
+    ],
+  });
+  const poster = createPoster({
+    client: client({ c1: on, c2: off }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  assert.deepEqual(on.sent[0].allowedMentions.users, ['4242', '99']);
+  assert.deepEqual(off.sent[0].allowedMentions.users, ['4242']);
+});
+
+test('every message carries the manage button, on both paths', async () => {
+  const clip = makeClip();
+  const attached = makeChannel({ channelId: 'c1', guildId: 'g1', premiumTier: 3, messageId: 'm1' });
+  const linked = makeChannel({ channelId: 'c2', guildId: 'g2', premiumTier: 0, messageId: 'm2' });
+  const backend = makeBackend({
+    clip,
+    guilds: [
+      { guildId: 'g1', channelId: 'c1', seedEmojis: [] },
+      { guildId: 'g2', channelId: 'c2', seedEmojis: [] },
+    ],
+  });
+  const poster = createPoster({
+    client: client({ c1: attached, c2: linked }),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  await poster.postClip('clip1');
+
+  for (const channel of [attached, linked]) {
+    const payload = channel.sent[0];
+    assert.equal(payload.components.length, 1);
+    const row = payload.components[0].toJSON();
+    assert.equal(row.components.length, 1);
+    assert.equal(row.components[0].custom_id, 'clip:menu:clip1');
+    // Components are not embeds: the link path still carries no embeds[] and so keeps the
+    // video preview Discord builds from the player page.
+    assert.equal(payload.embeds, undefined);
+  }
+  assert.ok(attached.sent[0].files, 'expected the attachment path in the tier 3 guild');
+  assert.equal(linked.sent[0].files, undefined, 'expected the link path in the tier 0 guild');
+});
+
+test('every message allows only the ids it means to mention, on both paths', async () => {
   // The content carries a clip title and an owner username, neither of which the bot controls.
   // 27 MB fits under the tier 3 limit and not under the tier 0 one, so one post takes each path.
   const clip = makeClip();
@@ -584,16 +727,19 @@ test('every message disables mentions, on both the attachment and the link path'
   await poster.postClip('clip1');
 
   assert.ok(attached.sent[0].files, 'expected the attachment path in the tier 3 guild');
-  assert.deepEqual(attached.sent[0].allowedMentions, { parse: [] });
+  // parse: [] stays: it is what keeps @everyone and role syntax in the title inert. `users`
+  // is an allow-list of ids, not permission for whatever the content happens to contain.
+  assert.deepEqual(attached.sent[0].allowedMentions, { parse: [], users: ['4242'] });
   assert.equal(linked.sent[0].files, undefined, 'expected the link path in the tier 0 guild');
-  assert.deepEqual(linked.sent[0].allowedMentions, { parse: [] });
+  assert.deepEqual(linked.sent[0].allowedMentions, { parse: [], users: ['4242'] });
   // A fresh object per message: discord.js resolves the payload it is handed in place.
   assert.notEqual(attached.sent[0].allowedMentions, linked.sent[0].allowedMentions);
+  assert.notEqual(attached.sent[0].allowedMentions.users, linked.sent[0].allowedMentions.users);
 });
 
 test('a clip titled @everyone is posted as text that cannot ping', async () => {
   const clip = makeClip({
-    title: '@everyone look at this',
+    title: '@everyone look at this <@999> <@&1234567890>',
     owner: { discordId: '4242', username: '<@&1234567890>' },
   });
   const channel = makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' });
@@ -605,5 +751,8 @@ test('a clip titled @everyone is posted as text that cannot ping', async () => {
   const payload = channel.sent[0];
   // The text is sent as typed - it is allowedMentions, not escaping, that makes it inert.
   assert.ok(payload.content.includes('@everyone look at this'));
-  assert.deepEqual(payload.allowedMentions, { parse: [] });
+  // A user id in the title is not in the allow-list, so it renders as a name and notifies
+  // nobody: `users` lists who may be pinged, it does not bless what the content contains.
+  assert.deepEqual(payload.allowedMentions, { parse: [], users: ['4242'] });
+  assert.ok(!payload.allowedMentions.users.includes('999'));
 });

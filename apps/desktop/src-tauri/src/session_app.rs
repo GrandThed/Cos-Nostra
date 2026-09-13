@@ -376,6 +376,9 @@ fn clip_from_match_inner(app: &AppHandle, id: i64, start_ms: i64, end_ms: i64) -
         height: info.height,
         fps: info.fps,
         size_source: info.size as i64,
+        // A match is cut out long after it was played, so there is no moment to snapshot
+        // voice membership at. Only the hotkey path carries participants.
+        participants: None,
     };
     let clip_id = queue.enqueue_with_cut(clip, &cut)?;
     log::info!(

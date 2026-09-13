@@ -28,6 +28,12 @@ export const DEFAULT_LOCALE = 'es';
  * @property {string | null} channelId
  * @property {string[]} seedEmojis
  * @property {Locale} locale
+ * @property {boolean} tagVoiceMembers  @mention everyone who was in voice with the clip owner
+ *   when it was captured. On unless a guild turned it off with `/clips config`.
+ * @property {string | null} name  Discord server name, backing the public clip site (phase 5)
+ * @property {string | null} icon  Discord CDN icon hash, a bare hash like `avatar`, never a URL
+ * @property {string | null} slug  the clip site's URL segment (e.g. "famafia"), set once by a
+ *   human via `/clips setup`; null until someone picks one
  */
 
 /**
@@ -64,6 +70,9 @@ export const DEFAULT_LOCALE = 'es';
  * @property {string} recordedAt  ISO 8601
  * @property {string | null} uploadedAt  ISO 8601
  * @property {ClipStatus} status
+ * @property {string[]} [participants]  Discord ids of whoever was in voice with the owner when
+ *   the clip was captured. Only GET /internal/clips/:id returns this; the public clip JSON
+ *   leaves it out, so it is optional on the shared type rather than a second typedef.
  */
 
 /**
@@ -78,6 +87,15 @@ export const DEFAULT_LOCALE = 'es';
  * @property {number} sizeH264  exact byte length of the H.264 file
  * @property {number} sizeThumb exact byte length of the thumbnail
  * @property {string} recordedAt  ISO 8601
+ * @property {string[]} [participantDiscordIds]  who was in voice with the owner at capture
+ *   time, from voiceSnapshot(). At most 50; omitted or null means nobody was.
+ */
+
+/**
+ * Response of POST /discord/voice-snapshot: the other members of the caller's Discord voice
+ * channel, right now. Empty whenever the bot cannot answer, never an error.
+ * @typedef {object} VoiceSnapshot
+ * @property {string[]} participants  Discord user ids
  */
 
 /**

@@ -25,12 +25,22 @@ test('the client requests the partials reaction tracking needs', () => {
   ].sort());
 });
 
-test('the client asks for the three intents the bot uses and no more', () => {
+test('the client asks for the four intents the bot uses and no more', () => {
   assert.deepEqual(clientOptions.intents, [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildVoiceStates,
   ]);
+});
+
+test('the client keeps guild voice states cached and asks for no privileged intent', () => {
+  // GuildVoiceStates is what fills guild.voiceStates.cache, which is the whole of
+  // POST /voice-snapshot. GuildMembers would be a privileged intent and is not needed: a
+  // voice state carries the user id whatever the intents are, and <@id> renders on its own.
+  assert.ok(clientOptions.intents.includes(GatewayIntentBits.GuildVoiceStates));
+  assert.ok(!clientOptions.intents.includes(GatewayIntentBits.GuildMembers));
+  assert.ok(!clientOptions.intents.includes(GatewayIntentBits.MessageContent));
 });
 
 test('createClient builds a client discord.js accepts, still logged out', () => {

@@ -859,7 +859,13 @@ async fn storage_stats(app: AppHandle) -> Result<storage::StorageStats, String> 
         let state = app.state::<AppState>();
         let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
         let rows = queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))?;
-        Ok(storage::scan(&rows, &clip_dir))
+        let mut stats = storage::scan(&rows, &clip_dir);
+        // The sessions database may not have opened yet (or ever, if APPDATA is unset); that is
+        // not a reason to fail the whole tab, so it is just left at zero.
+        if let Some(sessions) = state.sessions.lock().unwrap().clone() {
+            stats.matches = storage::scan_matches(&sessions).map_err(|e| format!("{e:#}"))?;
+        }
+        Ok(stats)
     })
     .await
 }
@@ -1106,6 +1112,7 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
             size_av1,
             size_h264,
             size_thumb,
+            participant_discord_ids: row.participants.clone(),
         })
         .map_err(explain)
         .context("creating clip record")
@@ -1391,6 +1398,8 @@ fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedG
         height: info.height,
         fps: info.fps,
         size_source: info.size as i64,
+        // Filled in by `snapshot_voice_participants` below, once the row has an id.
+        participants: None,
     };
     match queue.enqueue(clip) {
         Ok(id) => {
@@ -1403,8 +1412,49 @@ fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedG
             );
             state.wake_worker();
             emit_clips_changed(app, Some(id));
+            snapshot_voice_participants(app, &queue, id);
         }
         Err(e) => log::error!("enqueue {} failed: {e:#}", path.display()),
+    }
+}
+
+/// Asks the backend who is in the owner's Discord voice channel and records the answer on the
+/// clip, so the bot can mention them when the clip is eventually posted.
+///
+/// It has to be asked *now*, not at upload time: encoding and uploading can take minutes, and
+/// by then the channel may have emptied or filled with other people. It runs on its own thread
+/// because it is a blocking HTTP call and nothing about the clip depends on the answer — the
+/// row is already enqueued and the UI already knows about it, and a backend that is slow, old
+/// or unreachable must cost the clip nothing. Best effort throughout: every failure leaves
+/// `participants` null, which reads the same as nobody having been in voice.
+fn snapshot_voice_participants(app: &AppHandle, queue: &Arc<Queue>, id: i64) {
+    let app = app.clone();
+    let queue = Arc::clone(queue);
+    let spawned = std::thread::Builder::new()
+        .name("voice-snapshot".into())
+        .spawn(move || {
+            let api = match app.state::<AppState>().api() {
+                Ok(api) => api,
+                Err(e) => {
+                    log::warn!("voice snapshot for clip {id} skipped: {e:#}");
+                    return;
+                }
+            };
+            match api.voice_snapshot() {
+                Ok(snapshot) => {
+                    log::info!(
+                        "clip {id}: {} in voice at capture time",
+                        snapshot.participants.len()
+                    );
+                    if let Err(e) = queue.set_participants(id, &snapshot.participants) {
+                        log::warn!("could not store voice snapshot for clip {id}: {e:#}");
+                    }
+                }
+                Err(e) => log::warn!("voice snapshot for clip {id} failed: {e:#}"),
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start the voice snapshot thread for clip {id}: {e}");
     }
 }
 

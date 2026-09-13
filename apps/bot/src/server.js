@@ -1,9 +1,15 @@
-// The bot's internal HTTP server. Two routes, node:http, no framework: the backend calls
-// POST /post after an upload completes and Railway calls GET /health.
+// The bot's internal HTTP server. Three routes, node:http, no framework: the backend calls
+// POST /post after an upload completes and POST /voice-snapshot while a clip is being made,
+// and Railway calls GET /health.
 //
 // POST /post is fire-and-forget by contract (see apps/backend/src/plugins/bot.js): the clip
 // is already stored, so we answer 202 before touching Discord and never let a posting failure
 // turn into a retry storm or a crashed process. The backend only looks at the status code.
+//
+// POST /voice-snapshot is the opposite: the caller wants the answer, and the answer is a
+// synchronous read of the gateway's voice state cache, so it is served inline. It exists
+// because only the bot holds that state - the desktop app knows who pressed the hotkey and
+// nothing else, and the backend has no gateway connection of its own.
 
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -64,12 +70,67 @@ function readBody(req) {
 }
 
 /**
+ * Reads and JSON-parses a request body, answering the request itself when it cannot. Both
+ * POST routes take a small JSON object, so both get the same 413 and the same 400.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ * @returns {Promise<{ ok: true, body: any } | { ok: false }>}
+ */
+async function jsonBody(req, res) {
+  let raw;
+  try {
+    raw = await readBody(req);
+  } catch {
+    json(res, 413, { error: 'payload_too_large' });
+    return { ok: false };
+  }
+  try {
+    return { ok: true, body: JSON.parse(raw) };
+  } catch {
+    json(res, 400, { error: 'bad_json' });
+    return { ok: false };
+  }
+}
+
+/**
+ * Everyone in `discordId`'s voice channel except `discordId`, in the first guild that has
+ * them in one.
+ *
+ * A person is realistically in one guild's voice at a time, so the first hit wins rather than
+ * merging channels from several servers into one participant list. Everything is read from
+ * the gateway cache the GuildVoiceStates intent keeps current - no REST call, nothing to
+ * await - which is why the route can answer inline.
+ *
+ * Only ids are collected: a VoiceState always carries one, with no GuildMembers intent and no
+ * cached member needed (see client.js), and `<@id>` renders the name on the reader's side.
+ *
+ * @param {any} client discord.js Client
+ * @param {string} discordId
+ * @returns {string[]}
+ */
+function voiceSnapshot(client, discordId) {
+  const guilds = client?.guilds?.cache;
+  if (!guilds || typeof guilds.values !== 'function') return [];
+  for (const guild of guilds.values()) {
+    const states = guild?.voiceStates?.cache;
+    if (!states || typeof states.get !== 'function') continue;
+    const own = states.get(discordId);
+    if (!own?.channelId) continue;
+    return [...states.values()]
+      .filter((state) => state?.channelId === own.channelId && state.id !== discordId)
+      .map((state) => String(state.id));
+  }
+  return [];
+}
+
+/**
  * @param {object} options
  * @param {import('./config.js').Config} options.config
  * @param {{ postClip: (clipId: string) => Promise<unknown> }} options.poster
  * @param {{ info: Function, warn: Function, error: Function, debug: Function }} [options.log]
+ * @param {any} [options.client] discord.js Client, read by POST /voice-snapshot
  */
-export function createServer({ config, poster, log = NOOP_LOG }) {
+export function createServer({ config, poster, log = NOOP_LOG, client }) {
   const expected = Buffer.from(`Bearer ${config.BOT_SHARED_SECRET}`);
 
   /**
@@ -99,24 +160,32 @@ export function createServer({ config, poster, log = NOOP_LOG }) {
       return json(res, 200, { ok: true });
     }
 
+    if (req.method === 'POST' && path === '/voice-snapshot') {
+      if (!authorized(req.headers.authorization, expected)) {
+        log.warn('POST /voice-snapshot rejected: bad shared secret');
+        return json(res, 401, { error: 'unauthorized' });
+      }
+      const parsed = await jsonBody(req, res);
+      if (!parsed.ok) return;
+      const discordId = parsed.body?.discordId;
+      if (typeof discordId !== 'string' || discordId.length === 0) {
+        return json(res, 400, { error: 'bad_request', message: 'discordId is required' });
+      }
+      // A cache lookup, so there is nothing to defer: answer with the participants, or with
+      // an empty list when the user is not in voice anywhere the bot can see.
+      const participants = voiceSnapshot(client, discordId);
+      log.debug(`voice snapshot for ${discordId}: ${participants.length} other(s) in the channel`);
+      return json(res, 200, { participants });
+    }
+
     if (req.method === 'POST' && path === '/post') {
       if (!authorized(req.headers.authorization, expected)) {
         log.warn('POST /post rejected: bad shared secret');
         return json(res, 401, { error: 'unauthorized' });
       }
-      let raw;
-      try {
-        raw = await readBody(req);
-      } catch {
-        return json(res, 413, { error: 'payload_too_large' });
-      }
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'bad_json' });
-      }
-      const clipId = body?.clipId;
+      const parsed = await jsonBody(req, res);
+      if (!parsed.ok) return;
+      const clipId = parsed.body?.clipId;
       if (typeof clipId !== 'string' || clipId.length === 0) {
         return json(res, 400, { error: 'bad_request', message: 'clipId is required' });
       }
