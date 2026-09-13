@@ -1,0 +1,18 @@
+{
+  // F5 runs the desktop app in dev mode (tauri dev: builds Rust, starts Vite, opens the window).
+  // Shift+F5 stops it. Quit the installed Cos Nostra first: both builds share one
+  // single-instance lock, so a running installed copy would just be focused instead.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Desktop app (tauri dev)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run desktop",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  ]
+}
