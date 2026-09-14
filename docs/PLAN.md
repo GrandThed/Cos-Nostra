@@ -378,7 +378,8 @@ The shape, and why:
 - **Separate database.** `sessions.db` beside `clips.db`, because the queue versions its schema
   through `user_version` and two stores in one file would share the number.
 - Files go to `<clip folder>\Matches`, which the Storage tab's top-level scan does not see and
-  the asset protocol scope now also allows.
+  the asset protocol scope now also allows. Since 2026-09-14 new sessions go to
+  `<clip folder>\<Game>\Matches` instead (see "Game folders and game art" below).
 - When the session ends the window comes forward on the Matches tab (`open_after_session`),
   and both new settings default on.
 
@@ -762,6 +763,36 @@ Not verified, and what would:
 - Membership filtering against real Discord, and a real publish: the backend and bot have to be
   deployed first.
 - The editor's scrolling and filmstrip on a long match file.
+
+### Game folders and game art. Built 2026-09-14, not yet run in the app.
+
+Not in the original plan. Desktop only; no backend, bot or wire change.
+
+- **Per-game folders.** New clips go to `<clip folder>\<Game>\Clips`, undetected ones to
+  `Unknown game\Clips`, new session recordings and their match files to `<Game>\Matches`
+  (`folders.rs`). Existing files were deliberately not migrated: rows hold absolute paths, so
+  nothing breaks, and moving a whole library at startup is risk with no payoff. Renaming a game
+  or changing a clip's game moves the clips already inside the old name's folder, all of a
+  clip's files or none (`storage::relocate`, `Queue::relocate`).
+- **Game pictures.** Resolved on the player's machine and cached under `%APPDATA%`, never
+  bundled (publisher art does not belong in a GPL repo) and never sent to the backend. Steam
+  games are identified from the exe path and Steam's own manifests, with their art usually
+  already on disk in Steam's library cache; everything else (Riot, Epic, Battle.net, Xbox,
+  standalone launchers) through Discord's detectable-games list, which is undocumented and so
+  cached, refreshed weekly and optional. Last resort is the exe's own icon, then a letter tile.
+  SteamGridDB or IGDB would cover more portrait art but need an API key, which would mean a
+  backend proxy; not needed yet.
+- The user can replace a picture from the game header; that choice is never overwritten.
+
+Verified without running the app: 142 of 143 desktop `cargo test`s (the flaky
+`max_attempts_then_manual_retry` timing test fails under load and passes alone), including new
+tests for folder naming, moving with rollback when a file is held open, Steam manifest and
+Discord matching, and the art index's rename and retry rules; the `#[ignore]`d network tests
+against the live Discord and Steam endpoints; `tsc` and `vite build`.
+
+Not verified: the tiles and header in both themes, a real hotkey clip landing in its game
+folder (and the move not racing libobs), pictures for Valorant, League and a Steam game in the
+running app, rename moving files while the player has the clip open.
 
 ## 5. Cross-cutting work
 

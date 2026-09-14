@@ -27,6 +27,11 @@ let saveBar: HTMLElement | null = null;
 let accountBlockEl: HTMLElement | null = null;
 let message = "";
 let messageKind: "" | "ok" | "err" = "";
+/** A save is in flight: the button stays up, disabled, until it lands. */
+let saving = false;
+/** Clears the "Saved" confirmation, so the bar goes away on its own after a good save. */
+let messageTimer: number | undefined;
+const SAVED_MESSAGE_MS = 2500;
 /** The device login in progress, if any. */
 let pendingCode: string | null = null;
 let loginNote = "";
@@ -93,10 +98,15 @@ function render(): void {
   }
   const s = draft;
 
-  fill(
-    root,
-    h("div", { class: "settings scroll" }, captureCard(s), behaviourCard(s), encodingCard(s), accountCard()),
-  );
+  // A full render replaces the scrolling panel, which would jump back to the top and fold
+  // Advanced away; carry both over. Edits update their own controls and never come here.
+  const scrollTop = root.querySelector<HTMLElement>(".settings.scroll")?.scrollTop ?? 0;
+  const advancedOpen = root.querySelector<HTMLDetailsElement>("details.advanced")?.open ?? false;
+  const panel = h("div", { class: "settings scroll" }, captureCard(s), behaviourCard(s), encodingCard(s), accountCard());
+  fill(root, panel);
+  const advanced = panel.querySelector<HTMLDetailsElement>("details.advanced");
+  if (advanced) advanced.open = advancedOpen;
+  panel.scrollTop = scrollTop;
   saveBar = null;
   syncSaveBar();
 }
@@ -109,10 +119,12 @@ function isDirty(): boolean {
 }
 
 /** Shows, updates or hides the save bar without touching the rest of the form, so typing in a
- *  text field does not lose focus or cursor position on every keystroke. */
+ *  text field does not lose focus or cursor position on every keystroke. The button only shows
+ *  while there is something to save; after a save the bar carries just the result. */
 function syncSaveBar(): void {
   if (!root || !draft) return;
-  if (!isDirty() && !message) {
+  const dirty = isDirty();
+  if (!dirty && !saving && !message) {
     saveBar?.remove();
     saveBar = null;
     return;
@@ -133,6 +145,8 @@ function syncSaveBar(): void {
   }
   const btn = saveBar.querySelector("button")!;
   btn.textContent = t("settings.save");
+  btn.hidden = !dirty && !saving;
+  btn.disabled = saving;
   const msg = saveBar.querySelector(".msg")!;
   msg.className = `msg ${messageKind}`;
   msg.textContent = message;
@@ -141,6 +155,7 @@ function syncSaveBar(): void {
 /** Marks the draft touched: clears any stale confirmation/error from a previous save and
  *  refreshes the save bar. Called from every field's change handler. */
 function markEdited(): void {
+  window.clearTimeout(messageTimer);
   message = "";
   messageKind = "";
   syncSaveBar();
@@ -153,6 +168,7 @@ function card(title: string, ...children: (Node | string | null | false)[]): HTM
 // ---------------------------------------------------------------------------
 
 function captureCard(s: Settings): HTMLElement {
+  const folder = h("span", { class: "field mono grow", text: s.clip_dir, title: s.clip_dir });
   return card(
     t("settings.capture"),
     hotkey!.node,
@@ -167,7 +183,7 @@ function captureCard(s: Settings): HTMLElement {
       "div",
       { class: "field-row" },
       h("span", { class: "name", text: t("settings.clipFolder") }),
-      h("span", { class: "field mono grow", text: s.clip_dir, title: s.clip_dir }),
+      folder,
       h("button", {
         type: "button",
         class: "btn small",
@@ -176,9 +192,9 @@ function captureCard(s: Settings): HTMLElement {
           const dir = await ipc.pickClipDir();
           if (dir) {
             s.clip_dir = dir;
-            message = "";
-            messageKind = "";
-            render();
+            folder.textContent = dir;
+            folder.title = dir;
+            markEdited();
           }
         },
       }),
@@ -226,9 +242,7 @@ function encodingCard(s: Settings): HTMLElement {
       s.quality,
       (id) => {
         s.quality = id as Quality;
-        message = "";
-        messageKind = "";
-        render();
+        markEdited();
       },
     ),
     h("span", { class: "note", text: t("settings.sizesNote") }),
@@ -241,9 +255,7 @@ function encodingCard(s: Settings): HTMLElement {
       s.encode_engine,
       (id) => {
         s.encode_engine = id as EncodeEngine;
-        message = "";
-        messageKind = "";
-        render();
+        markEdited();
       },
     ),
     h(
@@ -284,11 +296,10 @@ function languageRow(s: Settings): HTMLElement {
     "select",
     {
       class: "field",
+      // The form switches language once the save lands (onLanguage re-renders it), not on pick.
       onchange: (e: Event) => {
         s.language = (e.target as HTMLSelectElement).value as Language;
-        message = "";
-        messageKind = "";
-        render();
+        markEdited();
       },
     },
     ...LANGUAGES.map((id) =>
@@ -453,24 +464,27 @@ function radioCards(
   selected: string,
   pick: (id: string) => void,
 ): HTMLElement {
-  return h(
-    "div",
-    { class: "cards", role: "radiogroup" },
-    ...options.map((o) =>
-      h(
-        "button",
-        {
-          type: "button",
-          class: "radio-card",
-          role: "radio",
-          "aria-checked": String(o.id === selected),
-          onclick: () => pick(o.id),
+  // Picking marks the cards in place rather than re-rendering the form.
+  const group = h("div", { class: "cards", role: "radiogroup" });
+  for (const o of options) {
+    const card = h(
+      "button",
+      {
+        type: "button",
+        class: "radio-card",
+        role: "radio",
+        "aria-checked": String(o.id === selected),
+        onclick: () => {
+          for (const other of group.children) other.setAttribute("aria-checked", String(other === card));
+          pick(o.id);
         },
-        h("b", { text: o.label }),
-        h("small", { text: o.hint }),
-      ),
-    ),
-  );
+      },
+      h("b", { text: o.label }),
+      h("small", { text: o.hint }),
+    );
+    group.appendChild(card);
+  }
+  return group;
 }
 
 // ---------------------------------------------------------------------------
@@ -478,23 +492,34 @@ function radioCards(
 
 async function save(): Promise<void> {
   const keys = hotkey;
-  if (!draft || !keys) return;
+  if (!draft || !keys || saving) return;
   keys.stop();
   const next: Settings = { ...draft, hotkey: keys.value() };
+  window.clearTimeout(messageTimer);
+  saving = true;
   message = t("settings.saving");
   messageKind = "";
-  render();
+  syncSaveBar();
   try {
     await ipc.saveSettings(next);
+    saving = false;
     draft = null;
     hotkey = null;
     await loadSettings();
     await loadStatus();
-    // After the reload, so a language that just changed names the confirmation.
+    // After the reload, so a language that just changed names the confirmation. Nothing is
+    // left to save, so the bar shows only this and then goes away.
     message = t("settings.saved");
     messageKind = "ok";
     render();
+    messageTimer = window.setTimeout(() => {
+      if (messageKind !== "ok") return;
+      message = "";
+      messageKind = "";
+      syncSaveBar();
+    }, SAVED_MESSAGE_MS);
   } catch (e) {
+    saving = false;
     // A rejected hotkey is the common failure and the old one is still registered, so say so
     // rather than leaving the box showing something that is not in force.
     message = ipc.errorText(e);

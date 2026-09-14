@@ -10,6 +10,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { badgeFor } from "./clips";
 import { confirming, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhenLong, hueFor } from "./format";
+import { artTile } from "./gameArt";
 import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { go } from "./router";
@@ -199,6 +200,7 @@ function sessionBlock(s: SessionRow): HTMLElement {
         "aria-current": String(current),
         onclick: () => select(s.matches.length ? { kind: "match", id: s.matches[0].id } : { kind: "session", id: s.id }),
       },
+      s.game_name ? artTile(h("span"), s.game_name, "icon") : null,
       h("span", { class: "game", text: s.game_name }),
       h("span", { class: "when mono", text: timeRange(s) }),
       badge,

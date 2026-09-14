@@ -5,6 +5,8 @@ mod edit;
 mod settings;
 mod storage;
 mod ffmpeg;
+mod folders;
+mod game_art;
 mod games;
 mod i18n;
 mod placement;
@@ -27,7 +29,7 @@ use anyhow::Context as _;
 use libobs_bootstrapper::status_handler::ObsBootstrapStatusHandler;
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_dialog::DialogExt as _;
@@ -216,14 +218,13 @@ fn clear_progress(app: &AppHandle, id: i64) {
     let _ = app.emit("clip-progress", ClipProgress { id, stage: "idle", percent: 0 });
 }
 
-/// Lets the asset protocol read the clip folder, so the player can play the local H.264 file,
-/// and its `Matches` folder, where the match files are. Re-run whenever the folder changes;
-/// scopes only ever widen, which is fine for a folder the user chose themselves.
+/// Lets the asset protocol read the clip folder and everything under it, so the player can play
+/// the local H.264 file and match files: clips and matches live in per-game subfolders, and
+/// older ones at the top and in `Matches`. Re-run whenever the folder changes; scopes only ever
+/// widen, which is fine for a folder the user chose themselves.
 fn allow_clip_dir(app: &AppHandle, dir: &Path) {
-    for dir in [dir.to_path_buf(), session_app::matches_dir(dir)] {
-        if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, false) {
-            log::warn!("{} is not readable by the player: {e}", dir.display());
-        }
+    if let Err(e) = app.asset_protocol_scope().allow_directory(dir, true) {
+        log::warn!("{} is not readable by the player: {e}", dir.display());
     }
 }
 
@@ -611,6 +612,12 @@ async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
                     Err(e) => log::warn!("could not delete {p}: {e}"),
                 }
             }
+            if let Some(dir) = Path::new(&row.source_path).parent() {
+                let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+                if folders::is_clips_dir_of(dir, &clip_dir, row.game.as_deref()) {
+                    folders::prune_empty(dir, &clip_dir);
+                }
+            }
         }
         emit_clips_changed(&app, Some(id));
         Ok(())
@@ -618,31 +625,72 @@ async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
     .await
 }
 
+/// Moves a clip that lives in its game's folder into the folder of `game`, the name it is about
+/// to have or just got. `row` is the row as it was before, so its `game` names the folder it
+/// is in. Clips saved before per-game folders sit loose in the clip folder and stay there.
+/// Best effort: a clip whose files cannot move (open in a player) keeps its folder and plays.
+fn follow_game_folder(queue: &Queue, clip_dir: &Path, row: &ClipRow, game: Option<&str>) {
+    let Some(old_dir) = Path::new(&row.source_path).parent() else {
+        return;
+    };
+    if !folders::is_clips_dir_of(old_dir, clip_dir, row.game.as_deref()) {
+        return;
+    }
+    match storage::relocate(queue, row, &folders::clips_dir(clip_dir, game)) {
+        Ok(true) => folders::prune_empty(old_dir, clip_dir),
+        Ok(false) => {}
+        Err(e) => log::warn!("clip {} stays in {}: {e:#}", row.id, old_dir.display()),
+    }
+}
+
 #[tauri::command]
-fn set_clip_game(app: AppHandle, id: i64, game: Option<String>) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let game = game.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
-    queue_or_err(&state)?
-        .set_game(id, game.as_deref())
-        .map_err(|e| format!("{e:#}"))?;
-    emit_clips_changed(&app, Some(id));
-    Ok(())
+async fn set_clip_game(app: AppHandle, id: i64, game: Option<String>) -> Result<(), String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let game = game.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+        let queue = queue_or_err(&state)?;
+        let before = queue.get(id).map_err(|e| format!("{e:#}"))?;
+        queue.set_game(id, game.as_deref()).map_err(|e| format!("{e:#}"))?;
+        if let Some(row) = before.filter(|r| r.game != game) {
+            let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+            follow_game_folder(&queue, &clip_dir, &row, game.as_deref());
+        }
+        emit_clips_changed(&app, Some(id));
+        Ok(())
+    })
+    .await
 }
 
 /// Renames every clip of one game at once, which is also how two games are merged: rename the
 /// misdetected one to the name the good one already has and the library folds them together.
-/// `from` is `None` for the "Unknown game" pile, `to` is `None` to send clips back to it.
+/// `from` is `None` for the "Unknown game" pile, `to` is `None` to send clips back to it. Clips
+/// in the old name's folder move to the new one's, and the game's pictures go with the name.
 #[tauri::command]
-fn rename_game(app: AppHandle, from: Option<String>, to: Option<String>) -> Result<usize, String> {
-    let state = app.state::<AppState>();
-    let to = to.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
-    let changed = queue_or_err(&state)?
-        .rename_game(from.as_deref(), to.as_deref())
-        .map_err(|e| format!("{e:#}"))?;
-    if changed > 0 {
-        emit_clips_changed(&app, None);
-    }
-    Ok(changed)
+async fn rename_game(app: AppHandle, from: Option<String>, to: Option<String>) -> Result<usize, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let to = to.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+        let queue = queue_or_err(&state)?;
+        let before: Vec<ClipRow> = queue
+            .list()
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .filter(|r| r.game == from)
+            .collect();
+        let changed = queue
+            .rename_game(from.as_deref(), to.as_deref())
+            .map_err(|e| format!("{e:#}"))?;
+        if changed > 0 {
+            let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+            for row in &before {
+                follow_game_folder(&queue, &clip_dir, row, to.as_deref());
+            }
+            game_art::renamed(&app, from.as_deref(), to.as_deref());
+            emit_clips_changed(&app, None);
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -880,7 +928,19 @@ async fn publish_clip(
         let guilds = checked_guild_ids(guild_ids)?;
         let tidy = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let (title, game) = (tidy(title), tidy(game));
-        queue_or_err(&state)?
+        let queue = queue_or_err(&state)?;
+        // The dialog can rename the clip's game. Its files follow before the row is marked for
+        // publishing, while the worker still has no reason to open them; the same refusals as
+        // `publish` keep a clip that will not publish from moving.
+        if let Some(row) = queue.get(id).map_err(|e| format!("{e:#}"))? {
+            let publishable = row.remote_id.is_none()
+                && !(row.publish && matches!(row.status, ClipStatus::Encoding | ClipStatus::Uploading));
+            if publishable && row.game != game {
+                let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+                follow_game_folder(&queue, &clip_dir, &row, game.as_deref());
+            }
+        }
+        queue
             .publish(id, title.as_deref(), game.as_deref(), &guilds)
             .map_err(|e| format!("{e:#}"))?;
         {
@@ -1635,6 +1695,19 @@ fn enqueue_saved_clip(
         return;
     };
 
+    // The replay buffer writes to the top of the clip folder; a finished clip belongs in its
+    // game's. Only after the probe, which is what says libobs is done writing. A file that will
+    // not move is still a clip, just a loose one.
+    let game = detected.as_ref().map(|d| d.game.as_str());
+    let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+    let path = match folders::move_recording(&path, &folders::clips_dir(&clip_dir, game)) {
+        Ok(moved) => moved,
+        Err(e) => {
+            log::warn!("clip stays in the clip folder: {e:#}");
+            path
+        }
+    };
+
     let clip = NewClip {
         source_path: path.display().to_string(),
         game: detected.as_ref().map(|d| d.game.clone()),
@@ -1662,6 +1735,16 @@ fn enqueue_saved_clip(
             );
             emit_clips_changed(app, Some(id));
             snapshot_voice_participants(app, &queue, id);
+            if let Some(d) = &detected {
+                game_art::request(
+                    app,
+                    game_art::GameHint {
+                        name: d.game.clone(),
+                        executable: Some(d.executable.clone()).filter(|e| !e.is_empty()),
+                        executable_path: d.executable_path.clone(),
+                    },
+                );
+            }
             // A local clip is never encoded until it is published, and the encoder is what
             // used to make the thumbnail, so the card gets one here.
             match edit::refresh_thumbnail(&bins, &queue, id) {
@@ -1725,6 +1808,8 @@ fn hooked_game_as_detected(state: &State<AppState>) -> Option<games::DetectedGam
     Some(games::DetectedGame {
         game,
         executable: hooked.executable,
+        // libobs only names the executable; art lookup finds the path from the process list.
+        executable_path: None,
         title: hooked.title,
         confident,
     })
@@ -2188,6 +2273,16 @@ fn relabel_tray(app: &AppHandle, language: Language) {
     update_tray_tooltip(app, game.as_ref());
 }
 
+/// Brings the main window forward from the tray, from a second launch, or after a session.
+/// Unminimize first: `show` alone leaves a minimized window on the taskbar.
+pub(crate) fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let language = app.state::<AppState>().settings.lock().unwrap().language;
     let menu = tray_menu(app, language)?;
@@ -2195,17 +2290,23 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
         .tooltip(i18n::tray_idle(language))
+        // Left click opens the window; the menu stays on right click.
         .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "clip" => {
                 let _ = save_clip_inner(app);
             }
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
+            "show" => show_main_window(app),
             "quit" => app.exit(0),
             _ => {}
         });
@@ -2223,12 +2324,7 @@ pub fn run() {
     let _ = settings.save();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-        }))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -2300,10 +2396,14 @@ pub fn run() {
             session_app::match_thumbnail,
             session_app::clips_for_match,
             session_app::match_for_clip,
-            session_app::clip_match_index
+            session_app::clip_match_index,
+            game_art::get_game_art,
+            game_art::choose_game_art,
+            game_art::reset_game_art
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            game_art::init(&handle);
             build_tray(&handle)?;
             let settings = handle.state::<AppState>().settings.lock().unwrap().clone();
             // A bad or taken hotkey is reported in the UI rather than aborting startup.

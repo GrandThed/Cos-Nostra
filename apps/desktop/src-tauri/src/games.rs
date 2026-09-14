@@ -13,6 +13,8 @@ pub struct DetectedGame {
     /// from the window title.
     pub game: String,
     pub executable: String,
+    /// Full path of the executable, when Windows gave it. How art lookup finds a Steam game.
+    pub executable_path: Option<String>,
     pub title: String,
     /// True when the executable was found in the known-games table.
     pub confident: bool,
@@ -33,6 +35,7 @@ pub fn detect_foreground() -> Option<DetectedGame> {
     Some(DetectedGame {
         game,
         executable: fg.executable,
+        executable_path: fg.executable_path,
         title: fg.title,
         confident,
     })

@@ -67,6 +67,14 @@
   white-space: nowrap;
 }
 
+/* The game's icon (gameArt.ts, styled in library.css), sized to the head's one line. */
+.session-head .art-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 10px;
+}
+
 .session-head .when {
   flex: 1;
   color: var(--mut);

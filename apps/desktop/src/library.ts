@@ -23,6 +23,7 @@ import {
 } from "./clips";
 import { confirming, editInline, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhen, hueFor } from "./format";
+import { artFor, artTile, forgetArt, onGameArt } from "./gameArt";
 import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { openPublishDialog } from "./publish";
@@ -86,6 +87,13 @@ export function initLibrary(): void {
   });
   onLanguage(() => {
     if (parts) renderAll();
+  });
+  // The tiles repaint themselves; the header only has to show or hide its reset chip once it
+  // is known whether the picture is one the user chose.
+  onGameArt((game) => {
+    if (headArt?.game !== game) return;
+    const art = artFor(game, "cover");
+    if (art !== undefined) headArt.reset.hidden = !art?.custom;
   });
 }
 
@@ -237,8 +245,8 @@ function renderSidebar(): void {
       renderAll();
     }),
     h("div", { class: "divider" }),
-    ...named.map((g) =>
-      gameItem(
+    ...named.map((g) => {
+      const item = gameItem(
         g.game as string,
         String(g.clips),
         selection.kind === "game" && selection.game === g.game,
@@ -247,8 +255,10 @@ function renderSidebar(): void {
           renderAll();
         },
         "game",
-      ),
-    ),
+      );
+      item.prepend(artTile(h("span"), g.game as string, "icon"));
+      return item;
+    }),
   ];
 
   if (unknown) {
@@ -341,6 +351,12 @@ export function visibleClips(): ClipRow[] {
 const cardBadges = new Map<number, { dot: HTMLElement; trail: HTMLElement }>();
 /** Each card's "Show in match" button, shown only while the clip has a match to show. */
 const matchButtons = new Map<number, HTMLElement>();
+/** The game header's picture and its reset chip, which shows only while the picture is one the
+ *  user chose. */
+let headArt: { game: string; cover: HTMLButtonElement; reset: HTMLElement } | null = null;
+/** A picture's file picker is open. The header can be rebuilt under it, and the new button
+ *  must not open a second one. */
+let choosingArt = false;
 
 /** Repaints every card's circle and badge in place, leaving the rest of the grid alone: a
  *  percentage moves several times a second. */
@@ -368,6 +384,7 @@ function renderMain(): void {
   resetWatches();
   cardBadges.clear();
   matchButtons.clear();
+  headArt = null;
   const clips = visibleClips();
   const recent = selection.kind === "recent";
 
@@ -389,11 +406,14 @@ function renderMain(): void {
     parts.filterRow.hidden = true;
   } else {
     const game = selection.kind === "game" ? selection.game : null;
+    const art = game !== null ? artControls(game) : null;
     fill(
       parts.head,
+      art?.cover,
       h("h2", { text: gameLabel(game), title: gameLabel(game) }),
       h("span", { class: "count", text: gameSummary(game) }),
       renameChip(game),
+      art?.reset,
       search
         ? h("span", {
             class: "match-note",
@@ -477,6 +497,9 @@ function renameChip(game: string | null): HTMLElement {
           .renameGame(game, value)
           .then(() => {
             selection = { kind: "game", game: value };
+            // The pictures travel with the name, so whatever was known under either is stale.
+            if (game !== null) forgetArt(game);
+            if (value !== null) forgetArt(value);
             void loadClips();
             void loadStorage();
           })
@@ -486,6 +509,56 @@ function renameChip(game: string | null): HTMLElement {
     );
   });
   return chip;
+}
+
+/** The game's box art, which is also the button that changes it, and the chip that puts back
+ *  the picture a lookup found. */
+function artControls(game: string): { cover: HTMLButtonElement; reset: HTMLElement } {
+  const cover = artTile(
+    h("button", {
+      type: "button",
+      title: t("library.changeImage"),
+      "aria-label": t("library.changeImage"),
+      disabled: choosingArt,
+    }),
+    game,
+    "cover",
+  );
+  cover.addEventListener("click", () => {
+    choosingArt = true;
+    cover.disabled = true;
+    void ipc
+      .chooseGameArt(game)
+      .then((chosen) => {
+        if (chosen) forgetArt(game);
+      })
+      .catch((e) => console.warn("choose game art", game, e))
+      .finally(() => {
+        choosingArt = false;
+        if (headArt) headArt.cover.disabled = false;
+      });
+  });
+
+  const reset = h("button", {
+    type: "button",
+    class: "chip dashed",
+    text: t("library.resetImage"),
+    title: t("library.resetImageTitle"),
+    hidden: !artFor(game, "cover")?.custom,
+    onclick: () => {
+      reset.hidden = true;
+      void ipc
+        .resetGameArt(game)
+        .then(() => forgetArt(game))
+        .catch((e) => {
+          console.warn("reset game art", game, e);
+          forgetArt(game);
+        });
+    },
+  });
+
+  headArt = { game, cover, reset };
+  return { cover, reset };
 }
 
 function byDay(clips: ClipRow[]): HTMLElement[] {

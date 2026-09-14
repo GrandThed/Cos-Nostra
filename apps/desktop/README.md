@@ -32,7 +32,45 @@ player leaves the game. The reasoning and what has been verified are in `docs/PL
 | `placement.rs` | where a clip sits on a match, from the clip's `captured_at` and the match file's `file_start_at` |
 | `edit.rs` | what the editor opens for a clip (its match, or its own recording) and what Apply does |
 
-Recordings (`session-<id>-<n>.mp4`) and match files live in `<clip folder>\Matches`.
+Recordings (`session-<id>-<n>.mp4`) and match files live in `<clip folder>\<Game>\Matches`;
+sessions recorded before per-game folders stay in `<clip folder>\Matches`.
+
+## The clip folder
+
+`folders.rs` decides where files go. A hotkey clip is written by the replay buffer to the top of
+the clip folder and, once the probe says libobs finished writing it, moved into
+`<clip folder>\<Game>\Clips` (`Unknown game\Clips` when no game was detected); its encoded
+copies and thumbnail are written next to it. Clips taken from a match go to the same folder, and
+a recording the editor rebuilds stays in the folder its clip is already in. Game names become
+folder names with the characters Windows refuses removed and reserved names suffixed.
+
+Rows store absolute paths, so clips saved before the layout existed stay loose at the top of the
+folder and keep working; nothing migrates them. Renaming or merging a game (and changing a clip's
+game, including from the Publish dialog) moves the clips that live in the old name's folder
+into the new one's through `storage::relocate`, which moves every file of a clip or none and
+then prunes the empty folder. A clip whose file is held open by a player or ffmpeg keeps its
+folder.
+
+## Game pictures
+
+The library sidebar, the game header and the Matches session list show a picture per game.
+`src-tauri/src/game_art.rs` finds them on a worker thread and caches them in
+`%APPDATA%\Cos Nostra\game-art\`, keyed by the game's name in the library; `src/gameArt.ts`
+asks for them as data URLs (`get_game_art`) and repaints tiles in place on `game-art-changed`.
+
+A save hands over the executable and, from the foreground window, its path. The lookup, in order:
+
+1. Steam app id: the exe path under `<library>\steamapps\common\<installdir>` matched to an
+   `appmanifest_*.acf`, or the Steam SKU on the game's entry in Discord's detectable-games list
+   (`/api/v9/applications/detectable`, matched by exe name, or by name for clips saved before
+   pictures existed).
+2. Cover: Steam's own `appcache\librarycache\<appid>` (no network), the Steam CDN, the store
+   assets API for newer apps with hashed URLs, then Discord's cover image.
+3. Icon: Discord's app icon, else the exe's icon (`win::extract_exe_icon`). With no square icon
+   the UI crops the cover.
+
+Clicking the header picture replaces it with a chosen file (`custom`, never overwritten); "Reset
+image" drops it and looks the game up again. Renaming a game carries its pictures to the new name.
 
 ## The window
 
@@ -51,6 +89,7 @@ pushes, and nothing renders from an event payload directly.
 | `circles.ts` | the status circle and the stack of server icons on a clip |
 | `storage.ts`, `settings.ts`, `firstrun.ts` | the other three screens |
 | `clips.ts` | what a clip row means: its badge, its meta line, where its video is |
+| `gameArt.ts` | game pictures: the per-game cache and the tiles that repaint when one lands |
 | `styles/tokens.css` | the one token set both themes run on |
 
 The window is undecorated, so `.titlebar` is the title bar and the window buttons call the
@@ -63,8 +102,8 @@ variable-weight subsets of Bricolage Grotesque, Rubik and JetBrains Mono, all OF
 `OFL.txt` beside them); `node scripts/fetch-fonts.mjs src/assets/fonts` regenerates them.
 
 The player reads clip files through Tauri's asset protocol. `lib.rs` widens its scope to the
-clip folder at startup and whenever the folder setting changes, so a clip outside that folder
-will not play.
+clip folder and everything under it at startup and whenever the folder setting changes, so a
+clip outside that folder will not play.
 
 ## Local clips and publishing
 

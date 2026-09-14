@@ -92,6 +92,14 @@
   font-weight: 500;
 }
 
+.game-item .art-icon {
+  width: 20px;
+  height: 20px;
+  margin: -1px 0;
+  border-radius: 5px;
+  font-size: 11px;
+}
+
 .game-item .count {
   color: var(--mut);
   font-size: 11.5px;
@@ -146,6 +154,44 @@
   color: var(--acc);
 }
 
+/* --- Game pictures (gameArt.ts) ------------------------------------------ */
+
+/* A game's icon or box art, or until it has one, its initial on a tint of its own. The tint
+   is mixed into the panel tokens rather than fixed, so it sits right in either theme. Sized
+   where it is used: the sidebar, the game header, the Matches session list. */
+.art-tile {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: color-mix(in srgb, hsl(var(--hue) 48% 50%) 24%, var(--panel));
+  color: color-mix(in srgb, hsl(var(--hue) 55% 42%) 55%, var(--ink));
+  font-family: var(--display);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.art-tile img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* A hairline over the picture, so a dark cover on a dark panel still has an edge. */
+.art-tile::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 12%, transparent);
+  pointer-events: none;
+}
+
 /* --- Main column --------------------------------------------------------- */
 
 .clips {
@@ -174,6 +220,50 @@
 .game-head .count {
   color: var(--mut);
   white-space: nowrap;
+}
+
+/* The box art is the button that changes it: the pencil of an inline rename waits under the
+   pointer. */
+.game-head .art-cover {
+  width: 44px;
+  height: 58px;
+  border-radius: 8px;
+  font-size: 22px;
+}
+
+.game-head .art-cover::before {
+  content: "✎";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  font-family: var(--ui);
+  font-size: 11px;
+  font-weight: 400;
+  background: var(--overVideo);
+  color: var(--overVideoInk);
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.game-head .art-cover:hover:not(:disabled)::before,
+.game-head .art-cover:focus-visible::before {
+  opacity: 1;
+}
+
+.game-head .art-cover:hover:not(:disabled)::after {
+  box-shadow: inset 0 0 0 2px var(--acc);
+}
+
+/* Its file picker is open. */
+.game-head .art-cover:disabled {
+  cursor: default;
+  opacity: 0.7;
 }
 
 .match-note {
@@ -428,6 +518,18 @@
 
   .game-head {
     padding: 12px 14px 10px;
+    gap: 10px;
+  }
+
+  .game-head .art-cover {
+    width: 30px;
+    height: 40px;
+    border-radius: 6px;
+    font-size: 16px;
+  }
+
+  .game-head .art-cover::before {
+    display: none;
   }
 
   /* The compact bar carries the sort, so the header's copy of it would be a duplicate. */

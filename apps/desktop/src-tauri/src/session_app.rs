@@ -1,8 +1,10 @@
 //! The session feature's side of the app: the host the session watch runs against, processing
 //! finished sessions into match files, and the commands the Matches tab calls.
 //!
-//! Recordings and match files live in `<clip folder>\Matches`. The Storage tab only reads the
-//! top of the clip folder, so none of them are mistaken for leftovers there.
+//! Recordings and match files live in `<clip folder>\<Game>\Matches` (sessions recorded before
+//! per-game folders, in `<clip folder>\Matches`), and clips taken from a match in the game's
+//! `Clips` folder. The Storage tab never reads a `Matches` folder, so none of them are mistaken
+//! for leftovers there.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt as _;
 
 use crate::cutter::{self, Processed};
+use crate::folders;
 use crate::ffmpeg::{self, Segment};
 use crate::placement::{self, ClipMatch, MatchClip};
 use crate::queue::NewClip;
@@ -28,8 +31,23 @@ const MIN_CLIP_MS: i64 = 1_000;
 /// Footage kept either side of a clip taken from a match, so the editor can still widen it.
 const CLIP_MARGIN_MS: i64 = 3_000;
 
-pub fn matches_dir(clip_dir: &Path) -> PathBuf {
-    clip_dir.join("Matches")
+/// Where a session's recordings go: its game's `Matches` folder. The top-level `Matches`
+/// folder when the session cannot be read, which is where they all went before.
+fn session_matches_dir(app: &AppHandle, session_id: i64) -> PathBuf {
+    let state = app.state::<AppState>();
+    let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+    let store = state.sessions.lock().unwrap().clone();
+    let game = store.and_then(|s| match s.session(session_id) {
+        Ok(session) => session.map(|s| s.game_name),
+        Err(e) => {
+            log::warn!("session {session_id}: {e:#}");
+            None
+        }
+    });
+    match game {
+        Some(game) => folders::matches_dir(&clip_dir, &game),
+        None => clip_dir.join(folders::MATCHES),
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -58,8 +76,8 @@ impl Host for AppHost {
     }
 
     fn recording_path(&self, session_id: i64, n: usize) -> PathBuf {
-        let clip_dir = self.app.state::<AppState>().settings.lock().unwrap().clip_dir.clone();
-        matches_dir(&clip_dir).join(format!("session-{session_id}-{n}.mp4"))
+        // The match files are cut next to the recordings, so this decides their folder too.
+        session_matches_dir(&self.app, session_id).join(format!("session-{session_id}-{n}.mp4"))
     }
 
     fn start_recording(&self, path: &Path) -> anyhow::Result<()> {
@@ -150,11 +168,7 @@ fn on_session_ended(app: &AppHandle, id: i64) {
     emit_sessions_changed(app, id);
     let open = app.state::<AppState>().settings.lock().unwrap().open_after_session;
     if open {
-        if let Some(w) = app.get_webview_window("main") {
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
+        crate::show_main_window(app);
         let _ = app.emit("session-ended", SessionChanged { id });
     }
     process(app, vec![id]);
@@ -375,10 +389,12 @@ fn clip_from_match_inner(app: &AppHandle, id: i64, start_ms: i64, end_ms: i64) -
     let from = ffmpeg::keyframe_at_or_before(&bins, Path::new(path), (start - CLIP_MARGIN_MS).max(0))?;
     let to = (end + CLIP_MARGIN_MS).min(duration);
     let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+    let dir = folders::clips_dir(&clip_dir, Some(&session.game_name));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let moment = file_start + Duration::milliseconds(start);
     // Named like the replay buffer names its clips, after the moment the clip starts.
     let stem = moment.with_timezone(&Local).format("%Y-%m-%d %H-%M-%S").to_string();
-    let dst = cutter::unique(&clip_dir, &stem);
+    let dst = dir.join(format!("{}.mp4", folders::free_stem(&dir, &stem, "mp4")));
     ffmpeg::copy_range(&bins, Path::new(path), from, to, &dst)?;
     let info = ffmpeg::probe(&bins, &dst)?;
 
@@ -486,8 +502,12 @@ pub fn open_match_folder(app: AppHandle, id: i64) -> Result<(), String> {
     match row.path.as_deref().filter(|p| Path::new(p).exists()) {
         Some(p) => app.opener().reveal_item_in_dir(p).map_err(|e| format!("{e:#}")),
         None => {
-            let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
-            let dir = matches_dir(&clip_dir);
+            let dir = session_matches_dir(&app, row.session_id);
+            let dir = if dir.is_dir() {
+                dir
+            } else {
+                state.settings.lock().unwrap().clip_dir.clone()
+            };
             app.opener()
                 .open_path(dir.display().to_string(), None::<&str>)
                 .map_err(|e| format!("{e:#}"))

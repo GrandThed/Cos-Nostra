@@ -192,6 +192,18 @@ export interface ClipRow {
   posts: ClipPost[];
 }
 
+/** Which picture of a game: a square-ish icon for lists, or box art for the game header. Rust
+ *  falls back to the other when only one exists. `game_art::ArtKind`. */
+export type ArtKind = "icon" | "cover";
+
+/** A game's picture. `game_art::GameArtImage`. */
+export interface GameArtImage {
+  /** A `data:` URL. */
+  url: string;
+  /** The user chose it, so no lookup ever replaces it. */
+  custom: boolean;
+}
+
 /** Live percentage of the encode or upload running right now. */
 export interface ClipProgress {
   id: number;

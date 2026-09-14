@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
+  ArtKind,
   Bootstrap,
   CleanResult,
   CleanTarget,
@@ -12,6 +13,7 @@ import type {
   ClipRow,
   EditSource,
   Encoders,
+  GameArtImage,
   LoginStarted,
   MatchClip,
   PublishGuild,
@@ -41,6 +43,15 @@ export const retryClip = (id: number) => invoke<void>("retry_clip", { id });
 export const clipProgress = () => invoke<ClipProgress[]>("clip_progress");
 export const openClipFolder = (id: number) => invoke<void>("open_clip_folder", { id });
 export const getThumbnail = (id: number) => invoke<string | null>("get_thumbnail", { id });
+
+/** `null` when the game has no picture yet: Rust looks it up in the background and says
+ *  `game-art-changed` if one lands. */
+export const getGameArt = (game: string, kind: ArtKind) =>
+  invoke<GameArtImage | null>("get_game_art", { game, kind });
+/** Opens a file picker; false when it was cancelled. */
+export const chooseGameArt = (game: string) => invoke<boolean>("choose_game_art", { game });
+/** Drops the picture the user chose and looks the game up again. */
+export const resetGameArt = (game: string) => invoke<void>("reset_game_art", { game });
 
 export const editSource = (id: number) => invoke<EditSource>("edit_source", { id });
 /** One kept range, measured in the file `source` names (the match, or the clip's own). */

@@ -508,6 +508,30 @@ impl Queue {
         Ok(())
     }
 
+    /// Points a clip at files the caller just moved to another folder. Only applies while the
+    /// row still has `old_source` and no job is running on it, since the worker reads these
+    /// paths; `false` means it did not apply and the caller should move the files back.
+    pub fn relocate(
+        &self,
+        id: i64,
+        old_source: &str,
+        source_path: &str,
+        av1_path: Option<&str>,
+        h264_path: Option<&str>,
+        thumb_path: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE clips SET source_path = ?2, av1_path = ?3, h264_path = ?4, thumb_path = ?5, \
+                 updated_at = ?6 \
+                 WHERE id = ?1 AND source_path = ?7 AND status NOT IN ('encoding', 'uploading')",
+                params![id, source_path, av1_path, h264_path, thumb_path, now_rfc3339(), old_source],
+            )
+            .with_context(|| format!("relocating clip {id}"))?;
+        Ok(changed == 1)
+    }
+
     /// Moves every clip of one game to another name, and returns how many moved. `None` on
     /// either side is the "no game detected" pile, which is why the match cannot just be
     /// `game = ?1`. Renaming onto a name that already exists merges the two.

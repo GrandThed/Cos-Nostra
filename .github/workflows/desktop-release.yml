@@ -56,6 +56,23 @@ jobs:
         shell: msys2 {0}
         run: bash apps/desktop/scripts/build-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-build" apps/desktop/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
 
+      # The release notes are the tag's section of apps/desktop/CHANGELOG.md: everything under
+      # the "## vX.Y.Z" heading up to the next "## ". The checkout may have CRLF line endings,
+      # hence the sub(). A tag with no section publishes with an empty body.
+      - name: Release notes
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<CHANGELOG_EOF'
+            awk -v tag="## ${GITHUB_REF_NAME}" '
+              { sub(/\r$/, "") }
+              /^## / { on = ($0 == tag || index($0, tag " ") == 1); next }
+              on
+            ' apps/desktop/CHANGELOG.md
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,6 +82,7 @@ jobs:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
           releaseName: Cos Nostra ${{ github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
           # Draft releases are invisible to the updater's "latest" endpoint, so this has to
           # publish straight away; there is no review step before an update goes out.
           releaseDraft: false

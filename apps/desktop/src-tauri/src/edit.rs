@@ -189,6 +189,14 @@ pub fn apply(
     if busy(&row) {
         bail!("this clip is busy right now; wait for the current job to finish");
     }
+    // A new recording goes where the clip already is: its game's folder, or the top of the clip
+    // folder for a clip saved before per-game folders.
+    let clip_dir = Path::new(&row.source_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(clip_dir)
+        .to_path_buf();
+    let clip_dir = clip_dir.as_path();
     let own = edit_source_path(&row);
 
     match kind {

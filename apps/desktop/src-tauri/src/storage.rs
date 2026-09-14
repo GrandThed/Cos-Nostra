@@ -49,6 +49,78 @@ pub fn clip_files(row: &ClipRow) -> Vec<String> {
     files
 }
 
+/// Moves a clip's files (recording, encoded copies, thumbnail) into `dir` and points the row
+/// at them. `Ok(false)` when there was nothing to do: the clip is already there, or a job is
+/// running on it. Everything or nothing: when one file cannot be moved (a player or ffmpeg
+/// holds it) or the row changed meanwhile, the files already moved go back and the clip keeps
+/// its folder.
+pub fn relocate(queue: &Queue, row: &ClipRow, dir: &Path) -> Result<bool> {
+    if matches!(row.status, ClipStatus::Encoding | ClipStatus::Uploading) {
+        return Ok(false);
+    }
+    let source = Path::new(&row.source_path);
+    if source.parent().is_some_and(|p| path_key(&p.display().to_string()) == path_key(&dir.display().to_string())) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
+    let ext = source.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
+    let new_source = dir.join(format!("{}.{ext}", crate::folders::free_stem(dir, &stem, &ext)));
+    let (av1, h264, thumb) = output_paths(&new_source);
+    let new_av1 = row.av1_path.as_ref().map(|_| av1.display().to_string());
+    let new_h264 = row.h264_path.as_ref().map(|_| h264.display().to_string());
+    let new_thumb = row.thumb_path.as_ref().map(|_| thumb.display().to_string());
+
+    let plan = [
+        (Some(&row.source_path), Some(new_source.display().to_string())),
+        (row.av1_path.as_ref(), new_av1.clone()),
+        (row.h264_path.as_ref(), new_h264.clone()),
+        (row.thumb_path.as_ref(), new_thumb.clone()),
+    ];
+    let mut moved: Vec<(String, String)> = Vec::new();
+    let undo = |moved: &[(String, String)]| {
+        for (from, to) in moved.iter().rev() {
+            if let Err(e) = std::fs::rename(to, from) {
+                log::error!("could not move {to} back to {from}: {e}");
+            }
+        }
+    };
+    for (from, to) in plan {
+        let (Some(from), Some(to)) = (from, to) else { continue };
+        // A released clip has no video left, only its thumbnail; its paths still move.
+        if !Path::new(from).is_file() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(from, &to) {
+            undo(&moved);
+            return Err(e).with_context(|| format!("moving {from} to {to}"));
+        }
+        moved.push((from.clone(), to));
+    }
+    let applied = queue.relocate(
+        row.id,
+        &row.source_path,
+        &new_source.display().to_string(),
+        new_av1.as_deref(),
+        new_h264.as_deref(),
+        new_thumb.as_deref(),
+    );
+    match applied {
+        Ok(true) => {
+            log::info!("clip {}: moved to {}", row.id, dir.display());
+            Ok(true)
+        }
+        Ok(false) => {
+            undo(&moved);
+            Ok(false)
+        }
+        Err(e) => {
+            undo(&moved);
+            Err(e)
+        }
+    }
+}
+
 /// Clips and the bytes they hold on this PC.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Bucket {
@@ -201,9 +273,19 @@ pub fn scan(rows: &[ClipRow], clip_dir: &Path) -> StorageStats {
         }
     }
 
-    // Anything else in the folder: leftovers from a crashed encode, a row deleted by hand, a
-    // video the user dropped in. Counted so the total matches Explorer, never deleted for them.
+    // Anything else in the folder or a game's `Clips` folder: leftovers from a crashed encode, a
+    // row deleted by hand, a video the user dropped in. Counted so the total matches Explorer,
+    // never deleted for them. `Matches` folders are `scan_matches`' business.
+    let mut dirs = vec![clip_dir.to_path_buf()];
     if let Ok(entries) = std::fs::read_dir(clip_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(entry.path().join(crate::folders::CLIPS));
+            }
+        }
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if !meta.is_file() {
@@ -662,6 +744,52 @@ mod tests {
         assert!(q.get(a).unwrap().is_none(), "the row goes too");
         assert!(!dir.join("a.mkv").exists());
         assert!(q.get(b).unwrap().is_some());
+    }
+
+    #[test]
+    fn relocating_moves_every_file_and_the_row_together() {
+        let (dir, db) = temp_dirs();
+        let q = Queue::open(&db).unwrap();
+        let a = add(&q, &dir, "a", Some("Game"), 1000);
+        encode(&q, a, 100, 200, 10);
+        let target = dir.join("Game").join("Clips");
+        // Something already called `a` there: the clip takes the next free name.
+        std::fs::create_dir_all(&target).unwrap();
+        write(&target.join("a.jpg"), 5);
+
+        let row = q.get(a).unwrap().unwrap();
+        assert!(relocate(&q, &row, &target).unwrap());
+        let row = q.get(a).unwrap().unwrap();
+        assert_eq!(row.source_path, target.join("a 2.mkv").display().to_string());
+        assert_eq!(row.av1_path.as_deref(), Some(target.join("a 2.av1.mp4").display().to_string().as_str()));
+        assert_eq!(row.thumb_path.as_deref(), Some(target.join("a 2.jpg").display().to_string().as_str()));
+        assert!(!dir.join("a.mkv").exists() && !dir.join("a.h264.mp4").exists());
+        assert_eq!(scan(&q.list().unwrap(), &dir).kinds.other, 5, "the stray thumbnail in Clips counts");
+
+        assert!(!relocate(&q, &row, &target).unwrap(), "already there");
+    }
+
+    #[test]
+    fn relocating_puts_files_back_when_one_is_held_open() {
+        let (dir, db) = temp_dirs();
+        let q = Queue::open(&db).unwrap();
+        let a = add(&q, &dir, "a", Some("Game"), 1000);
+        encode(&q, a, 100, 200, 10);
+        let row = q.get(a).unwrap().unwrap();
+        // std opens with FILE_SHARE_DELETE, which lets a rename through; ffmpeg does not share
+        // delete, and neither does this handle.
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 /* FILE_SHARE_READ */)
+            .open(row.h264_path.as_deref().unwrap())
+            .unwrap();
+
+        let target = dir.join("Game").join("Clips");
+        assert!(relocate(&q, &row, &target).is_err());
+        drop(held);
+        assert!(dir.join("a.mkv").is_file() && dir.join("a.av1.mp4").is_file(), "moved back");
+        assert_eq!(q.get(a).unwrap().unwrap().source_path, row.source_path, "row untouched");
     }
 
     #[test]
