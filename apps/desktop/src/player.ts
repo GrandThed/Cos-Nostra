@@ -3,12 +3,14 @@
  *  Prev and Next step through whatever the library is currently showing, so a filter or a
  *  search narrows the player too. */
 
+import { serverStack, statusDot } from "./circles";
 import { badgeFor, canEdit, cutLabel, gameLabel, isReleased, mediaFor, unknownGame } from "./clips";
 import { confirming, editInline, fill, h } from "./dom";
 import { fmtBytes, fmtClock, fmtDuration, fmtWhen, fmtWhenLong, hueFor } from "./format";
 import { t } from "./i18n";
 import * as ipc from "./ipc";
-import { copyLinkButton, selectionLabel, visibleClips } from "./library";
+import { copyLinkButton, selectionLabel, showInMatch, visibleClips } from "./library";
+import { openPublishDialog } from "./publish";
 import { go } from "./router";
 import { data, loadClips, on } from "./store";
 import type { ClipRow } from "./types";
@@ -48,6 +50,13 @@ export function initPlayer(): void {
     else show();
   });
   on("progress", () => {
+    if (live) renderRail();
+  });
+  // Both only reach the rail when something it shows moved (see `railKey`).
+  on("clipMatches", () => {
+    if (live) renderRail();
+  });
+  on("status", () => {
     if (live) renderRail();
   });
 }
@@ -482,7 +491,7 @@ function handleKey(e: KeyboardEvent, video: HTMLVideoElement, clip: ClipRow): vo
     case "e":
     case "E": {
       const now = data.clips.find((c) => c.id === clip.id);
-      if (now && canEdit(now)) go({ view: "editor", id: clip.id });
+      if (now && canEdit(now, data.clipMatches.has(now.id))) go({ view: "editor", id: clip.id });
       break;
     }
     case "Escape":
@@ -495,15 +504,21 @@ function handleKey(e: KeyboardEvent, video: HTMLVideoElement, clip: ClipRow): vo
   e.preventDefault();
 }
 
-/** The way into the editor: a sketch of the clip's current cut (or its whole length) that
- *  opens the timeline. Disabled, with the reason, while there is nothing here to cut. */
+/** The way into the editor: a sketch of the clip's current range on its recording (or its
+ *  whole length) that opens the timeline. Disabled, with the reason, while there is nothing
+ *  here to cut. */
 function cutStrip(clip: ClipRow): HTMLElement {
-  const editable = canEdit(clip);
+  const editable = canEdit(clip, data.clipMatches.has(clip.id));
   const cut = clip.cut;
   // The sketch is in source time, and after a cut the row's duration is the kept length, so
-  // the last segment's end is the better guess at how long the recording is.
+  // the last segment's end is the better guess at how long the recording is. Several parts
+  // from before the range editor are drawn as their outer span, which is what the editor
+  // opens them as.
   const scale = Math.max(clip.duration_ms, cut?.[cut.length - 1]?.end_ms ?? 0, 1);
-  const keeps = (cut ?? [{ start_ms: 0, end_ms: scale }]).map((s) =>
+  const span = cut?.length
+    ? { start_ms: cut[0].start_ms, end_ms: cut[cut.length - 1].end_ms }
+    : { start_ms: 0, end_ms: scale };
+  const keeps = [span].map((s) =>
     h("span", {
       class: "keep",
       style: `left:${(s.start_ms / scale) * 100}%;width:${((s.end_ms - s.start_ms) / scale) * 100}%`,
@@ -549,6 +564,7 @@ function renderRail(): void {
 
   const badge = badgeFor(clip, data.progress.get(clip.id), data.status, data.settings);
   const released = isReleased(clip);
+  const inMatch = data.clipMatches.has(clip.id);
 
   const key = [
     clip.game,
@@ -558,16 +574,20 @@ function renderRail(): void {
     clip.size_h264,
     clip.page_url,
     clip.status,
+    clip.publish,
+    clip.remote_id,
+    JSON.stringify(clip.posts),
     badge.label,
     released,
     clip.duration_ms,
     JSON.stringify(clip.cut),
+    inMatch,
   ].join("");
   if (key === railKey) return;
   railKey = key;
 
   fill(live.strip, cutStrip(clip));
-  const editable = canEdit(clip);
+  const editable = canEdit(clip, inMatch);
 
   const name = h("button", {
     type: "button",
@@ -604,7 +624,14 @@ function renderRail(): void {
           })
         : null,
     ),
-    h("span", { class: `badge ${badge.kind}`, text: badge.label, title: badge.title }),
+    h(
+      "div",
+      { class: "status-row" },
+      statusDot(badge),
+      h("span", { class: `badge ${badge.kind}`, text: badge.label, title: badge.title }),
+      h("span", { class: "grow" }),
+      serverStack(clip),
+    ),
     h(
       "div",
       { class: "facts" },
@@ -632,15 +659,7 @@ function renderRail(): void {
     h(
       "div",
       { class: "buttons" },
-      clip.page_url
-        ? copyLinkButton(clip.page_url, "btn primary")
-        : h("button", {
-            type: "button",
-            class: "btn",
-            text: t("library.copyLink"),
-            disabled: true,
-            title: t("player.rail.copyLinkPending"),
-          }),
+      ...publishButtons(clip),
       h("button", {
         type: "button",
         class: "btn",
@@ -649,6 +668,14 @@ function renderRail(): void {
         title: editable ? t("player.rail.trimCutTitle") : t("player.rail.trimCutDisabled"),
         onclick: () => go({ view: "editor", id: clip.id }),
       }),
+      inMatch
+        ? h("button", {
+            type: "button",
+            class: "btn",
+            text: t("player.rail.showInMatch"),
+            onclick: () => showInMatch(clip.id),
+          })
+        : null,
       openFolder,
       clip.status === "failed"
         ? h("button", {
@@ -660,7 +687,7 @@ function renderRail(): void {
         : null,
       confirming(
         h("button", { type: "button", class: "btn danger" }) as HTMLButtonElement,
-        t("player.rail.delete"),
+        clip.remote_id ? t("player.rail.delete") : t("player.rail.deleteLocal"),
         t("player.rail.confirmDelete"),
         () => void deleteClip(clip.id),
       ),
@@ -672,6 +699,23 @@ function renderRail(): void {
       text: clip.remote_id ? t("player.rail.noteRemote") : t("player.rail.noteLocal"),
     }),
   );
+}
+
+/** The rail's first buttons, which say where the clip stands: Publish for a local clip, the
+ *  link and the servers for a published one, and a way to watch or stop a publish underway. */
+function publishButtons(clip: ClipRow): HTMLElement[] {
+  const dialog = (text: string, className: string, title?: string) =>
+    h("button", { type: "button", class: className, text, title, onclick: () => openPublishDialog(clip.id) });
+  if (clip.remote_id) {
+    return [
+      clip.page_url
+        ? copyLinkButton(clip.page_url, "btn primary")
+        : h("button", { type: "button", class: "btn", text: t("library.copyLink"), disabled: true }),
+      dialog(t("player.rail.servers"), "btn"),
+    ];
+  }
+  if (clip.publish) return [dialog(t("player.rail.publishing"), "btn")];
+  return [dialog(t("player.rail.publish"), "btn primary", t("player.rail.publishTitle"))];
 }
 
 function videoLine(clip: ClipRow): string {

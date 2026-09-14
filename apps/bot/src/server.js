@@ -1,21 +1,33 @@
-// The bot's internal HTTP server. Three routes, node:http, no framework: the backend calls
-// POST /post after an upload completes and POST /voice-snapshot while a clip is being made,
+// The bot's internal HTTP server. node:http, no framework. The backend calls four routes:
+//
+//   - POST /post after an upload completes, or when the owner posts a clip to more servers;
+//   - POST /unpost when a clip is unpublished or deleted, to take its messages down;
+//   - POST /voice-snapshot while a clip is being made;
+//   - POST /member-guilds when the desktop's Publish dialog asks which servers to offer;
+//
 // and Railway calls GET /health.
 //
-// POST /post is fire-and-forget by contract (see apps/backend/src/plugins/bot.js): the clip
-// is already stored, so we answer 202 before touching Discord and never let a posting failure
-// turn into a retry storm or a crashed process. The backend only looks at the status code.
+// POST /post and POST /unpost are fire-and-forget by contract (see
+// apps/backend/src/plugins/bot.js): the backend has already written the outcome it wants, so
+// we answer 202 before touching Discord and never let a Discord failure turn into a retry
+// storm or a crashed process. The backend only looks at the status code.
 //
-// POST /voice-snapshot is the opposite: the caller wants the answer, and the answer is a
-// synchronous read of the gateway's voice state cache, so it is served inline. It exists
-// because only the bot holds that state - the desktop app knows who pressed the hotkey and
-// nothing else, and the backend has no gateway connection of its own.
+// POST /voice-snapshot and POST /member-guilds are the opposite: the caller wants the answer,
+// so it is served inline. They exist because only the bot can ask - the backend has no gateway
+// connection of its own, and the voice state cache and guild membership both live behind one.
 
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 
-// Bodies here are a single clip id. Anything larger is a mistake or an attack.
+import { deleteMessage } from './manage.js';
+import { memberGuilds } from './members.js';
+
+// Bodies here are a few ids: a clip, a user, a handful of guilds or posts. Anything larger is a
+// mistake or an attack.
 const MAX_BODY_BYTES = 16 * 1024;
+// The backend gives POST /member-guilds 4 s before it answers the desktop with bot_unavailable.
+// Answering a little earlier with the guilds confirmed so far is better than being cut off.
+const MEMBER_GUILDS_TIMEOUT_MS = 3_500;
 // Railway private networking resolves to IPv6, so a dual-stack bind is required for the
 // backend to reach us at bot.railway.internal. Node leaves ipv6Only off, so IPv4 works too.
 const HOST = '::';
@@ -123,28 +135,83 @@ function voiceSnapshot(client, discordId) {
   return [];
 }
 
+/** @param {unknown} value */
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/** @param {unknown} value @returns {value is string[]} */
+function isIdList(value) {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+/**
+ * One entry of POST /unpost. Only the channel and message ids are needed to delete it; the
+ * guild id is carried for the log and checked only for its type.
+ * @param {any} post
+ */
+function isPostRef(post) {
+  return (
+    Boolean(post) &&
+    typeof post === 'object' &&
+    isNonEmptyString(post.channelId) &&
+    isNonEmptyString(post.messageId) &&
+    (post.guildId === undefined || typeof post.guildId === 'string')
+  );
+}
+
 /**
  * @param {object} options
  * @param {import('./config.js').Config} options.config
- * @param {{ postClip: (clipId: string) => Promise<unknown> }} options.poster
+ * @param {{ postClip: (clipId: string, guildIds?: string[]) => Promise<unknown> }} options.poster
  * @param {{ info: Function, warn: Function, error: Function, debug: Function }} [options.log]
- * @param {any} [options.client] discord.js Client, read by POST /voice-snapshot
+ * @param {any} [options.client] discord.js Client, read by POST /voice-snapshot and
+ *   POST /member-guilds and used to delete messages for POST /unpost
+ * @param {number} [options.memberGuildsTimeoutMs] overridable so a test need not wait 3.5 s
  */
-export function createServer({ config, poster, log = NOOP_LOG, client }) {
+export function createServer({
+  config,
+  poster,
+  log = NOOP_LOG,
+  client,
+  memberGuildsTimeoutMs = MEMBER_GUILDS_TIMEOUT_MS,
+}) {
   const expected = Buffer.from(`Bearer ${config.BOT_SHARED_SECRET}`);
 
   /**
    * Posting runs after the response, detached from the request. Everything it can throw,
    * including a synchronous throw from a bad poster, is logged and swallowed here.
    * @param {string} clipId
+   * @param {string[] | undefined} guildIds
    */
-  function postInBackground(clipId) {
+  function postInBackground(clipId, guildIds) {
     void (async () => {
       try {
-        await poster.postClip(clipId);
+        await poster.postClip(clipId, guildIds);
       } catch (err) {
         log.error(`post failed for clip ${clipId}: ${err?.stack ?? err?.message ?? String(err)}`);
       }
+    })();
+  }
+
+  /**
+   * Takes a clip's messages down after the response, one at a time: there are rarely more than
+   * a few, and discord.js queues deletes in one channel behind the same rate limit anyway.
+   * deleteMessage already tolerates a message or channel that is gone.
+   * @param {string} clipId
+   * @param {{ guildId?: string, channelId: string, messageId: string }[]} posts
+   */
+  function unpostInBackground(clipId, posts) {
+    void (async () => {
+      for (const post of posts) {
+        try {
+          await deleteMessage(client, post.channelId, post.messageId, log);
+        } catch (err) {
+          // deleteMessage never rejects today; this keeps a future change from crashing us.
+          log.error(`unpost of message ${post.messageId} failed: ${err?.message ?? String(err)}`);
+        }
+      }
+      log.info(`clip ${clipId}: took down ${posts.length} post(s)`);
     })();
   }
 
@@ -189,10 +256,72 @@ export function createServer({ config, poster, log = NOOP_LOG, client }) {
       if (typeof clipId !== 'string' || clipId.length === 0) {
         return json(res, 400, { error: 'bad_request', message: 'clipId is required' });
       }
+      // Absent and null are the same thing - "use the clip's own targets" - because the poster
+      // resolves them with `??`. Anything else must be a list of ids: a malformed list that
+      // quietly fell back to the clip's targets could post somewhere nobody asked for.
+      const guildIds = parsed.body.guildIds ?? undefined;
+      if (guildIds !== undefined && !isIdList(guildIds)) {
+        return json(res, 400, {
+          error: 'bad_request',
+          message: 'guildIds must be an array of guild ids',
+        });
+      }
       // Accept first, work later. The backend must not wait for Discord.
       json(res, 202, { ok: true, clipId });
-      log.info(`queued clip ${clipId} for posting`);
-      postInBackground(clipId);
+      log.info(
+        `queued clip ${clipId} for posting${guildIds ? ` to guild(s) ${guildIds.join(', ') || '(none)'}` : ''}`,
+      );
+      postInBackground(clipId, guildIds);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/member-guilds') {
+      if (!authorized(req.headers.authorization, expected)) {
+        log.warn('POST /member-guilds rejected: bad shared secret');
+        return json(res, 401, { error: 'unauthorized' });
+      }
+      const parsed = await jsonBody(req, res);
+      if (!parsed.ok) return;
+      const discordId = parsed.body?.discordId;
+      const guildIds = parsed.body?.guildIds;
+      if (!isNonEmptyString(discordId) || !isIdList(guildIds)) {
+        return json(res, 400, {
+          error: 'bad_request',
+          message: 'discordId and guildIds are required',
+        });
+      }
+      // memberGuilds never rejects and is bounded by the timeout, so the response always goes
+      // out in time for the backend's own deadline.
+      const confirmed = await memberGuilds({
+        client,
+        discordId,
+        guildIds,
+        timeoutMs: memberGuildsTimeoutMs,
+        log,
+      });
+      log.debug(`member guilds for ${discordId}: ${confirmed.length} of ${guildIds.length}`);
+      return json(res, 200, { guildIds: confirmed });
+    }
+
+    if (req.method === 'POST' && path === '/unpost') {
+      if (!authorized(req.headers.authorization, expected)) {
+        log.warn('POST /unpost rejected: bad shared secret');
+        return json(res, 401, { error: 'unauthorized' });
+      }
+      const parsed = await jsonBody(req, res);
+      if (!parsed.ok) return;
+      const clipId = parsed.body?.clipId;
+      const posts = parsed.body?.posts;
+      if (!isNonEmptyString(clipId) || !Array.isArray(posts) || !posts.every(isPostRef)) {
+        return json(res, 400, {
+          error: 'bad_request',
+          message: 'clipId and posts [{ guildId, channelId, messageId }] are required',
+        });
+      }
+      // The backend has already marked these posts removed; the messages are ours to clean up.
+      json(res, 202, { ok: true, clipId });
+      log.info(`queued ${posts.length} post(s) of clip ${clipId} for removal`);
+      unpostInBackground(clipId, posts);
       return;
     }
 

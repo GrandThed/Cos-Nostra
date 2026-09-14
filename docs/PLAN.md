@@ -373,6 +373,7 @@ The shape, and why:
 - **A clip from a match is an ordinary clip.** `clip_from_match` copies the range with three
   seconds either side into the clip folder and enqueues it with the exact range as its `cut`
   (`Queue::enqueue_with_cut`), so encoding, the editor and uploading are the paths that exist.
+  Since publish on demand (below) it stays local like a hotkey clip until published.
 - **Separate database.** `sessions.db` beside `clips.db`, because the queue versions its schema
   through `user_version` and two stores in one file would share the number.
 - Files go to `<clip folder>\Matches`, which the Storage tab's top-level scan does not see and
@@ -696,6 +697,70 @@ Not verified, and what would:
 - `/clips config` is a new subcommand and is not live in any guild until
   `npm run deploy-commands -w apps/bot` is run again - registration is a separate step from
   deploying, same as every other command change.
+
+### Publish on demand. Built 2026-09-13, not yet deployed or run in the app.
+
+Not in the original plan. Every hotkey clip used to encode, upload and post itself to every
+configured server. In practice a player wants a piece of what they saved, and a match recording
+is mostly used for the moment they forgot to clip, so the product now centers on the act of
+publishing one chosen clip rather than on uploading everything.
+
+The shape, and why:
+
+- **Clips are local until published.** The hotkey still saves the replay buffer as its own file
+  (it can be watched at once, survives the match being deleted, and works in games that are not
+  recorded). `clips.db` schema v6 adds `publish`, and the queue only encodes or uploads rows
+  where it is 1. The `auto_upload` setting is gone. Encoding waits for Publish because almost
+  every clip is trimmed first, and encoding before the trim was wasted work.
+- **A clip knows where it is on its match.** `captured_at` is the wall-clock time of the clip
+  recording's first frame (taken just before `Recorder::save()`, minus the probed length), and
+  a match file already stores `file_start_at`, so `placement.rs` finds the overlap by
+  subtraction, like match events. The Matches timeline draws clips as ranges; the Library has
+  "Show in match". `clips.db` and `sessions.db` stay separate; the join is in Rust.
+- **The editor is one range on the match.** Split and remove-part are gone. Dragging past the
+  saved footage copies that span (plus 3 s) out of the match into a new recording for the clip,
+  so a clip is always self-contained. Publishing is once per clip: re-editing a published clip
+  replaces it under the same link, as before.
+- **Publish is a dialog.** Title, game, and the servers to post in, from `GET /discord/guilds`:
+  guilds with a clip channel where the bot confirms the user is a member (`POST
+  /member-guilds` on the bot, a REST member fetch, no privileged intent). None ticked means a
+  web page only. The choice travels as `guildIds` on `POST /clips` and is stored as
+  `clips.target_guilds`; `null` is the legacy "every configured guild" path that keeps desktop
+  builds from before this working. The bot re-checks membership at post time and skips any
+  guild that already has a live post of the clip, so retries and "post to more servers" (`POST
+  /clips/:id/posts`) never double-post.
+- **Posts can be taken down, and that is recorded.** `posts.removed_at` marks a post whose
+  message is gone: Hide in the Discord manage menu (`DELETE /internal/posts/:messageId`), and
+  every purge. `purgeClip` now also tells the bot to delete the clip's live messages (`POST
+  /unpost`), so deleting a clip from the desktop, the site or Discord removes all of its posts.
+  Rankings and the guild site keep counting hidden posts, as Hide promised.
+- **Unpublish** is `DELETE /clips/:id` while keeping the local files; publishing again makes a
+  new clip and link, since the old objects are gone. It is refused for a clip whose local video
+  the Storage tab released, because the site copy would be the last one.
+- **Clip cards** carry a status circle (local, working with a progress ring, published, failed)
+  and a stack of server icons from `GET /me/posts`, cached on the row as `posts` and refreshed at
+  startup, after uploads, after posting more, and every five minutes.
+
+Rollout: deploy the backend (migration `0005`) and the bot together, then ship the desktop.
+Until the new bot is live, `GET /discord/guilds` answers 503, and unpublishing or deleting a clip
+leaves its Discord messages up. Never
+run an older desktop build against a migrated `clips.db`: it would upload every local clip (see
+`CLAUDE.md`).
+
+Verified 2026-09-13 without running the app: 73 backend tests on PGlite (migration 0005 also
+applied to a copy of the dev database), 195 bot tests, 26 `packages/shared` tests, 122 desktop
+`cargo test`s (1 ignored) including real-ffmpeg Apply cases inside and past the saved footage,
+`tsc --noEmit` and `vite build`.
+
+Not verified, and what would:
+
+- The UI itself: the dialog, circles, progress rings and clip ranges in both themes. Run `tauri
+  dev` with Backend URL on `http://localhost:3000`.
+- `captured_at` against a real replay-buffer save: clip once during a recorded match and check
+  that its range on the timeline shows the same moment as the clip.
+- Membership filtering against real Discord, and a real publish: the backend and bot have to be
+  deployed first.
+- The editor's scrolling and filmstrip on a long match file.
 
 ## 5. Cross-cutting work
 

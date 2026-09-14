@@ -38,12 +38,14 @@ pub fn clip_not_saved(l: Language) -> &'static str {
     pick(l, "Clip not saved", "No se pudo guardar el clip")
 }
 
+/// Shown once a clip the user published has finished uploading.
 pub fn clip_uploaded(l: Language) -> &'static str {
-    pick(l, "Clip uploaded", "Clip subido")
+    pick(l, "Clip published", "Clip publicado")
 }
 
+/// Shown once an edit of a published clip has replaced it on the site.
 pub fn clip_updated(l: Language) -> &'static str {
-    pick(l, "Clip updated", "Clip actualizado")
+    pick(l, "Published clip updated", "Clip publicado actualizado")
 }
 
 pub fn tray_hint_title(l: Language) -> &'static str {

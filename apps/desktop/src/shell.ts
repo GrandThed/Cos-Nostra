@@ -369,9 +369,6 @@ function renderStatusPanel(): void {
       "span",
       { class: "value" },
       s.account ? s.account.username : t("shell.panel.notLinked"),
-      s.account && !s.auto_upload
-        ? h("span", { style: "color:var(--warn)", text: t("shell.panel.uploadsOff") })
-        : null,
     ),
   ];
 

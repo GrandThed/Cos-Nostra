@@ -245,15 +245,15 @@
   object-fit: cover;
 }
 
-.card .badge.over {
-  position: absolute;
-  left: 8px;
-  top: 8px;
-  background: var(--scrim);
+/* In the grid the thumbnail wears the status circle and the server icons (circles.css); the
+   text badge and the second server stack belong to the compact rows below. */
+.card .badge.trail,
+.card .foot .servers {
+  display: none;
 }
 
-.card .badge.trail {
-  display: none;
+.card .foot .servers .guild {
+  box-shadow: 0 0 0 2px var(--panel);
 }
 
 .card .dur {
@@ -274,10 +274,14 @@
   position: absolute;
   inset: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  align-content: center;
   justify-content: center;
   gap: 6px;
-  background: rgba(12, 9, 4, 0.55);
+  /* Clear of the circles in the top corners and the duration chip below. */
+  padding: 30px 10px 26px;
+  background: rgba(12, 9, 4, 0.6);
   opacity: 0;
   transition: opacity 0.1s ease;
 }
@@ -298,6 +302,18 @@
 
 .card .actions .btn:hover {
   border-color: var(--overVideoInk);
+}
+
+/* The one thing a local clip is waiting for. */
+.card .actions .btn.publish {
+  background: var(--acc);
+  border-color: var(--acc);
+  color: var(--accInk);
+  font-weight: 600;
+}
+
+.card .actions .btn.publish:hover {
+  filter: brightness(1.08);
 }
 
 .card .actions .btn.danger.armed {
@@ -447,13 +463,18 @@
     overflow: hidden;
   }
 
-  .card .badge.over,
+  .card .shot .status-dot,
+  .card .shot .servers,
   .card .actions {
     display: none;
   }
 
   .card .badge.trail {
     display: inline-block;
+  }
+
+  .card .foot .servers {
+    display: inline-flex;
   }
 
   .card .dur {

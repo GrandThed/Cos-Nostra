@@ -4,7 +4,12 @@
 //! exponential backoff up to `MAX_ATTEMPTS`, after which they wait for a manual retry. The queue
 //! survives restarts: an `encoding` row found at open time is put back to `saved`, an
 //! `uploading` one back to `encoded`.
+//!
+//! Only rows with `publish = 1` move at all. Everything the hotkey or a match saves starts as a
+//! local clip (`saved`, `publish = 0`) and stays exactly there, unencoded, until the user
+//! presses Publish; the worker never so much as looks at it.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -23,8 +28,9 @@ pub const MAX_ATTEMPTS: i32 = 5;
 /// 1: initial. 2: `stage`, `remote_id`, `page_url` for uploads. 3: `fps`, which the player
 /// needs to step a frame at a time. 4: `cut`, the kept parts the editor chose.
 /// 5: `participants`, JSON array of Discord user ids seen in the owner's voice channel at
-/// capture time.
-const SCHEMA_VERSION: i32 = 5;
+/// capture time. 6: publish on demand: `publish`, `publish_guilds`, `publish_title`, the
+/// `posts` cache, and `captured_at`, which places a clip on the match it was taken in.
+const SCHEMA_VERSION: i32 = 6;
 
 /// How often the worker polls when nobody calls `wake`.
 #[cfg(not(test))]
@@ -125,6 +131,20 @@ pub struct NewClip {
     /// written later with `set_participants`, so a slow or missing backend never delays the
     /// row appearing in the UI.
     pub participants: Option<Vec<String>>,
+    /// RFC 3339 UTC wall-clock time of the first frame of `source_path`. `None` only when the
+    /// caller has no idea, which keeps the clip off every match timeline.
+    pub captured_at: Option<String>,
+}
+
+/// One live Discord post of a clip, as `GET /me/posts` last reported it. Cached on the row so
+/// the library can draw server icons without asking the backend for every card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipPost {
+    pub guild_id: String,
+    pub name: Option<String>,
+    pub icon_url: Option<String>,
+    pub message_url: String,
+    pub posted_at: String,
 }
 
 /// One row of the clips table, as shown in the UI.
@@ -167,6 +187,21 @@ pub struct ClipRow {
     /// When the row last changed. The UI keys its thumbnail cache on it, since a re-encode
     /// rewrites the thumbnail in place under the same path.
     pub updated_at: String,
+    /// The user asked for this clip to be published. The worker encodes and uploads only
+    /// these; a row without it is a local clip, whatever its status says.
+    pub publish: bool,
+    /// Discord guild ids chosen in the publish dialog (and any added later). `None` on a clip
+    /// published before the dialog existed.
+    pub publish_guilds: Option<Vec<String>>,
+    /// The title typed in the publish dialog.
+    pub publish_title: Option<String>,
+    /// RFC 3339 UTC time of the first frame of `source_path`. Together with `cut` (or the whole
+    /// `duration_ms` when there is none) it is where the clip sits in wall-clock time, which
+    /// is how it is found on a match. When the recording is gone and an encoded copy is what is
+    /// left, that copy starts `cut[0].start_ms` later; see `edit::file_start`.
+    pub captured_at: Option<String>,
+    /// Live Discord posts, from the last `GET /me/posts`. Empty for a clip nobody posted.
+    pub posts: Vec<ClipPost>,
 }
 
 /// Files the processor produced for a clip.
@@ -246,26 +281,56 @@ CREATE TABLE IF NOT EXISTS clips (
     remote_id TEXT,
     page_url TEXT,
     cut TEXT,
-    participants TEXT
+    participants TEXT,
+    publish INTEGER NOT NULL DEFAULT 0,
+    publish_guilds TEXT,
+    publish_title TEXT,
+    captured_at TEXT,
+    posts TEXT
 );
 CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 ";
 
 /// Columns added after version 1, applied with ALTER TABLE to databases that predate them.
-/// Every one is nullable or has a default, so an older row needs no backfill.
-const ADDED_COLUMNS: [(&str, &str); 6] = [
+/// Every one is nullable or has a default; `migrate_to_publish_on_demand` backfills the two
+/// whose default would be wrong for an existing row.
+const ADDED_COLUMNS: [(&str, &str); 11] = [
     ("stage", "TEXT NOT NULL DEFAULT 'encode'"),
     ("remote_id", "TEXT"),
     ("page_url", "TEXT"),
     ("fps", "REAL"),
     ("cut", "TEXT"),
     ("participants", "TEXT"),
+    ("publish", "INTEGER NOT NULL DEFAULT 0"),
+    ("publish_guilds", "TEXT"),
+    ("publish_title", "TEXT"),
+    ("captured_at", "TEXT"),
+    ("posts", "TEXT"),
 ];
 
 /// Column list shared by every SELECT so `row_from` stays in sync.
 const COLUMNS: &str = "id, source_path, game, title, recorded_at, duration_ms, width, height, \
     size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts, \
-    stage, remote_id, page_url, fps, cut, updated_at, participants";
+    stage, remote_id, page_url, fps, cut, updated_at, participants, publish, publish_guilds, \
+    publish_title, captured_at, posts";
+
+/// A new recording for a clip, after the editor widened it past the file it had: the copy
+/// taken out of the match (or out of the encoded copy) that replaces `source_path`.
+#[derive(Debug, Clone)]
+pub struct Rebased {
+    pub source_path: String,
+    /// RFC 3339 UTC time of the new file's first frame.
+    pub captured_at: String,
+    /// The range inside the new file. `None` when it is the whole file.
+    pub cut: Option<Vec<Segment>>,
+    pub duration_ms: i64,
+    pub size_source: i64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    /// A thumbnail already written for the new file, if one could be.
+    pub thumb_path: Option<String>,
+}
 
 pub struct Queue {
     conn: Mutex<Connection>,
@@ -297,6 +362,9 @@ impl Queue {
             if version >= 1 {
                 // An older table already exists; the CREATE above did not add the new columns.
                 add_missing_columns(&conn)?;
+                if version < 6 {
+                    migrate_to_publish_on_demand(&conn)?;
+                }
             }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("writing schema version")?;
@@ -358,10 +426,12 @@ impl Queue {
             .context("encoding participants")?;
         let now = now_rfc3339();
         let conn = self.lock();
+        // `publish` is left at its default: every new clip is a local one.
         conn.execute(
             "INSERT INTO clips (source_path, game, title, recorded_at, duration_ms, width, height, \
-             fps, size_source, status, attempts, created_at, updated_at, cut, participants) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10, ?11, ?12)",
+             fps, size_source, status, attempts, created_at, updated_at, cut, participants, \
+             captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'saved', 0, ?10, ?10, ?11, ?12, ?13)",
             params![
                 clip.source_path,
                 clip.game,
@@ -375,6 +445,7 @@ impl Queue {
                 now,
                 cut,
                 participants,
+                clip.captured_at,
             ],
         )
         .with_context(|| format!("enqueueing {}", clip.source_path))?;
@@ -484,14 +555,281 @@ impl Queue {
     }
 
     /// Forgets a clip's cut after it was baked into the outputs from a file that no longer
-    /// exists as the original, so the segments are not applied twice.
-    pub fn clear_cut(&self, id: i64) -> Result<()> {
+    /// exists as the original, so the segments are not applied twice. The new copy starts
+    /// where the cut did, so `captured_at` moves forward by `shift_ms` to keep placing the
+    /// clip where it really is.
+    pub fn bake_cut(&self, id: i64, shift_ms: i64) -> Result<()> {
         let conn = self.lock();
+        let captured: Option<String> = conn
+            .query_row("SELECT captured_at FROM clips WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .with_context(|| format!("reading clip {id}"))?
+            .flatten();
+        let moved = captured
+            .as_deref()
+            .and_then(|c| DateTime::parse_from_rfc3339(c).ok())
+            .map(|c| format_rfc3339(c.with_timezone(&Utc) + chrono::Duration::milliseconds(shift_ms)));
         conn.execute(
-            "UPDATE clips SET cut = NULL, updated_at = ?2 WHERE id = ?1",
-            params![id, now_rfc3339()],
+            "UPDATE clips SET cut = NULL, captured_at = COALESCE(?3, captured_at), updated_at = ?2 \
+             WHERE id = ?1",
+            params![id, now_rfc3339(), moved],
         )
         .with_context(|| format!("clearing cut of clip {id}"))?;
+        Ok(())
+    }
+
+    /// Records the thumbnail written for a clip that has not been encoded. Bumps `updated_at`
+    /// on purpose: the UI caches thumbnails by path and `updated_at`, and a range change
+    /// rewrites the file under the same path.
+    pub fn set_thumb(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE clips SET thumb_path = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, path, now_rfc3339()],
+        )
+        .with_context(|| format!("setting thumbnail of clip {id}"))?;
+        Ok(())
+    }
+
+    /// Marks a clip for publishing with what the dialog chose, and lets the worker at it.
+    ///
+    /// A `saved` row gets encoded then uploaded. An `encoded` one (a clip from before publish
+    /// on demand, which encoded but never went up) goes straight to upload, since an edit of a
+    /// local clip always throws stale outputs away; unless its outputs have gone missing, in
+    /// which case it encodes again. A failed row starts over at the stage it failed in.
+    pub fn publish(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        game: Option<&str>,
+        guild_ids: &[String],
+    ) -> Result<()> {
+        let guilds = serde_json::to_string(guild_ids).context("encoding guild ids")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting publish transaction")?;
+        let row = get_in(&tx, id)?.with_context(|| format!("clip {id} not found"))?;
+        if row.remote_id.is_some() {
+            bail!("this clip is already published");
+        }
+        if row.publish && matches!(row.status, ClipStatus::Encoding | ClipStatus::Uploading) {
+            bail!("this clip is already being published");
+        }
+        let outputs_here = [&row.av1_path, &row.h264_path, &row.thumb_path]
+            .into_iter()
+            .all(|p| p.as_deref().is_some_and(|p| Path::new(p).is_file()));
+        let status = match row.status {
+            ClipStatus::Failed if row.stage == Stage::Upload && outputs_here => "encoded",
+            ClipStatus::Failed => "saved",
+            ClipStatus::Encoded if !outputs_here => "saved",
+            other => other.as_str(),
+        };
+        let restart = status != row.status.as_str() || row.status == ClipStatus::Failed;
+        tx.execute(
+            "UPDATE clips SET publish = 1, publish_title = ?2, game = ?3, publish_guilds = ?4, \
+             status = ?5, \
+             stage = CASE WHEN ?5 = 'saved' THEN 'encode' ELSE stage END, \
+             attempts = CASE WHEN ?6 THEN 0 ELSE attempts END, \
+             error = CASE WHEN ?6 THEN NULL ELSE error END, \
+             next_attempt_at = NULL, updated_at = ?7 WHERE id = ?1",
+            params![id, title, game, guilds, status, restart, now_rfc3339()],
+        )
+        .with_context(|| format!("publishing clip {id}"))?;
+        tx.commit().context("committing publish")?;
+        Ok(())
+    }
+
+    /// First half of unpublishing: stops the worker from touching the clip (by clearing
+    /// `publish`) before the backend is asked to delete it, so an encode cannot start between
+    /// the check and the request. Refused while a job is already running. Returns the row as
+    /// it was, for its `remote_id`.
+    pub fn begin_unpublish(&self, id: i64) -> Result<ClipRow> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting unpublish transaction")?;
+        let row = get_in(&tx, id)?.with_context(|| format!("clip {id} not found"))?;
+        if matches!(row.status, ClipStatus::Encoding | ClipStatus::Uploading) {
+            bail!("this clip is busy right now; wait for the current job to finish");
+        }
+        // The Storage tab releases a published clip's local video, leaving the site as the only
+        // copy. Deleting that copy is what "delete everywhere" is for, not unpublish.
+        let video_here = [Some(&row.source_path), row.av1_path.as_ref(), row.h264_path.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|p| Path::new(p).is_file());
+        if row.remote_id.is_some() && !video_here {
+            bail!("this clip's video is only on the site now, so unpublishing would lose it; delete it everywhere instead");
+        }
+        tx.execute("UPDATE clips SET publish = 0 WHERE id = ?1", params![id])
+            .with_context(|| format!("holding clip {id}"))?;
+        tx.commit().context("committing unpublish hold")?;
+        Ok(row)
+    }
+
+    /// Puts `publish` back after the backend refused an unpublish, so the clip is exactly as
+    /// published as it was.
+    pub fn restore_publish(&self, id: i64, publish: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("UPDATE clips SET publish = ?2 WHERE id = ?1", params![id, publish])
+            .with_context(|| format!("restoring clip {id}"))?;
+        Ok(())
+    }
+
+    /// Second half: the site has let go, so the clip becomes local again. Its files all stay.
+    /// It rests as `encoded` while both encoded copies are still here (a later Publish uploads
+    /// them without encoding again) and as `saved` otherwise.
+    pub fn finish_unpublish(&self, id: i64) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting unpublish transaction")?;
+        let row = get_in(&tx, id)?.with_context(|| format!("clip {id} not found"))?;
+        let outputs_here = [&row.av1_path, &row.h264_path]
+            .into_iter()
+            .all(|p| p.as_deref().is_some_and(|p| Path::new(p).is_file()));
+        tx.execute(
+            "UPDATE clips SET publish = 0, remote_id = NULL, page_url = NULL, posts = NULL, \
+             status = ?2, stage = 'encode', attempts = 0, error = NULL, next_attempt_at = NULL, \
+             updated_at = ?3 WHERE id = ?1",
+            params![id, if outputs_here { "encoded" } else { "saved" }, now_rfc3339()],
+        )
+        .with_context(|| format!("unpublishing clip {id}"))?;
+        tx.commit().context("committing unpublish")?;
+        Ok(())
+    }
+
+    /// Adds guild ids to the ones the clip was published to, for the "post to more" action.
+    pub fn add_publish_guilds(&self, id: i64, guild_ids: &[String]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting guilds transaction")?;
+        let row = get_in(&tx, id)?.with_context(|| format!("clip {id} not found"))?;
+        let mut all = row.publish_guilds.unwrap_or_default();
+        for g in guild_ids {
+            if !all.contains(g) {
+                all.push(g.clone());
+            }
+        }
+        tx.execute(
+            "UPDATE clips SET publish_guilds = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&all).context("encoding guild ids")?],
+        )
+        .with_context(|| format!("adding guilds to clip {id}"))?;
+        tx.commit().context("committing guilds")?;
+        Ok(())
+    }
+
+    /// Replaces every published clip's posts cache with what the backend reported, keyed by
+    /// `remote_id`; a clip missing from the map has no live posts. Returns the ids whose cache
+    /// actually changed. `updated_at` is left alone: it keys the thumbnail cache, and a
+    /// refresh every five minutes would otherwise reload every published thumbnail.
+    pub fn replace_posts(&self, by_remote: &HashMap<String, Vec<ClipPost>>) -> Result<Vec<i64>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting posts transaction")?;
+        let current: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, remote_id, posts FROM clips WHERE remote_id IS NOT NULL OR posts IS NOT NULL")
+                .context("preparing posts read")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .context("reading posts")?
+                .collect::<rusqlite::Result<_>>()
+                .context("reading posts")?;
+            rows
+        };
+        let mut changed = Vec::new();
+        for (id, remote_id, posts) in current {
+            let wanted = remote_id
+                .as_ref()
+                .and_then(|r| by_remote.get(r))
+                .filter(|p| !p.is_empty())
+                .map(serde_json::to_string)
+                .transpose()
+                .context("encoding posts")?;
+            let have = posts
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<ClipPost>>(json).ok())
+                .filter(|p| !p.is_empty())
+                .map(|p| serde_json::to_string(&p))
+                .transpose()
+                .context("encoding posts")?;
+            if wanted != have {
+                tx.execute("UPDATE clips SET posts = ?2 WHERE id = ?1", params![id, wanted])
+                    .with_context(|| format!("caching posts of clip {id}"))?;
+                changed.push(id);
+            }
+        }
+        tx.commit().context("committing posts")?;
+        Ok(changed)
+    }
+
+    /// A new range on the recording a local clip already has. The encoded copies (a clip from
+    /// before publish on demand may have some) no longer match it, so their paths are
+    /// forgotten and the row goes back to `saved`; the caller deletes the files. The length
+    /// becomes the range's, since nothing will encode it and report one.
+    pub fn set_local_cut(&self, id: i64, cut: Option<&[Segment]>, duration_ms: i64) -> Result<()> {
+        let json = cut.map(serde_json::to_string).transpose().context("encoding cut")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting cut transaction")?;
+        let row = get_in(&tx, id)?.with_context(|| format!("clip {id} not found"))?;
+        if matches!(row.status, ClipStatus::Encoding | ClipStatus::Uploading) {
+            bail!("this clip is busy right now; wait for the current job to finish");
+        }
+        if row.publish || row.remote_id.is_some() {
+            bail!("a published clip is re-encoded, not cut in place");
+        }
+        tx.execute(
+            "UPDATE clips SET cut = ?2, duration_ms = ?3, av1_path = NULL, h264_path = NULL, \
+             size_av1 = NULL, size_h264 = NULL, status = 'saved', stage = 'encode', attempts = 0, \
+             error = NULL, next_attempt_at = NULL, updated_at = ?4 WHERE id = ?1",
+            params![id, json, duration_ms, now_rfc3339()],
+        )
+        .with_context(|| format!("cutting clip {id}"))?;
+        tx.commit().context("committing cut")?;
+        Ok(())
+    }
+
+    /// Points a clip at a new recording (see `Rebased`) and sends it back to `saved`. The old
+    /// outputs belong to the old file's name, so their paths are forgotten; the caller deletes
+    /// the files. A published clip is then encoded and replaced on the site by
+    /// the worker; a local one just rests with its new range.
+    pub fn rebase(&self, id: i64, new: &Rebased) -> Result<()> {
+        let json = new
+            .cut
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding cut")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("starting rebase transaction")?;
+        let status: Option<String> = tx
+            .query_row("SELECT status FROM clips WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .with_context(|| format!("reading clip {id}"))?;
+        match status.as_deref() {
+            None => bail!("clip {id} not found"),
+            Some("encoding") | Some("uploading") => {
+                bail!("this clip is busy right now; wait for the current job to finish")
+            }
+            Some(_) => {}
+        }
+        tx.execute(
+            "UPDATE clips SET source_path = ?2, captured_at = ?3, cut = ?4, duration_ms = ?5, \
+             size_source = ?6, width = ?7, height = ?8, fps = ?9, av1_path = NULL, h264_path = NULL, \
+             size_av1 = NULL, size_h264 = NULL, thumb_path = ?11, status = 'saved', stage = 'encode', \
+             attempts = 0, error = NULL, next_attempt_at = NULL, updated_at = ?10 WHERE id = ?1",
+            params![
+                id,
+                new.source_path,
+                new.captured_at,
+                json,
+                new.duration_ms,
+                new.size_source,
+                new.width,
+                new.height,
+                new.fps,
+                now_rfc3339(),
+                new.thumb_path,
+            ],
+        )
+        .with_context(|| format!("pointing clip {id} at {}", new.source_path))?;
+        tx.commit().context("committing rebase")?;
         Ok(())
     }
 
@@ -524,7 +862,8 @@ impl Queue {
         Ok(())
     }
 
-    /// Atomically picks the oldest runnable encode job and marks it `encoding`.
+    /// Atomically picks the oldest runnable encode job and marks it `encoding`. Only clips the
+    /// user published: a local clip is never encoded.
     fn claim_next(&self) -> Result<Option<ClipRow>> {
         let now = now_rfc3339();
         let mut conn = self.lock();
@@ -532,10 +871,10 @@ impl Queue {
         let row = tx
             .query_row(
                 &format!(
-                    "SELECT {COLUMNS} FROM clips WHERE \
+                    "SELECT {COLUMNS} FROM clips WHERE publish = 1 AND ( \
                      (status = 'saved' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)) \
                      OR (status = 'failed' AND stage = 'encode' AND attempts < ?2 \
-                         AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) \
+                         AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1)) \
                      ORDER BY id ASC LIMIT 1"
                 ),
                 params![now, MAX_ATTEMPTS],
@@ -558,15 +897,15 @@ impl Queue {
         Ok(Some(row))
     }
 
-    /// The oldest `encoded` row, or an upload failure whose retry time has passed. Does not
-    /// claim it; call `mark_uploading` next.
+    /// The oldest published `encoded` row, or an upload failure whose retry time has passed.
+    /// Does not claim it; call `mark_uploading` next. An `encoded` local clip stays put.
     pub fn next_uploadable(&self) -> Result<Option<ClipRow>> {
         let conn = self.lock();
         conn.query_row(
             &format!(
-                "SELECT {COLUMNS} FROM clips WHERE status = 'encoded' \
+                "SELECT {COLUMNS} FROM clips WHERE publish = 1 AND (status = 'encoded' \
                  OR (status = 'failed' AND stage = 'upload' AND attempts < ?2 \
-                     AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) \
+                     AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1)) \
                  ORDER BY id ASC LIMIT 1"
             ),
             params![now_rfc3339(), MAX_ATTEMPTS],
@@ -699,6 +1038,57 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Version 6: clips publish on demand. Runs once, on the open that brings a database up to 6,
+/// and is idempotent should it run twice. Nothing is deleted and nothing is re-encoded.
+///
+/// - A clip the site already has was, in effect, published: `publish = 1`, so a re-edit still
+///   replaces it and a queued replace still runs. Every other clip becomes local, including
+///   ones that were waiting to encode or had encoded but not uploaded; they stay that way
+///   until someone presses Publish.
+/// - `captured_at` is a best guess, since nothing recorded it: the replay buffer saved the
+///   clip a moment before `recorded_at` was taken, so the recording started about its own
+///   length earlier. The length of the recording is the row's duration, or the end of its cut
+///   when the duration is already the cut length. Clips taken from a match before this build
+///   stamped `recorded_at` at the clip's start rather than the file's end, so they land up to
+///   a recording's length early; that is the "best effort".
+fn migrate_to_publish_on_demand(conn: &Connection) -> Result<()> {
+    let published = conn
+        .execute("UPDATE clips SET publish = 1 WHERE remote_id IS NOT NULL", [])
+        .context("marking uploaded clips published")?;
+    let rows: Vec<(i64, String, i64, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, recorded_at, duration_ms, cut FROM clips WHERE captured_at IS NULL")
+            .context("reading clips to place")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .context("reading clips to place")?
+            .collect::<rusqlite::Result<_>>()
+            .context("reading clips to place")?;
+        rows
+    };
+    let mut placed = 0;
+    for (id, recorded_at, duration_ms, cut) in rows {
+        let Ok(recorded) = DateTime::parse_from_rfc3339(&recorded_at) else {
+            continue;
+        };
+        let cut_end = cut
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<Segment>>(json).ok())
+            .and_then(|segments| segments.last().map(|s| s.end_ms))
+            .unwrap_or(0);
+        let length = duration_ms.max(cut_end).max(0);
+        let captured = recorded.with_timezone(&Utc) - chrono::Duration::milliseconds(length);
+        conn.execute(
+            "UPDATE clips SET captured_at = ?2 WHERE id = ?1",
+            params![id, format_rfc3339(captured)],
+        )
+        .with_context(|| format!("placing clip {id}"))?;
+        placed += 1;
+    }
+    log::info!("clip queue: publish on demand; {published} uploaded clip(s) kept published, {placed} placed in time");
+    Ok(())
+}
+
 fn get_in(conn: &Connection, id: i64) -> Result<Option<ClipRow>> {
     conn.query_row(
         &format!("SELECT {COLUMNS} FROM clips WHERE id = ?1"),
@@ -735,6 +1125,14 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         .get::<_, Option<String>>(23)?
         .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
         .filter(|ids| !ids.is_empty());
+    // Both are caches of choices made elsewhere, so junk reads as nothing rather than failing.
+    let publish_guilds = r
+        .get::<_, Option<String>>(25)?
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+    let posts = r
+        .get::<_, Option<String>>(28)?
+        .and_then(|json| serde_json::from_str::<Vec<ClipPost>>(&json).ok())
+        .unwrap_or_default();
     Ok(ClipRow {
         id: r.get(0)?,
         source_path: r.get(1)?,
@@ -766,6 +1164,11 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         cut,
         participants,
         updated_at: r.get(22)?,
+        publish: r.get::<_, i64>(24)? != 0,
+        publish_guilds,
+        publish_title: r.get(26)?,
+        captured_at: r.get(27)?,
+        posts,
     })
 }
 
@@ -824,7 +1227,7 @@ impl Worker {
 /// Starts the worker thread. It polls every few seconds and whenever woken. Encode jobs first:
 /// the oldest `saved` row whose retry time has passed is marked `encoding`, run through
 /// `processor`, then marked `encoded` or `failed` (with backoff). Then upload jobs, when an
-/// `uploader` is given and `upload_gate` is open (logged in, auto-upload on): `encoded` rows go
+/// `uploader` is given and `upload_gate` is open (logged in): `encoded` rows go
 /// `uploading` -> `done` or `failed`. Each gate is checked before every job.
 pub fn start_worker(
     queue: Arc<Queue>,
@@ -992,7 +1395,15 @@ mod tests {
             fps: 60.0,
             size_source: 12_345,
             participants: None,
+            captured_at: None,
         }
+    }
+
+    /// A clip the user pressed Publish on, which is the only kind the worker touches.
+    fn published(q: &Queue, name: &str) -> i64 {
+        let id = q.enqueue(clip(name, "2026-09-10T10:00:00.000Z")).unwrap();
+        q.publish(id, None, None, &[]).unwrap();
+        id
     }
 
     fn wait_until(queue: &Queue, id: i64, pred: impl Fn(&ClipRow) -> bool) -> ClipRow {
@@ -1058,7 +1469,7 @@ mod tests {
         assert_eq!(q.get(id).unwrap().unwrap().duration_ms, 7_000);
 
         // Baked from a copy: the cut is consumed.
-        q.clear_cut(id).unwrap();
+        q.bake_cut(id, 0).unwrap();
         assert_eq!(q.get(id).unwrap().unwrap().cut, None);
 
         // Back to the whole recording is a re-encode too.
@@ -1164,7 +1575,7 @@ mod tests {
         };
         let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), on_change, None, Arc::new(|| false));
 
-        let id = q.enqueue(clip("w", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "w");
         worker.wake();
 
         let failed = wait_until(&q, id, |r| r.status == ClipStatus::Failed);
@@ -1196,7 +1607,7 @@ mod tests {
             })
         };
         let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change(), None, Arc::new(|| false));
-        let id = q.enqueue(clip("p", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "p");
         worker.wake();
         let failed = wait_until(&q, id, |r| r.status == ClipStatus::Failed);
         assert_eq!(failed.error.as_deref(), Some("processor panicked: kaboom"));
@@ -1215,7 +1626,7 @@ mod tests {
             })
         };
         let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| false), noop_change(), None, Arc::new(|| false));
-        let id = q.enqueue(clip("g", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "g");
         worker.wake();
         std::thread::sleep(POLL_INTERVAL * 6);
         assert_eq!(q.get(id).unwrap().unwrap().status, ClipStatus::Saved);
@@ -1234,7 +1645,7 @@ mod tests {
             })
         };
         let worker = start_worker(Arc::clone(&q), processor, Arc::new(|| true), noop_change(), None, Arc::new(|| false));
-        let id = q.enqueue(clip("m", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "m");
         worker.wake();
 
         let exhausted = wait_until(&q, id, |r| r.attempts >= MAX_ATTEMPTS);
@@ -1305,7 +1716,7 @@ mod tests {
             Some(uploader),
             Arc::new(|| true),
         );
-        let id = q.enqueue(clip("u", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "u");
         worker.wake();
         let done = wait_until(&q, id, |r| r.status == ClipStatus::Done);
         assert_eq!(done.remote_id.as_deref(), Some("abc123"));
@@ -1339,7 +1750,7 @@ mod tests {
             Some(uploader),
             Arc::new(|| true),
         );
-        let id = q.enqueue(clip("f", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "f");
         worker.wake();
 
         let failed = wait_until(&q, id, |r| r.status == ClipStatus::Failed);
@@ -1381,7 +1792,7 @@ mod tests {
             Some(uploader),
             Arc::new(|| true),
         );
-        let id = q.enqueue(clip("r", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "r");
         worker.wake();
 
         let parked = wait_until(&q, id, |r| r.status == ClipStatus::Failed && r.attempts > 0);
@@ -1425,7 +1836,7 @@ mod tests {
             Some(uploader),
             Arc::new(|| true),
         );
-        let id = q.enqueue(clip("e", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "e");
         worker.wake();
         let exhausted = wait_until(&q, id, |r| r.attempts >= MAX_ATTEMPTS);
         assert_eq!(exhausted.status, ClipStatus::Failed);
@@ -1469,7 +1880,7 @@ mod tests {
             Some(uploader),
             upload_gate,
         );
-        let id = q.enqueue(clip("g", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "g");
         worker.wake();
         wait_until(&q, id, |r| r.status == ClipStatus::Encoded);
         std::thread::sleep(POLL_INTERVAL * 6);
@@ -1494,7 +1905,7 @@ mod tests {
             None,
             Arc::new(|| true),
         );
-        let id = q.enqueue(clip("n", "2026-09-10T10:00:00.000Z")).unwrap();
+        let id = published(&q, "n");
         worker.wake();
         wait_until(&q, id, |r| r.status == ClipStatus::Encoded);
         std::thread::sleep(POLL_INTERVAL * 4);
@@ -1529,6 +1940,12 @@ mod tests {
         assert_eq!(row.fps, None, "a row that predates the column has no frame rate");
         assert_eq!(row.cut, None, "and no cut");
         assert_eq!(row.participants, None, "and nobody in voice");
+        assert!(!row.publish, "never uploaded, so it is a local clip now");
+        assert_eq!(
+            row.captured_at.as_deref(),
+            Some("2025-12-31T23:59:59.000Z"),
+            "placed its own length before it was recorded"
+        );
         let version: i32 = q
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1660,5 +2077,345 @@ mod tests {
         // An empty cut is the whole recording, stored as no cut.
         let whole = q.enqueue_with_cut(clip("whole", "2026-09-13T21:00:01.000Z"), &[]).unwrap();
         assert_eq!(q.get(whole).unwrap().unwrap().cut, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish on demand
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cos-nostra-queue-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Outputs that really exist, for the paths that check.
+    fn real_outputs(dir: &Path, stem: &str) -> Outputs {
+        let file = |ext: &str| {
+            let p = dir.join(format!("{stem}.{ext}"));
+            std::fs::write(&p, b"x").unwrap();
+            p.display().to_string()
+        };
+        Outputs {
+            av1_path: file("av1.mp4"),
+            h264_path: file("h264.mp4"),
+            thumb_path: file("jpg"),
+            size_av1: 1,
+            size_h264: 1,
+            duration_ms: None,
+        }
+    }
+
+    /// A database from the build before publish on demand: an uploaded clip stays published
+    /// (so a re-edit still replaces it), everything else becomes local, and every clip gets a
+    /// best-guess place in time. Nothing else about any row moves.
+    #[test]
+    fn a_v5_database_migrates_to_publish_on_demand() {
+        let path = temp_db();
+        let (uploaded, trimmed, encoded, replacing, offset) = {
+            let q = Queue::open(&path).unwrap();
+            let uploaded = q.enqueue(clip("uploaded", "2026-09-10T10:00:30.000Z")).unwrap();
+            q.mark_encoded(uploaded, &outputs()).unwrap();
+            q.mark_uploading(uploaded).unwrap();
+            q.mark_done(uploaded, "r1", "https://x/c/r1").unwrap();
+            let cut = [seg(2_000, 9_500)];
+            let trimmed = q
+                .enqueue_with_cut(NewClip { duration_ms: 7_500, ..clip("trimmed", "2026-09-10T10:05:00.000Z") }, &cut)
+                .unwrap();
+            let encoded = q.enqueue(clip("encoded", "2026-09-10T10:10:00.000Z")).unwrap();
+            q.mark_encoded(encoded, &outputs()).unwrap();
+            // A re-edit of an uploaded clip, queued when the old app closed.
+            let replacing = q.enqueue(clip("replacing", "2026-09-10T10:20:00.000Z")).unwrap();
+            q.mark_done(replacing, "r2", "https://x/c/r2").unwrap();
+            q.request_reencode(replacing, Some(&cut)).unwrap();
+            // Written by an app that stamped local time with an offset.
+            let offset = q.enqueue(clip("offset", "2026-09-10T12:00:30+02:00")).unwrap();
+
+            let conn = q.lock();
+            for column in ["publish", "publish_guilds", "publish_title", "captured_at", "posts"] {
+                conn.execute(&format!("ALTER TABLE clips DROP COLUMN {column}"), []).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            (uploaded, trimmed, encoded, replacing, offset)
+        };
+
+        let q = Queue::open(&path).unwrap();
+        let row = |id| q.get(id).unwrap().unwrap();
+        let version: i32 = q.lock().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let up = row(uploaded);
+        assert!(up.publish, "the site has it, so it counts as published");
+        assert_eq!(up.status, ClipStatus::Done);
+        assert_eq!(up.captured_at.as_deref(), Some("2026-09-10T10:00:00.000Z"));
+        assert!(up.posts.is_empty() && up.publish_guilds.is_none() && up.publish_title.is_none());
+
+        let tr = row(trimmed);
+        assert!(!tr.publish, "waiting to encode is now a local clip");
+        assert_eq!(tr.status, ClipStatus::Saved);
+        assert_eq!(tr.cut.as_deref(), Some(&[seg(2_000, 9_500)][..]), "the cut is untouched");
+        assert_eq!(
+            tr.captured_at.as_deref(),
+            Some("2026-09-10T10:04:50.500Z"),
+            "the recording is as long as the cut's end, not the kept length"
+        );
+
+        let en = row(encoded);
+        assert!(!en.publish);
+        assert_eq!(en.status, ClipStatus::Encoded, "encoded but never uploaded stays encoded");
+        assert_eq!(en.av1_path.as_deref(), Some("a.mp4"), "its outputs are kept");
+
+        let re = row(replacing);
+        assert!(re.publish, "a queued replace still runs");
+        assert_eq!(re.status, ClipStatus::Saved);
+
+        assert_eq!(row(offset).captured_at.as_deref(), Some("2026-09-10T10:00:00.000Z"));
+
+        // The worker agrees: the only runnable job is the replace.
+        assert_eq!(q.claim_next().unwrap().map(|r| r.id), Some(replacing));
+        assert!(q.next_uploadable().unwrap().is_none(), "the encoded local clip is not uploaded");
+
+        // Opening again is a no-op.
+        drop(q);
+        let q = Queue::open(&path).unwrap();
+        assert_eq!(q.get(trimmed).unwrap().unwrap().captured_at.as_deref(), Some("2026-09-10T10:04:50.500Z"));
+    }
+
+    /// The whole point of the change: with both gates open and a worker running, a clip nobody
+    /// published is neither encoded nor uploaded, however long it waits. Publishing an old
+    /// encoded clip uploads it without encoding it again.
+    #[test]
+    fn local_clips_are_never_encoded_or_uploaded() {
+        let dir = scratch_dir("gating");
+        let q = Arc::new(Queue::open(&temp_db()).unwrap());
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let processor: Processor = {
+            let encodes = Arc::clone(&encodes);
+            Arc::new(move |_row| {
+                encodes.fetch_add(1, Ordering::SeqCst);
+                Ok(outputs())
+            })
+        };
+        let uploader: Uploader = {
+            let uploads = Arc::clone(&uploads);
+            Arc::new(move |_row| {
+                uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(upload_result())
+            })
+        };
+        let worker = start_worker(
+            Arc::clone(&q),
+            processor,
+            Arc::new(|| true),
+            noop_change(),
+            Some(uploader),
+            Arc::new(|| true),
+        );
+
+        let local = q.enqueue(clip("local", "2026-09-10T10:00:00.000Z")).unwrap();
+        let old = q.enqueue(clip("old", "2026-09-10T10:00:01.000Z")).unwrap();
+        q.mark_encoded(old, &real_outputs(&dir, "old")).unwrap();
+        worker.wake();
+        std::thread::sleep(POLL_INTERVAL * 6);
+        assert_eq!(q.get(local).unwrap().unwrap().status, ClipStatus::Saved);
+        assert_eq!(q.get(old).unwrap().unwrap().status, ClipStatus::Encoded);
+        assert_eq!(encodes.load(Ordering::SeqCst), 0, "nothing local was encoded");
+        assert_eq!(uploads.load(Ordering::SeqCst), 0, "nothing local was uploaded");
+
+        // Publishing the old encoded clip goes straight to the upload.
+        q.publish(old, Some("ace"), Some("Valorant"), &["123".to_string()]).unwrap();
+        worker.wake();
+        let done = wait_until(&q, old, |r| r.status == ClipStatus::Done);
+        assert_eq!(encodes.load(Ordering::SeqCst), 0, "its outputs were still good");
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(done.publish_title.as_deref(), Some("ace"));
+        assert_eq!(done.game.as_deref(), Some("Valorant"));
+        assert_eq!(done.publish_guilds, Some(vec!["123".to_string()]));
+
+        // And a fresh one runs the whole way.
+        q.publish(local, None, None, &[]).unwrap();
+        worker.wake();
+        wait_until(&q, local, |r| r.status == ClipStatus::Done);
+        assert_eq!(encodes.load(Ordering::SeqCst), 1);
+        assert_eq!(uploads.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publishing_restarts_a_failed_clip_and_refuses_a_published_one() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let id = q.enqueue(clip("f", "2026-09-10T10:00:00.000Z")).unwrap();
+        q.mark_failed(id, "ffmpeg exploded").unwrap();
+        // Outputs that are not on disk: an upload failure with nothing to upload encodes again.
+        let up = q.enqueue(clip("u", "2026-09-10T10:00:01.000Z")).unwrap();
+        q.mark_encoded(up, &outputs()).unwrap();
+        q.mark_upload_failed(up, "offline").unwrap();
+
+        q.publish(id, None, None, &[]).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert!(row.publish);
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!((row.attempts, row.error.as_deref()), (0, None));
+        assert_eq!(row.publish_guilds, Some(vec![]), "no server is a choice too: web page only");
+
+        q.publish(up, None, None, &[]).unwrap();
+        let row = q.get(up).unwrap().unwrap();
+        assert_eq!((row.status, row.stage), (ClipStatus::Saved, Stage::Encode));
+
+        q.mark_done(id, "r1", "https://x/c/r1").unwrap();
+        assert!(q.publish(id, None, None, &[]).is_err(), "published once is published");
+        assert!(q.publish(9999, None, None, &[]).is_err());
+    }
+
+    /// Unpublish keeps every file and turns the clip back into a local one, resting as
+    /// `encoded` when both copies are still here (so publishing again skips the encode) and as
+    /// `saved` when they are not. The two halves let a failed backend call put things back.
+    #[test]
+    fn unpublishing_makes_a_clip_local_again() {
+        let dir = scratch_dir("unpublish");
+        let q = Queue::open(&temp_db()).unwrap();
+        let post = ClipPost {
+            guild_id: "1".into(),
+            name: Some("Cos Nostra".into()),
+            icon_url: None,
+            message_url: "https://discord.com/channels/1/2/3".into(),
+            posted_at: "2026-09-13T20:00:00.000Z".into(),
+        };
+
+        let kept = published(&q, "kept");
+        q.mark_encoded(kept, &real_outputs(&dir, "kept")).unwrap();
+        q.mark_uploading(kept).unwrap();
+        q.mark_done(kept, "r1", "https://x/c/r1").unwrap();
+        q.replace_posts(&HashMap::from([("r1".to_string(), vec![post.clone()])])).unwrap();
+        assert_eq!(q.get(kept).unwrap().unwrap().posts, vec![post]);
+
+        let held = q.begin_unpublish(kept).unwrap();
+        assert_eq!(held.remote_id.as_deref(), Some("r1"), "the caller gets the id to delete");
+        assert!(!q.get(kept).unwrap().unwrap().publish, "the worker lets go first");
+        // The backend said no: everything is as it was.
+        q.restore_publish(kept, held.publish).unwrap();
+        assert!(q.get(kept).unwrap().unwrap().publish);
+
+        q.begin_unpublish(kept).unwrap();
+        q.finish_unpublish(kept).unwrap();
+        let row = q.get(kept).unwrap().unwrap();
+        assert!(!row.publish);
+        assert_eq!((row.remote_id, row.page_url), (None, None));
+        assert!(row.posts.is_empty());
+        assert_eq!(row.status, ClipStatus::Encoded);
+        assert!(Path::new(row.av1_path.as_deref().unwrap()).is_file(), "files stay");
+        assert!(q.next_uploadable().unwrap().is_none(), "and nothing uploads it again");
+
+        // A clip whose local video was released is only on the site: unpublishing would lose it.
+        let released = published(&q, "released");
+        q.mark_encoded(released, &outputs()).unwrap();
+        q.mark_done(released, "r2", "https://x/c/r2").unwrap();
+        q.clear_local_video(released).unwrap();
+        assert!(q.begin_unpublish(released).is_err(), "the last copy is not unpublished away");
+        let row = q.get(released).unwrap().unwrap();
+        assert!(row.publish && row.remote_id.as_deref() == Some("r2"), "nothing changed");
+
+        // With its recording still here it rests on that, as `saved`.
+        let recorded = published(&q, "recorded");
+        let recording = dir.join("recorded.mp4");
+        std::fs::write(&recording, b"video").unwrap();
+        q.lock()
+            .execute("UPDATE clips SET source_path = ?2 WHERE id = ?1", params![recorded, recording.display().to_string()])
+            .unwrap();
+        q.mark_encoded(recorded, &outputs()).unwrap();
+        q.mark_done(recorded, "r3", "https://x/c/r3").unwrap();
+        q.clear_local_video(recorded).unwrap();
+        q.begin_unpublish(recorded).unwrap();
+        q.finish_unpublish(recorded).unwrap();
+        assert_eq!(q.get(recorded).unwrap().unwrap().status, ClipStatus::Saved);
+
+        for busy in ["encoding", "uploading"] {
+            q.lock()
+                .execute("UPDATE clips SET status = ?2, publish = 1 WHERE id = ?1", params![kept, busy])
+                .unwrap();
+            assert!(q.begin_unpublish(kept).is_err(), "{busy} is refused");
+            assert!(q.get(kept).unwrap().unwrap().publish, "{busy}: nothing changed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_posts_cache_follows_the_backend_without_touching_thumbnails() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let a = published(&q, "a");
+        let b = published(&q, "b");
+        let local = q.enqueue(clip("l", "2026-09-10T10:00:00.000Z")).unwrap();
+        q.mark_done(a, "ra", "https://x/c/ra").unwrap();
+        q.mark_done(b, "rb", "https://x/c/rb").unwrap();
+        let post = |guild: &str| ClipPost {
+            guild_id: guild.into(),
+            name: None,
+            icon_url: Some(format!("https://cdn.discordapp.com/icons/{guild}/x.png?size=96")),
+            message_url: format!("https://discord.com/channels/{guild}/2/3"),
+            posted_at: "2026-09-13T20:00:00.000Z".into(),
+        };
+        let before = q.get(a).unwrap().unwrap().updated_at;
+
+        let report = HashMap::from([("ra".to_string(), vec![post("1"), post("2")])]);
+        assert_eq!(q.replace_posts(&report).unwrap(), vec![a]);
+        assert_eq!(q.get(a).unwrap().unwrap().posts.len(), 2);
+        assert!(q.get(b).unwrap().unwrap().posts.is_empty());
+        assert!(q.get(local).unwrap().unwrap().posts.is_empty());
+        assert_eq!(q.get(a).unwrap().unwrap().updated_at, before, "the thumbnail cache key is left alone");
+
+        assert!(q.replace_posts(&report).unwrap().is_empty(), "the same report changes nothing");
+        // Hidden from Discord everywhere: the clip has no live posts left.
+        assert_eq!(q.replace_posts(&HashMap::new()).unwrap(), vec![a]);
+        assert!(q.get(a).unwrap().unwrap().posts.is_empty());
+    }
+
+    #[test]
+    fn a_local_cut_drops_stale_outputs_and_a_rebase_swaps_the_recording() {
+        let q = Queue::open(&temp_db()).unwrap();
+        let id = q.enqueue(clip("c", "2026-09-10T10:00:00.000Z")).unwrap();
+        q.mark_encoded(id, &outputs()).unwrap();
+
+        q.set_local_cut(id, Some(&[seg(1_000, 4_000)]), 3_000).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.status, ClipStatus::Saved);
+        assert_eq!(row.cut, Some(vec![seg(1_000, 4_000)]));
+        assert_eq!(row.duration_ms, 3_000);
+        assert_eq!((row.av1_path, row.h264_path), (None, None), "stale outputs are forgotten");
+
+        let rebased = Rebased {
+            source_path: "C:\\clips\\new.mp4".into(),
+            captured_at: "2026-09-10T09:59:50.000Z".into(),
+            cut: Some(vec![seg(3_000, 20_000)]),
+            duration_ms: 17_000,
+            size_source: 99,
+            width: 1280,
+            height: 720,
+            fps: 30.0,
+            thumb_path: Some("C:\\clips\\new.jpg".into()),
+        };
+        q.rebase(id, &rebased).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.source_path, "C:\\clips\\new.mp4");
+        assert_eq!(row.captured_at.as_deref(), Some("2026-09-10T09:59:50.000Z"));
+        assert_eq!((row.duration_ms, row.size_source, row.width), (17_000, 99, 1280));
+        assert_eq!(row.thumb_path.as_deref(), Some("C:\\clips\\new.jpg"));
+        assert!(!row.publish, "a rebase does not publish anything");
+
+        // A published clip is re-encoded instead, and nothing is cut while a job runs.
+        q.publish(id, None, None, &[]).unwrap();
+        assert!(q.set_local_cut(id, None, 17_000).is_err());
+        q.lock().execute("UPDATE clips SET status = 'encoding' WHERE id = ?1", params![id]).unwrap();
+        assert!(q.rebase(id, &rebased).is_err());
+
+        // Baking a cut into a copy moves the clip's start to where that cut began.
+        q.lock().execute("UPDATE clips SET status = 'encoded' WHERE id = ?1", params![id]).unwrap();
+        q.bake_cut(id, 3_000).unwrap();
+        let row = q.get(id).unwrap().unwrap();
+        assert_eq!(row.cut, None);
+        assert_eq!(row.captured_at.as_deref(), Some("2026-09-10T09:59:53.000Z"));
     }
 }

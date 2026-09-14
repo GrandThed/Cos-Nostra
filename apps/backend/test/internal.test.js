@@ -174,6 +174,9 @@ test('GET /internal/clips/:id for the bot', async () => {
       recordedAt: '2026-01-02T03:04:05.000Z',
       owner: { discordId: '111', username: 'ben' },
       participants: [],
+      // A seeded clip never went through the publish dialog: legacy targets, nothing posted.
+      targetGuildIds: null,
+      posts: [],
       urls: {
         h264: `http://localhost:3000/clips/${CLIP}/h264`,
         thumb: `http://localhost:3000/clips/${CLIP}/thumb`,

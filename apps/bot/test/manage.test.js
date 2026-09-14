@@ -113,9 +113,10 @@ function makeClient({ deleteError, fetchError } = {}) {
  * @param {object} [opts]
  * @param {any} [opts.clip] what getClip answers, null for a clip that is gone
  * @param {Error} [opts.deleteError] what deleteClip throws
+ * @param {Error} [opts.removePostError] what removePost throws
  */
-function makeBackend({ clip = CLIP, deleteError } = {}) {
-  const calls = { getClip: [], deleteClip: [] };
+function makeBackend({ clip = CLIP, deleteError, removePostError } = {}) {
+  const calls = { getClip: [], deleteClip: [], removePost: [] };
   return {
     calls,
     getGuild: async () => ({ guildId: 'guild-1', channelId: CHANNEL_ID, seedEmojis: [] }),
@@ -127,7 +128,17 @@ function makeBackend({ clip = CLIP, deleteError } = {}) {
       calls.deleteClip.push(clipId);
       if (deleteError) throw deleteError;
     },
+    removePost: async (messageId) => {
+      calls.removePost.push(messageId);
+      if (removePostError) throw removePostError;
+      return null;
+    },
   };
+}
+
+/** An error shaped like the shared client's ApiError, which is all manage.js looks at. */
+function apiError(status, message = `status ${status}`) {
+  return Object.assign(new Error(message), { name: 'ApiError', status });
 }
 
 function withTimeout(promise, ms, label) {
@@ -265,7 +276,39 @@ test('hide deletes the Discord message and nothing else', async () => {
 
   assert.deepEqual(client.deleted, [`${CHANNEL_ID}/${MESSAGE_ID}`]);
   assert.deepEqual(backend.calls.deleteClip, [], 'hide must never touch the clip itself');
+  // The post row is marked removed, so it stops counting as live on the desktop.
+  assert.deepEqual(backend.calls.removePost, [MESSAGE_ID]);
   assert.match(answer(interaction).content, /Oculto/i);
+});
+
+test('hide tolerates a post the backend never recorded', async () => {
+  const backend = makeBackend({ removePostError: apiError(404, 'unknown_message') });
+  const interaction = makeButton({
+    customId: `clip:hide:${CLIP_ID}:${CHANNEL_ID}:${MESSAGE_ID}`,
+  });
+  const { client, log } = await click(interaction, backend);
+
+  assert.deepEqual(client.deleted, [`${CHANNEL_ID}/${MESSAGE_ID}`]);
+  assert.deepEqual(backend.calls.removePost, [MESSAGE_ID]);
+  assert.match(answer(interaction).content, /Oculto/i);
+  assert.deepEqual(log.lines.error, []);
+  assert.deepEqual(log.lines.warn, []);
+});
+
+test('hide logs a failure to mark the post removed but still tells the user it is hidden', async () => {
+  const backend = makeBackend({ removePostError: apiError(503, 'backend is redeploying') });
+  const interaction = makeButton({
+    customId: `clip:hide:${CLIP_ID}:${CHANNEL_ID}:${MESSAGE_ID}`,
+  });
+  const { client, log } = await click(interaction, backend);
+
+  // The message is gone either way, which is what was asked for.
+  assert.deepEqual(client.deleted, [`${CHANNEL_ID}/${MESSAGE_ID}`]);
+  const payload = answer(interaction);
+  assert.match(payload.content, /Oculto/i);
+  assert.equal(log.lines.error.length, 1);
+  assert.match(log.lines.error[0], /status 503/);
+  assert.match(log.lines.error[0], new RegExp(MESSAGE_ID));
 });
 
 test('hide is refused for someone who may not manage the clip', async () => {
@@ -346,6 +389,8 @@ test('confirming deletes the clip everywhere and takes the message down with it'
 
   assert.deepEqual(backend.calls.deleteClip, [CLIP_ID]);
   assert.deepEqual(client.deleted, [`${CHANNEL_ID}/${MESSAGE_ID}`]);
+  // The backend's purge marks every post removed itself; a separate call would only 404.
+  assert.deepEqual(backend.calls.removePost, []);
   const payload = answer(interaction);
   assert.match(payload.content, /borrado/i);
   assert.deepEqual(payload.components, []);

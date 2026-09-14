@@ -1,12 +1,13 @@
-/** The cut editor: the clip above a timeline with in and out handles on every kept part.
+/** The range editor: one kept range, with a start and an end handle, over the match the clip
+ *  was taken in (or over the clip's own recording when that match is gone).
  *
- *  A cut is a list of kept ranges of the recording. While the original recording is still on
- *  disk it costs nothing to change: the worker re-encodes both outputs from the recording, and
- *  opening the editor again shows the whole recording with the cut drawn on it. Once the
- *  recording is gone the encoded copy is what gets cut, for good, and the rail says so.
+ *  On a match the handles can go past the footage the clip already has, which is drawn as a
+ *  band under the filmstrip; Apply then copies the wider range out of the match. Whether that
+ *  happens, whether anything is encoded and whether a published clip is replaced are all
+ *  decided in Rust (`edit::apply`); the editor only says which range and on which file.
  *
- *  The keys are the ones every clip trimmer shares: I and O set the in and out point of the
- *  part under the playhead, S splits it, Delete drops it, Ctrl+Z undoes, Ctrl+Enter applies. */
+ *  The keys are the ones every clip trimmer shares: I and O set the start and end at the
+ *  playhead, [ and ] jump between the edges, Ctrl+Z undoes, Ctrl+Enter applies. */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { gameLabel } from "./clips";
@@ -22,15 +23,21 @@ import type { ClipRow, EditSource, Segment } from "./types";
 /** Matches `ffmpeg::MIN_SEGMENT_MS`. */
 const MIN_MS = 100;
 const FALLBACK_FPS = 60;
-const MAX_ZOOM = 12;
+/** Each zoom step multiplies or divides by this. */
+const ZOOM_STEP = 1.5;
+/** A match is long, so the deepest zoom depends on it: about 5 s across the view at most. */
+const MIN_MAX_ZOOM = 12;
+const MAX_MAX_ZOOM = 600;
 /** Filmstrip thumbnails: CSS height, and how many the strip will draw at most. */
 const FILM_HEIGHT = 56;
-const MAX_THUMBS = 160;
+const MAX_THUMBS = 60;
+/** The timeline's side padding (editor.css), which scrolling counts and the track does not. */
+const TRACK_PAD = 6;
 const HISTORY = 100;
-/** How far into a removed range playback may drift before it is jumped. */
-const GAP_SLACK_MS = 15;
+/** How close to the end of the range playback may get before it counts as there. */
+const END_SLACK_MS = 15;
 
-type Drag = { kind: "handle"; seg: number; edge: "in" | "out"; moved: boolean } | { kind: "scrub" };
+type Drag = { kind: "handle"; edge: "in" | "out"; moved: boolean } | { kind: "scrub" };
 
 interface Editor {
   id: number;
@@ -41,15 +48,17 @@ interface Editor {
   film: HTMLVideoElement;
   durationMs: number;
   fps: number;
-  segments: Segment[];
-  /** The segments the editor opened with, for the dirty check. */
-  initial: string;
-  selected: number | null;
-  past: Segment[][];
-  future: Segment[][];
+  range: Segment;
+  /** The range the editor opened with, for the dirty check and Reset. */
+  initial: Segment;
+  past: Segment[];
+  future: Segment[];
   zoom: number;
-  skipGaps: boolean;
+  maxZoom: number;
   drag: Drag | null;
+  /** Playback that started inside the range stops (or loops) at its end; playback started
+   *  outside it is looking around the match and runs on. */
+  playingRange: boolean;
   filmGen: number;
   filmTimer: number;
   raf: number;
@@ -59,8 +68,10 @@ interface Editor {
   track: HTMLElement;
   ruler: HTMLElement;
   filmCanvas: HTMLCanvasElement;
-  gaps: HTMLElement;
-  parts: HTMLElement;
+  before: HTMLElement;
+  after: HTMLElement;
+  part: HTMLElement;
+  partLen: HTMLElement;
   playhead: HTMLElement;
   time: HTMLElement;
   playButton: HTMLElement;
@@ -68,7 +79,7 @@ interface Editor {
   inField: HTMLInputElement;
   outField: HTMLInputElement;
   summary: HTMLElement;
-  partList: HTMLElement;
+  beyond: HTMLElement;
   undoButton: HTMLButtonElement;
   redoButton: HTMLButtonElement;
   applyButton: HTMLButtonElement;
@@ -135,11 +146,19 @@ export function unmountEditor(): void {
 
 function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   const url = convertFileSrc(source.path);
-  const video = h("video", { preload: "auto", playsinline: true, src: url }) as HTMLVideoElement;
-  const film = h("video", { preload: "auto", muted: true, src: url }) as HTMLVideoElement;
-  const segments: Segment[] = source.cut?.length
-    ? source.cut.map((s) => ({ ...s }))
-    : [{ start_ms: 0, end_ms: source.duration_ms }];
+  // A match file is gigabytes; let the decoder fetch what it needs rather than buffer ahead.
+  const preload = source.kind === "match" ? "metadata" : "auto";
+  const video = h("video", { preload, playsinline: true, src: url }) as HTMLVideoElement;
+  const film = h("video", { preload: "metadata", muted: true, src: url }) as HTMLVideoElement;
+  const durationMs = Math.max(source.duration_ms, MIN_MS);
+  const range = {
+    start_ms: clamp(source.range.start_ms, 0, durationMs - MIN_MS),
+    end_ms: clamp(source.range.end_ms, MIN_MS, durationMs),
+  };
+  if (range.end_ms - range.start_ms < MIN_MS) range.end_ms = Math.min(durationMs, range.start_ms + MIN_MS);
+  const published = clip.remote_id !== null || clip.publish;
+  // Cutting the only copy of a clip earns the second click every destructive action gets.
+  const permanent = source.kind === "clip" && !source.original;
 
   const playButton = h("button", {
     class: "play",
@@ -150,16 +169,36 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   const time = h("span", { class: "time" });
   const ruler = h("div", { class: "ruler" });
   const filmCanvas = h("canvas", { class: "film" }) as HTMLCanvasElement;
-  const gaps = h("div", { class: "gaps" });
-  const parts = h("div", { class: "parts" });
+  const footage = source.clip_span
+    ? h("div", {
+        class: "footage",
+        style: `left:${(source.clip_span.start_ms / durationMs) * 100}%;width:${
+          ((source.clip_span.end_ms - source.clip_span.start_ms) / durationMs) * 100
+        }%`,
+        title: t("editor.footageTitle", {
+          in: fmtPrecise(source.clip_span.start_ms),
+          out: fmtPrecise(source.clip_span.end_ms),
+        }),
+      })
+    : null;
+  const before = h("div", { class: "outside" });
+  const after = h("div", { class: "outside" });
+  const partLen = h("span", { class: "len" });
+  const part = h(
+    "div",
+    { class: "part selected" },
+    h("span", { class: "handle in", "data-edge": "in", title: t("editor.dragStart") }),
+    partLen,
+    h("span", { class: "handle out", "data-edge": "out", title: t("editor.dragEnd") }),
+  );
   const playhead = h("div", { class: "playhead" }, h("span", { class: "head" }));
-  const track = h("div", { class: "track" }, ruler, filmCanvas, gaps, parts, playhead);
+  const track = h("div", { class: "track" }, ruler, filmCanvas, before, after, footage, part, playhead);
   const timeline = h("div", { class: "timeline" }, track);
   const zoomLabel = h("span", { class: "zoom-level", text: "1×" });
   const inField = timeField(t("editor.inField"));
   const outField = timeField(t("editor.outField"));
   const summary = h("div", { class: "summary" });
-  const partList = h("div", { class: "part-list" });
+  const beyond = h("span", { class: "note beyond", text: t("editor.beyond"), hidden: true });
   const message = h("div", { class: "rail-msg" });
 
   const undoButton = h("button", {
@@ -177,18 +216,16 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     onclick: () => redo(),
   }) as HTMLButtonElement;
 
-  // Applying on the original is reversible, so one click. On the encoded copy it is the
-  // only copy being cut, which earns the same second click every destructive action gets.
   const applyButton = h("button", {
     type: "button",
-    class: source.original ? "btn primary" : "btn warn",
+    class: permanent ? "btn warn" : "btn primary",
     title: t("editor.applyTitle"),
   }) as HTMLButtonElement;
-  if (source.original) {
+  if (permanent) {
+    confirming(applyButton, t("editor.applyArm"), t("editor.applyConfirm"), () => void apply());
+  } else {
     applyButton.textContent = t("editor.apply");
     applyButton.addEventListener("click", () => void apply());
-  } else {
-    confirming(applyButton, t("editor.applyArm"), t("editor.applyConfirm"), () => void apply());
   }
   const cancelButton = confirming(
     h("button", { type: "button", class: "btn" }) as HTMLButtonElement,
@@ -203,6 +240,17 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     h("span", { text: "▶" }),
   );
 
+  const note =
+    source.kind === "match"
+      ? published
+        ? t("editor.noteMatchPublished")
+        : t("editor.noteMatchLocal")
+      : !source.original
+        ? t("editor.noteEncoded")
+        : published
+          ? t("editor.notePublished")
+          : t("editor.noteLocal");
+
   const page = h(
     "div",
     { class: "player editor", style: `--hue:${hueFor(clip.id)}` },
@@ -216,15 +264,24 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
         h("b", { text: gameLabel(clip.game) }),
         ` / ${fmtWhen(clip.recorded_at)}`,
       ),
-      h("span", { class: "mode", text: t("editor.mode") }),
+      h("span", {
+        class: "mode",
+        text: source.kind === "match" ? t("editor.modeMatch") : t("editor.mode"),
+      }),
       h("span", { class: "grow" }),
-      h("div", { class: "steps" }, undoButton, redoButton, h("button", {
-        type: "button",
-        class: "btn small",
-        text: t("editor.reset"),
-        title: t("editor.resetTitle"),
-        onclick: () => reset(),
-      })),
+      h(
+        "div",
+        { class: "steps" },
+        undoButton,
+        redoButton,
+        h("button", {
+          type: "button",
+          class: "btn small",
+          text: t("editor.reset"),
+          title: t("editor.resetTitle"),
+          onclick: () => reset(),
+        }),
+      ),
     ),
     h(
       "div",
@@ -243,19 +300,6 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
             time,
             frameStep(video, { fps: source.fps || clip.fps }),
             h("span", { class: "grow" }),
-            h("button", {
-              type: "button",
-              class: "loop skip",
-              text: t("editor.skipRemoved"),
-              title: t("editor.skipRemovedTitle"),
-              "aria-pressed": "true",
-              onclick: (e: Event) => {
-                const button = e.currentTarget as HTMLElement;
-                if (!live) return;
-                live.skipGaps = !live.skipGaps;
-                button.setAttribute("aria-pressed", String(live.skipGaps));
-              },
-            }),
             loopToggle(video),
             volume(video),
             h(
@@ -284,20 +328,6 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
               title: t("editor.setOutTitle"),
               onclick: () => setOut(),
             }),
-            h("button", {
-              type: "button",
-              class: "btn small",
-              text: t("editor.split"),
-              title: t("editor.splitTitle"),
-              onclick: () => split(),
-            }),
-            h("button", {
-              type: "button",
-              class: "btn small danger",
-              text: t("editor.removePart"),
-              title: t("editor.removePartTitle"),
-              onclick: () => removeSelected(),
-            }),
             h("span", { class: "grow" }),
             h("label", { class: "field-label", text: t("editor.inLabel") }),
             inField,
@@ -308,8 +338,6 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
             "div",
             { class: "keys" },
             h("span", { text: t("editor.keys.inOut") }),
-            h("span", { text: t("editor.keys.split") }),
-            h("span", { text: t("editor.keys.remove") }),
             h("span", { text: t("editor.keys.jump") }),
             h("span", { text: t("editor.keys.play") }),
             h("span", { text: t("editor.keys.seek") }),
@@ -325,36 +353,35 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
         { class: "rail" },
         h("span", { class: "label", text: t("editor.railLabel") }),
         summary,
-        partList,
+        beyond,
+        source.multi_part ? h("span", { class: "note warn", text: t("editor.multiPart") }) : null,
         h("div", { class: "buttons" }, applyButton, cancelButton),
         message,
         h("span", { class: "grow" }),
-        h("span", {
-          class: "note",
-          text: source.original ? t("editor.noteOriginal") : t("editor.noteEncoded"),
-        }),
+        h("span", { class: "note", text: note }),
       ),
     ),
   );
 
   fill(root, page);
 
+  const maxZoom = clamp(durationMs / 5000, MIN_MAX_ZOOM, MAX_MAX_ZOOM);
   const editor: Editor = {
     id: clip.id,
     clip,
     source,
     video,
     film,
-    durationMs: Math.max(source.duration_ms, MIN_MS),
+    durationMs,
     fps: source.fps > 0 ? source.fps : clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS,
-    segments,
-    initial: JSON.stringify(segments),
-    selected: segments.length === 1 ? 0 : null,
+    range,
+    initial: { ...range },
     past: [],
     future: [],
     zoom: 1,
-    skipGaps: true,
+    maxZoom,
     drag: null,
+    playingRange: false,
     filmGen: 0,
     filmTimer: 0,
     raf: 0,
@@ -364,8 +391,10 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     track,
     ruler,
     filmCanvas,
-    gaps,
-    parts,
+    before,
+    after,
+    part,
+    partLen,
     playhead,
     time,
     playButton,
@@ -373,7 +402,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     inField,
     outField,
     summary,
-    partList,
+    beyond,
     undoButton,
     redoButton,
     applyButton,
@@ -396,15 +425,22 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   document.addEventListener("keydown", editor.onKey);
   editor.resize.observe(timeline);
 
-  paintParts(editor);
+  paintRange(editor);
+  // A range of a few seconds on a forty-minute match would be a sliver: open zoomed so it
+  // takes about two fifths of the view, centred.
+  const span = range.end_ms - range.start_ms;
+  if (source.kind === "match" && span > 0) {
+    setZoom(editor, durationMs / (span * 2.5));
+    const centre = (range.start_ms + range.end_ms) / 2;
+    timeline.scrollLeft = (centre / durationMs) * track.clientWidth - (timeline.clientWidth - TRACK_PAD * 2) / 2;
+  }
   paintRuler(editor);
   paintPlayhead(editor, true);
   scheduleFilm(editor, 0);
-  // Open on the first kept frame rather than frame zero of a trimmed recording.
   video.addEventListener(
     "loadedmetadata",
     () => {
-      if (live === editor && segments[0].start_ms > 0) seek(editor, segments[0].start_ms);
+      if (live === editor && range.start_ms > 0) seek(editor, range.start_ms);
     },
     { once: true },
   );
@@ -428,6 +464,8 @@ function wireVideo(ed: Editor, bigPlay: HTMLElement): void {
   const { video } = ed;
   video.addEventListener("play", () => {
     bigPlay.hidden = true;
+    const at = now(ed);
+    ed.playingRange = at >= ed.range.start_ms - END_SLACK_MS && at < ed.range.end_ms - END_SLACK_MS;
     paintPlayhead(ed, true);
   });
   video.addEventListener("pause", () => {
@@ -435,13 +473,6 @@ function wireVideo(ed: Editor, bigPlay: HTMLElement): void {
     paintPlayhead(ed, true);
   });
   video.addEventListener("seeked", () => paintPlayhead(ed, true));
-  video.addEventListener("ended", () => {
-    // Native loop restarts at frame zero; with gaps skipped that means the first kept part.
-    if (video.loop && ed.skipGaps) {
-      seek(ed, ed.segments[0].start_ms);
-      void video.play().catch(() => undefined);
-    }
-  });
   video.addEventListener("error", () => {
     const box = ed.root.querySelector(".video");
     if (box && !box.querySelector(".trouble")) {
@@ -455,8 +486,7 @@ function now(ed: Editor): number {
 }
 
 function seek(ed: Editor, ms: number): void {
-  const clamped = clamp(ms, 0, ed.durationMs);
-  ed.video.currentTime = clamped / 1000;
+  ed.video.currentTime = clamp(ms, 0, ed.durationMs) / 1000;
   paintPlayhead(ed, true);
 }
 
@@ -470,38 +500,32 @@ function togglePlay(ed: Editor): void {
     video.pause();
     return;
   }
-  // Pressing play at the end of the kept footage starts it over rather than playing the
-  // removed tail.
-  const last = ed.segments[ed.segments.length - 1];
-  if (ed.skipGaps && now(ed) >= last.end_ms - GAP_SLACK_MS) seek(ed, ed.segments[0].start_ms);
+  // Play from the end of the range plays the range again rather than what follows it.
+  const at = now(ed);
+  if (Math.abs(at - ed.range.end_ms) <= END_SLACK_MS * 2) seek(ed, ed.range.start_ms);
   void video.play().catch(() => undefined);
 }
 
-/** One frame of the editor's own loop: jump over removed ranges while playing, keep the
- *  playhead in view, and repaint it only when it moved. */
+/** One frame of the editor's own loop: hold playback to the range when it started inside it,
+ *  keep the playhead in view, and repaint it only when it moved. */
 function tick(ed: Editor): void {
   ed.raf = requestAnimationFrame(() => tick(ed));
   if (!ed.video.paused) {
-    enforceGaps(ed);
+    holdToRange(ed);
     keepPlayheadVisible(ed);
   }
   paintPlayhead(ed, false);
 }
 
-function enforceGaps(ed: Editor): void {
-  if (!ed.skipGaps || ed.drag) return;
-  const t = now(ed);
-  const segs = ed.segments;
-  const next = segs.find((s) => t < s.end_ms - GAP_SLACK_MS);
-  if (!next) {
-    if (ed.video.loop) seek(ed, segs[0].start_ms);
-    else {
-      ed.video.pause();
-      seek(ed, segs[segs.length - 1].end_ms);
-    }
-    return;
+function holdToRange(ed: Editor): void {
+  if (!ed.playingRange || ed.drag) return;
+  if (now(ed) < ed.range.end_ms - END_SLACK_MS) return;
+  if (ed.video.loop) {
+    seek(ed, ed.range.start_ms);
+  } else {
+    ed.video.pause();
+    seek(ed, ed.range.end_ms);
   }
-  if (t < next.start_ms - GAP_SLACK_MS) seek(ed, next.start_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -523,22 +547,13 @@ function wireTimeline(ed: Editor): void {
   track.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
-    if (target.closest(".restore")) return;
     track.setPointerCapture(e.pointerId);
     ed.video.pause();
     const handle = target.closest<HTMLElement>(".handle");
     if (handle) {
       push(ed);
-      ed.drag = {
-        kind: "handle",
-        seg: Number(handle.dataset.seg),
-        edge: handle.dataset.edge === "out" ? "out" : "in",
-        moved: false,
-      };
-      select(ed, ed.drag.seg);
+      ed.drag = { kind: "handle", edge: handle.dataset.edge === "out" ? "out" : "in", moved: false };
     } else {
-      const part = target.closest<HTMLElement>(".part");
-      if (part) select(ed, Number(part.dataset.seg));
       ed.drag = { kind: "scrub" };
       seek(ed, msAt(ed, e));
     }
@@ -554,25 +569,24 @@ function wireTimeline(ed: Editor): void {
   const finish = (e: PointerEvent) => {
     if (!ed.drag) return;
     if (track.hasPointerCapture(e.pointerId)) track.releasePointerCapture(e.pointerId);
-    if (ed.drag.kind === "handle") {
-      // A click that never dragged is not an edit worth an undo step.
-      if (!ed.drag.moved) ed.past.pop();
-      mergeTouching(ed);
-      paintParts(ed);
-    }
+    // A click on a handle that never dragged is not an edit worth an undo step.
+    if (ed.drag.kind === "handle" && !ed.drag.moved) ed.past.pop();
     ed.drag = null;
+    paintRange(ed);
   };
   track.addEventListener("pointerup", finish);
   track.addEventListener("pointercancel", finish);
 
-  // Ctrl+wheel zooms; a plain wheel scrolls a zoomed timeline sideways, since it has no
-  // vertical extent to scroll.
+  // Ctrl+wheel zooms around the pointer; a plain wheel scrolls a zoomed timeline sideways,
+  // since it has no vertical extent to scroll.
   timeline.addEventListener(
     "wheel",
     (e) => {
       if (e.ctrlKey) {
         e.preventDefault();
-        zoomBy(e.deltaY < 0 ? 1 : -1);
+        const box = track.getBoundingClientRect();
+        const at = box.width ? ((e.clientX - box.left) / box.width) * ed.durationMs : undefined;
+        setZoom(ed, e.deltaY < 0 ? ed.zoom * ZOOM_STEP : ed.zoom / ZOOM_STEP, at);
       } else if (ed.zoom > 1 && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         e.preventDefault();
         timeline.scrollLeft += e.deltaY;
@@ -580,65 +594,64 @@ function wireTimeline(ed: Editor): void {
     },
     { passive: false },
   );
+  // The ruler and the filmstrip only draw what is in view, so scrolling redraws them.
+  timeline.addEventListener("scroll", () => {
+    paintRuler(ed);
+    scheduleFilm(ed, 120);
+  });
 }
 
 function moveHandle(ed: Editor, ms: number): void {
   const d = ed.drag;
   if (!d || d.kind !== "handle") return;
-  const segs = ed.segments;
-  const s = segs[d.seg];
-  const lo = d.seg > 0 ? segs[d.seg - 1].end_ms : 0;
-  const hi = d.seg < segs.length - 1 ? segs[d.seg + 1].start_ms : ed.durationMs;
-  if (d.edge === "in") s.start_ms = clamp(ms, lo, s.end_ms - MIN_MS);
-  else s.end_ms = clamp(ms, s.start_ms + MIN_MS, hi);
+  const r = ed.range;
+  if (d.edge === "in") r.start_ms = clamp(ms, 0, r.end_ms - MIN_MS);
+  else r.end_ms = clamp(ms, r.start_ms + MIN_MS, ed.durationMs);
   d.moved = true;
   // The preview follows the handle, which is how you see the frame you are cutting on.
-  seek(ed, d.edge === "in" ? s.start_ms : s.end_ms);
-  paintParts(ed);
-}
-
-/** Two parts whose edges meet are one part. Dragging a handle up to its neighbour is the
- *  natural way to close a cut, so this runs after every drag and field edit. */
-function mergeTouching(ed: Editor): void {
-  const merged: Segment[] = [];
-  for (const s of ed.segments) {
-    const last = merged[merged.length - 1];
-    if (last && s.start_ms <= last.end_ms) last.end_ms = Math.max(last.end_ms, s.end_ms);
-    else merged.push(s);
-  }
-  if (merged.length !== ed.segments.length) {
-    ed.segments = merged;
-    if (ed.selected !== null && ed.selected >= merged.length) ed.selected = merged.length - 1;
-  }
+  seek(ed, d.edge === "in" ? r.start_ms : r.end_ms);
+  paintRange(ed);
 }
 
 function keepPlayheadVisible(ed: Editor): void {
   if (ed.zoom === 1) return;
   const tl = ed.timeline;
   const x = (now(ed) / ed.durationMs) * ed.track.clientWidth;
-  if (x < tl.scrollLeft || x > tl.scrollLeft + tl.clientWidth) {
+  if (x < tl.scrollLeft || x > tl.scrollLeft + tl.clientWidth - TRACK_PAD * 2) {
     tl.scrollLeft = Math.max(0, x - tl.clientWidth * 0.2);
   }
 }
 
-function zoomBy(by: number): void {
-  if (live) setZoom(live, live.zoom + by);
+function zoomBy(direction: 1 | -1): void {
+  if (live) setZoom(live, direction > 0 ? live.zoom * ZOOM_STEP : live.zoom / ZOOM_STEP);
 }
 
-function setZoom(ed: Editor, zoom: number): void {
-  zoom = clamp(zoom, 1, MAX_ZOOM);
-  if (zoom === ed.zoom) return;
+/** Zooms to `zoom`, keeping `aroundMs` (by default whatever is mid-view) where it was. */
+function setZoom(ed: Editor, zoom: number, aroundMs?: number): void {
+  zoom = clamp(zoom, 1, ed.maxZoom);
+  if (Math.abs(zoom - ed.zoom) < 0.001) return;
   const tl = ed.timeline;
-  // Keep whatever is under the middle of the view under the middle of the view.
-  const centre = ed.track.clientWidth
-    ? (tl.scrollLeft + tl.clientWidth / 2) / ed.track.clientWidth
-    : 0.5;
+  const oldWidth = ed.track.clientWidth || 1;
+  const view = tl.clientWidth - TRACK_PAD * 2;
+  const centreMs = aroundMs ?? ((tl.scrollLeft + view / 2) / oldWidth) * ed.durationMs;
+  // Where on screen the anchor sits now, so it stays under the pointer after the zoom.
+  const anchorX = aroundMs === undefined ? view / 2 : (aroundMs / ed.durationMs) * oldWidth - tl.scrollLeft;
   ed.zoom = zoom;
   ed.track.style.width = `${zoom * 100}%`;
-  tl.scrollLeft = centre * ed.track.clientWidth - tl.clientWidth / 2;
-  ed.zoomLabel.textContent = `${zoom}×`;
+  const newWidth = ed.track.clientWidth || 1;
+  tl.scrollLeft = (centreMs / ed.durationMs) * newWidth - clamp(anchorX, 0, view);
+  ed.zoomLabel.textContent = `${zoom < 10 ? zoom.toFixed(1) : Math.round(zoom)}×`;
+  paintRange(ed);
   paintRuler(ed);
   scheduleFilm(ed);
+}
+
+/** The part of the track in view, in track pixels. */
+function visibleTrack(ed: Editor): { from: number; width: number } {
+  const trackWidth = ed.track.clientWidth;
+  const from = clamp(ed.timeline.scrollLeft - TRACK_PAD, 0, trackWidth);
+  const width = clamp(ed.timeline.clientWidth, 0, trackWidth - from);
+  return { from, width };
 }
 
 // ---------------------------------------------------------------------------
@@ -654,79 +667,23 @@ function paintPlayhead(ed: Editor, force: boolean): void {
   ed.playButton.title = ed.video.paused ? t("editor.play") : t("editor.pause");
 }
 
-function paintParts(ed: Editor): void {
-  const segs = ed.segments;
+function paintRange(ed: Editor): void {
+  const r = ed.range;
+  const len = r.end_ms - r.start_ms;
+  ed.before.style.left = "0";
+  ed.before.style.width = pct(ed, r.start_ms);
+  ed.after.style.left = pct(ed, r.end_ms);
+  ed.after.style.width = pct(ed, ed.durationMs - r.end_ms);
+  ed.part.style.left = pct(ed, r.start_ms);
+  ed.part.style.width = pct(ed, len);
+  ed.part.title = t("editor.rangeTitle", { in: fmtPrecise(r.start_ms), out: fmtPrecise(r.end_ms) });
+  ed.partLen.textContent = fmtLen(len);
   const width = ed.track.clientWidth || 1;
-  const gapNodes: HTMLElement[] = [];
-  let cursor = 0;
-  segs.forEach((s, i) => {
-    if (s.start_ms > cursor) gapNodes.push(gapNode(ed, cursor, s.start_ms, i));
-    cursor = s.end_ms;
-  });
-  if (cursor < ed.durationMs) gapNodes.push(gapNode(ed, cursor, ed.durationMs, segs.length));
-  fill(ed.gaps, ...gapNodes);
-  fill(
-    ed.parts,
-    ...segs.map((s, i) => {
-      const len = s.end_ms - s.start_ms;
-      const node = h(
-        "div",
-        {
-          class: `part${i === ed.selected ? " selected" : ""}`,
-          "data-seg": i,
-          style: `left:${pct(ed, s.start_ms)};width:${pct(ed, len)}`,
-          title: t("editor.partTitle", {
-            n: i + 1,
-            in: fmtPrecise(s.start_ms),
-            out: fmtPrecise(s.end_ms),
-          }),
-        },
-        h("span", {
-          class: "handle in",
-          "data-seg": i,
-          "data-edge": "in",
-          title: t("editor.dragStart"),
-        }),
-        h("span", { class: "len", text: fmtLen(len) }),
-        h("span", {
-          class: "handle out",
-          "data-seg": i,
-          "data-edge": "out",
-          title: t("editor.dragEnd"),
-        }),
-      );
-      if ((len / ed.durationMs) * width < 64) node.setAttribute("data-narrow", "");
-      return node;
-    }),
-  );
+  ed.part.toggleAttribute("data-narrow", (len / ed.durationMs) * width < 64);
   paintFields(ed);
   paintSummary(ed);
-  paintPartList(ed);
   ed.undoButton.disabled = ed.past.length === 0;
   ed.redoButton.disabled = ed.future.length === 0;
-}
-
-/** A removed range. `before` is the index of the part that follows it, which is what
- *  restoring it has to join. */
-function gapNode(ed: Editor, from: number, to: number, before: number): HTMLElement {
-  return h(
-    "div",
-    {
-      class: "gap",
-      style: `left:${pct(ed, from)};width:${pct(ed, to - from)}`,
-      title: t("editor.removed"),
-    },
-    h("button", {
-      type: "button",
-      class: "restore",
-      text: t("editor.restore"),
-      title: t("editor.restoreTitle"),
-      onclick: (e: Event) => {
-        e.stopPropagation();
-        restoreGap(ed, before);
-      },
-    }),
-  );
 }
 
 function paintRuler(ed: Editor): void {
@@ -734,19 +691,23 @@ function paintRuler(ed: Editor): void {
   const secs = ed.durationMs / 1000;
   if (!width || !secs) return;
   const pxPerSec = width / secs;
-  const steps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+  const steps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
   const step = steps.find((s) => s * pxPerSec >= 72) ?? steps[steps.length - 1];
   const minor = step / 5;
+  // Only what is in view, plus a screen either side: a zoomed match is tens of thousands of
+  // pixels wide and would otherwise be tens of thousands of ticks.
+  const { from, width: shown } = visibleTrack(ed);
+  const first = Math.max(0, Math.floor((from - shown) / pxPerSec / minor));
+  const last = Math.min(Math.floor(secs / minor + 1e-6), Math.ceil((from + shown * 2) / pxPerSec / minor));
   const nodes: HTMLElement[] = [];
-  const count = Math.floor(secs / minor + 1e-6);
-  for (let i = 0; i <= count; i++) {
-    const t = i * minor;
+  for (let i = first; i <= last; i++) {
+    const at = i * minor;
     const major = i % 5 === 0;
     nodes.push(
       h(
         "span",
-        { class: major ? "tick major" : "tick", style: `left:${(t / secs) * 100}%` },
-        major ? h("i", { text: fmtTick(t, step) }) : null,
+        { class: major ? "tick major" : "tick", style: `left:${(at / secs) * 100}%` },
+        major ? h("i", { text: fmtTick(at, step) }) : null,
       ),
     );
   }
@@ -754,71 +715,32 @@ function paintRuler(ed: Editor): void {
 }
 
 function paintFields(ed: Editor): void {
-  const s = ed.selected !== null ? ed.segments[ed.selected] : null;
   for (const [field, value] of [
-    [ed.inField, s?.start_ms],
-    [ed.outField, s?.end_ms],
+    [ed.inField, ed.range.start_ms],
+    [ed.outField, ed.range.end_ms],
   ] as const) {
-    field.disabled = !s;
-    if (document.activeElement !== field) field.value = value === undefined ? "" : fmtPrecise(value);
+    if (document.activeElement !== field) field.value = fmtPrecise(value);
   }
 }
 
 function paintSummary(ed: Editor): void {
-  const kept = ed.segments.reduce((sum, s) => sum + s.end_ms - s.start_ms, 0);
-  const parts = ed.segments.length;
-  const whole = isWhole(ed);
+  const r = ed.range;
+  const kept = r.end_ms - r.start_ms;
+  const whole = ed.source.kind === "clip" && r.start_ms <= 0 && r.end_ms >= ed.durationMs;
   fill(
     ed.summary,
     h("b", {
       text: whole
         ? t("editor.wholeRecording")
-        : t("editor.keeps", {
-            kept: fmtClock(kept / 1000),
-            total: fmtClock(ed.durationMs / 1000),
-          }),
+        : t("editor.keeps", { kept: fmtClock(kept / 1000), total: fmtClock(ed.durationMs / 1000) }),
     }),
-    h("span", {
-      class: "muted",
-      text: whole
-        ? ` · ${fmtClock(ed.durationMs / 1000)}`
-        : ` · ${parts} ${parts === 1 ? t("editor.partOne") : t("editor.partMany")}`,
-    }),
+    h("span", { class: "muted mono range", text: `${fmtPrecise(r.start_ms)} → ${fmtPrecise(r.end_ms)}` }),
   );
-  ed.applyButton.disabled = !isDirty(ed) && !(ed.clip.cut && whole);
-}
-
-function paintPartList(ed: Editor): void {
-  fill(
-    ed.partList,
-    ...ed.segments.map((s, i) =>
-      h(
-        "button",
-        {
-          type: "button",
-          class: `part-row${i === ed.selected ? " selected" : ""}`,
-          onclick: () => {
-            select(ed, i);
-            seek(ed, s.start_ms);
-          },
-        },
-        h("span", { class: "n", text: String(i + 1) }),
-        h("span", { class: "range mono", text: `${fmtPrecise(s.start_ms)} → ${fmtPrecise(s.end_ms)}` }),
-        h("span", { class: "muted mono", text: fmtLen(s.end_ms - s.start_ms) }),
-      ),
-    ),
-  );
-}
-
-function select(ed: Editor, i: number | null): void {
-  ed.selected = i;
-  for (const node of ed.parts.querySelectorAll<HTMLElement>(".part")) {
-    node.classList.toggle("selected", Number(node.dataset.seg) === i);
-  }
-  for (const node of ed.partList.querySelectorAll<HTMLElement>(".part-row")) {
-    node.classList.toggle("selected", [...ed.partList.children].indexOf(node) === i);
-  }
-  paintFields(ed);
+  const span = ed.source.clip_span;
+  ed.beyond.hidden =
+    ed.source.kind !== "match" || (!!span && r.start_ms >= span.start_ms && r.end_ms <= span.end_ms);
+  // Several old parts become one range even when the outer span is left as it is.
+  ed.applyButton.disabled = !isDirty(ed) && !ed.source.multi_part;
 }
 
 function note(ed: Editor, text: string, isError = false): void {
@@ -834,17 +756,20 @@ function scheduleFilm(ed: Editor, delay = 200): void {
   ed.filmTimer = window.setTimeout(() => void buildFilm(ed), delay);
 }
 
-/** Draws one frame per slot across the track. Sequential seeks on the hidden decoder, each
- *  drawn as it lands, so a wide zoom fills in from the left rather than all at once. */
+/** Draws one frame per slot across the part of the track in view. Sequential seeks on the
+ *  hidden decoder, each drawn as it lands, so the strip fills in from the left. */
 async function buildFilm(ed: Editor): Promise<void> {
   const gen = ++ed.filmGen;
-  const width = ed.track.clientWidth;
-  if (!width) return;
+  const trackWidth = ed.track.clientWidth;
+  const { from, width } = visibleTrack(ed);
+  if (!trackWidth || !width) return;
   const aspect = ed.source.width && ed.source.height ? ed.source.width / ed.source.height : 16 / 9;
   const thumbW = Math.max(40, Math.round(FILM_HEIGHT * aspect));
   const n = Math.min(MAX_THUMBS, Math.max(1, Math.ceil(width / thumbW)));
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const canvas = ed.filmCanvas;
+  canvas.style.left = `${from}px`;
+  canvas.style.width = `${n * thumbW}px`;
   canvas.width = Math.round(n * thumbW * dpr);
   canvas.height = Math.round(FILM_HEIGHT * dpr);
   const ctx = canvas.getContext("2d");
@@ -853,8 +778,9 @@ async function buildFilm(ed: Editor): Promise<void> {
   if (!(await decoderReady(ed.film))) return;
   for (let i = 0; i < n; i++) {
     if (ed.filmGen !== gen) return;
-    const at = (((i + 0.5) / n) * ed.durationMs) / 1000;
-    const ok = await seekDecoder(ed.film, at);
+    const x = from + (i + 0.5) * thumbW;
+    const at = ((x / trackWidth) * ed.durationMs) / 1000;
+    const ok = await seekDecoder(ed.film, Math.min(at, ed.durationMs / 1000));
     if (ed.filmGen !== gen) return;
     if (ok) ctx.drawImage(ed.film, i * thumbW, 0, thumbW, FILM_HEIGHT);
   }
@@ -895,168 +821,88 @@ function seekDecoder(v: HTMLVideoElement, seconds: number): Promise<boolean> {
 // Edits
 
 function push(ed: Editor): void {
-  ed.past.push(ed.segments.map((s) => ({ ...s })));
+  ed.past.push({ ...ed.range });
   if (ed.past.length > HISTORY) ed.past.shift();
   ed.future = [];
 }
 
 function undo(): void {
   const ed = live;
-  if (!ed) return;
-  const prev = ed.past.pop();
-  if (!prev) return;
-  ed.future.push(ed.segments.map((s) => ({ ...s })));
-  ed.segments = prev;
-  clampSelection(ed);
-  paintParts(ed);
+  const prev = ed?.past.pop();
+  if (!ed || !prev) return;
+  ed.future.push({ ...ed.range });
+  ed.range = prev;
+  paintRange(ed);
 }
 
 function redo(): void {
   const ed = live;
-  if (!ed) return;
-  const next = ed.future.pop();
-  if (!next) return;
-  ed.past.push(ed.segments.map((s) => ({ ...s })));
-  ed.segments = next;
-  clampSelection(ed);
-  paintParts(ed);
-}
-
-function clampSelection(ed: Editor): void {
-  if (ed.selected !== null && ed.selected >= ed.segments.length) ed.selected = ed.segments.length - 1;
+  const next = ed?.future.pop();
+  if (!ed || !next) return;
+  ed.past.push({ ...ed.range });
+  ed.range = next;
+  paintRange(ed);
 }
 
 function reset(): void {
   const ed = live;
-  if (!ed || isWhole(ed)) return;
+  if (!ed || !isDirty(ed)) return;
   push(ed);
-  ed.segments = [{ start_ms: 0, end_ms: ed.durationMs }];
-  ed.selected = 0;
-  paintParts(ed);
+  ed.range = { ...ed.initial };
+  paintRange(ed);
 }
 
-/** The part that starts at or after the playhead becomes the one that starts here: inside a
- *  part that trims its head, in a removed range it grows the next part back to cover it. */
+/** Starts the range at the playhead. Past the current end, the range moves there whole
+ *  rather than collapsing, which is what pressing I further along means. */
 function setIn(): void {
   const ed = live;
   if (!ed) return;
-  const at = now(ed);
-  const segs = ed.segments;
-  const i = segs.findIndex((s) => at < s.end_ms - MIN_MS);
-  if (i < 0) {
-    note(ed, t("editor.nothingAfter"));
-    return;
-  }
+  const at = clamp(now(ed), 0, ed.durationMs - MIN_MS);
   push(ed);
-  const lo = i > 0 ? segs[i - 1].end_ms : 0;
-  segs[i].start_ms = Math.max(at, lo);
-  ed.selected = i;
-  mergeTouching(ed);
-  paintParts(ed);
+  const length = ed.range.end_ms - ed.range.start_ms;
+  ed.range.start_ms = at;
+  if (ed.range.end_ms - at < MIN_MS) ed.range.end_ms = Math.min(ed.durationMs, at + length);
+  paintRange(ed);
   note(ed, "");
 }
 
 function setOut(): void {
   const ed = live;
   if (!ed) return;
-  const at = now(ed);
-  const segs = ed.segments;
-  let i = -1;
-  segs.forEach((s, k) => {
-    if (s.start_ms + MIN_MS <= at) i = k;
-  });
-  if (i < 0) {
-    note(ed, t("editor.nothingBefore"));
-    return;
-  }
+  const at = clamp(now(ed), MIN_MS, ed.durationMs);
   push(ed);
-  const hi = i < segs.length - 1 ? segs[i + 1].start_ms : ed.durationMs;
-  segs[i].end_ms = Math.min(at, hi);
-  ed.selected = i;
-  mergeTouching(ed);
-  paintParts(ed);
+  const length = ed.range.end_ms - ed.range.start_ms;
+  ed.range.end_ms = at;
+  if (at - ed.range.start_ms < MIN_MS) ed.range.start_ms = Math.max(0, at - length);
+  paintRange(ed);
   note(ed, "");
 }
 
-function split(): void {
-  const ed = live;
-  if (!ed) return;
+/** The range's edges and the saved footage's, for [ and ] to hop between. */
+function jumpEdge(ed: Editor, direction: -1 | 1): void {
   const at = now(ed);
-  const segs = ed.segments;
-  const i = segs.findIndex((s) => at - s.start_ms >= MIN_MS && s.end_ms - at >= MIN_MS);
-  if (i < 0) {
-    note(ed, t("editor.splitInside"));
-    return;
-  }
-  push(ed);
-  const s = segs[i];
-  segs.splice(i, 1, { start_ms: s.start_ms, end_ms: at }, { start_ms: at, end_ms: s.end_ms });
-  ed.selected = i + 1;
-  paintParts(ed);
-  note(ed, "");
-}
-
-function removeSelected(): void {
-  const ed = live;
-  if (!ed) return;
-  const at = now(ed);
-  const i = ed.selected ?? ed.segments.findIndex((s) => at >= s.start_ms && at <= s.end_ms);
-  if (i === null || i < 0) {
-    note(ed, t("editor.pickPart"));
-    return;
-  }
-  if (ed.segments.length === 1) {
-    note(ed, t("editor.onePartStays"));
-    return;
-  }
-  push(ed);
-  ed.segments.splice(i, 1);
-  ed.selected = null;
-  paintParts(ed);
-  note(ed, "");
-}
-
-function restoreGap(ed: Editor, before: number): void {
-  push(ed);
-  const segs = ed.segments;
-  if (before === 0) segs[0].start_ms = 0;
-  else if (before >= segs.length) segs[segs.length - 1].end_ms = ed.durationMs;
-  else {
-    segs[before - 1].end_ms = segs[before].end_ms;
-    segs.splice(before, 1);
-    if (ed.selected !== null && ed.selected >= before) ed.selected = Math.max(0, ed.selected - 1);
-  }
-  mergeTouching(ed);
-  paintParts(ed);
-}
-
-/** Every edge of every part, for [ and ] to hop between. */
-function jumpCut(ed: Editor, direction: -1 | 1): void {
-  const t = now(ed);
-  const edges = ed.segments.flatMap((s) => [s.start_ms, s.end_ms]).sort((a, b) => a - b);
-  const target = direction > 0 ? edges.find((e) => e > t + 1) : [...edges].reverse().find((e) => e < t - 1);
+  const span = ed.source.clip_span;
+  const edges = [ed.range.start_ms, ed.range.end_ms, ...(span ? [span.start_ms, span.end_ms] : [])].sort(
+    (a, b) => a - b,
+  );
+  const target =
+    direction > 0 ? edges.find((e) => e > at + 1) : [...edges].reverse().find((e) => e < at - 1);
   seek(ed, target ?? (direction > 0 ? ed.durationMs : 0));
 }
 
 function wireFields(ed: Editor): void {
   const commit = (field: HTMLInputElement, edge: "in" | "out") => {
-    if (ed.selected === null) return;
     const ms = parseTime(field.value);
     if (ms === null) {
       paintFields(ed);
       return;
     }
-    const segs = ed.segments;
-    const i = ed.selected;
-    const s = segs[i];
-    const lo = i > 0 ? segs[i - 1].end_ms : 0;
-    const hi = i < segs.length - 1 ? segs[i + 1].start_ms : ed.durationMs;
     push(ed);
-    if (edge === "in") s.start_ms = clamp(ms, lo, s.end_ms - MIN_MS);
-    else s.end_ms = clamp(ms, s.start_ms + MIN_MS, hi);
-    mergeTouching(ed);
-    paintParts(ed);
-    seek(ed, edge === "in" ? s.start_ms : s.end_ms);
+    const r = ed.range;
+    if (edge === "in") r.start_ms = clamp(ms, 0, r.end_ms - MIN_MS);
+    else r.end_ms = clamp(ms, r.start_ms + MIN_MS, ed.durationMs);
+    paintRange(ed);
+    seek(ed, edge === "in" ? r.start_ms : r.end_ms);
   };
   for (const [field, edge] of [
     [ed.inField, "in"],
@@ -1077,25 +923,22 @@ function wireFields(ed: Editor): void {
   }
 }
 
-function isWhole(ed: Editor): boolean {
-  const s = ed.segments;
-  return s.length === 1 && s[0].start_ms <= 0 && s[0].end_ms >= ed.durationMs;
-}
-
 function isDirty(ed: Editor): boolean {
-  return JSON.stringify(ed.segments) !== ed.initial;
+  return ed.range.start_ms !== ed.initial.start_ms || ed.range.end_ms !== ed.initial.end_ms;
 }
 
 async function apply(): Promise<void> {
   const ed = live;
   if (!ed) return;
-  const payload = isWhole(ed)
-    ? []
-    : ed.segments.map((s) => ({ start_ms: Math.round(s.start_ms), end_ms: Math.round(s.end_ms) }));
   ed.applyButton.disabled = true;
   note(ed, t("editor.queuing"));
   try {
-    await ipc.applyCut(ed.id, payload);
+    await ipc.applyRange(
+      ed.id,
+      ed.source.kind,
+      Math.round(ed.range.start_ms),
+      Math.round(ed.range.end_ms),
+    );
     go({ view: "player", id: ed.id });
   } catch (e) {
     if (live !== ed) return;
@@ -1174,19 +1017,11 @@ function handleKey(e: KeyboardEvent): void {
     case "O":
       setOut();
       break;
-    case "s":
-    case "S":
-      split();
-      break;
-    case "Delete":
-    case "Backspace":
-      removeSelected();
-      break;
     case "[":
-      jumpCut(ed, -1);
+      jumpEdge(ed, -1);
       break;
     case "]":
-      jumpCut(ed, 1);
+      jumpEdge(ed, 1);
       break;
     case "Home":
       seek(ed, 0);
@@ -1224,7 +1059,8 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(Math.max(n, lo), hi);
 }
 
-/** m:ss.mmm, the precision a cut is stored at. */
+/** m:ss.mmm, the precision a range is stored at. Hours roll into the minutes, which is how a
+ *  long match reads anyway. */
 function fmtPrecise(ms: number): string {
   const total = Math.max(0, Math.round(ms));
   const m = Math.floor(total / 60000);
@@ -1246,13 +1082,13 @@ function fmtTick(seconds: number, step: number): string {
 
 /** Accepts "1:23.456", "1:23", "83.4" or "83"; null for anything else. */
 function parseTime(text: string): number | null {
-  const t = text.trim();
-  const clock = /^(\d+):(\d{1,2})(?:\.(\d{1,3}))?$/.exec(t);
+  const s = text.trim();
+  const clock = /^(\d+):(\d{1,2})(?:\.(\d{1,3}))?$/.exec(s);
   if (clock) {
     const frac = (clock[3] ?? "").padEnd(3, "0");
     return Number(clock[1]) * 60000 + Number(clock[2]) * 1000 + Number(frac);
   }
-  const plain = /^(\d+)(?:\.(\d{1,3}))?$/.exec(t);
+  const plain = /^(\d+)(?:\.(\d{1,3}))?$/.exec(s);
   if (plain) return Number(plain[1]) * 1000 + Number((plain[2] ?? "").padEnd(3, "0"));
   return null;
 }

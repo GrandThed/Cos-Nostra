@@ -266,7 +266,7 @@
 .tl {
   position: relative;
   flex: none;
-  height: 34px;
+  height: 44px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -281,10 +281,11 @@
   pointer-events: none;
 }
 
+/* The top lane carries the rounds and what happened in them; the bottom lane the clips. */
 .tl-round {
   position: absolute;
   top: 6px;
-  bottom: 6px;
+  bottom: 16px;
   border-right: 1px solid var(--panel);
   background: var(--panel2);
 }
@@ -308,7 +309,7 @@
 
 .tl-dot {
   position: absolute;
-  top: 50%;
+  top: 17px;
   width: 8px;
   height: 8px;
   margin: -4px 0 0 -4px;
@@ -340,7 +341,7 @@
 }
 
 .tl-dot.objective {
-  top: 25%;
+  top: 11px;
   border-radius: 2px;
   background: var(--mut);
 }
@@ -351,6 +352,60 @@
 
 .tl-dot.objective.theirs {
   background: var(--err);
+}
+
+/* Clips already taken from the match: flat bars in the bottom lane, in the colours of the
+   library's status circle (circles.css), so they read as clips and never as events. */
+.tl-clips {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 4px;
+  height: 8px;
+  pointer-events: none;
+}
+
+.tl-clip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: var(--mut);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.tl-clip.local {
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1.5px var(--mut);
+}
+
+.tl-clip.busy {
+  background: var(--acc);
+}
+
+.tl-clip.published {
+  background: var(--ok);
+}
+
+.tl-clip.retrying {
+  background: var(--warn);
+}
+
+.tl-clip.failed {
+  background: var(--err);
+}
+
+.tl-clip:hover {
+  filter: brightness(1.15);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+
+.tl-clip:focus-visible {
+  outline-offset: 1px;
 }
 
 .tl-sel {

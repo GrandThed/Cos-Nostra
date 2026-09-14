@@ -163,17 +163,19 @@ button {
   white-space: nowrap;
 }
 
+/* The same vocabulary as the status circle (circles.css): local is quiet, anything on its way
+   to the site is the accent, published is green, trouble is amber or red. `encoding` is the
+   Matches tab's "cutting" badge. */
+.badge.queued,
+.badge.waiting,
+.badge.publishing {
+  color: var(--acc);
+}
 .badge.encoding,
 .badge.retrying {
   color: var(--warn);
 }
-.badge.ready {
-  color: var(--ink);
-}
-.badge.uploading {
-  color: var(--info);
-}
-.badge.done {
+.badge.published {
   color: var(--ok);
 }
 .badge.failed {

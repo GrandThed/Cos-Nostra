@@ -7,13 +7,14 @@
  *  not change, so a session ending in the background does not reset the video being watched. */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { badgeFor } from "./clips";
 import { confirming, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhenLong, hueFor } from "./format";
 import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { go } from "./router";
 import { data, loadClips, loadSessions, on } from "./store";
-import type { MatchRow, SessionRow, TimelineEvent } from "./types";
+import type { MatchClip, MatchRow, SessionRow, TimelineEvent } from "./types";
 
 /** Kept after the moment a round is decided when clipping it, for the kill and the reaction. */
 const ROUND_TAIL_MS = 3000;
@@ -30,6 +31,8 @@ type Selection = { kind: "match"; id: number } | { kind: "session"; id: number }
 
 let selection: Selection = null;
 let parts: { list: HTMLElement; main: HTMLElement } | null = null;
+/** A clip whose range the route asked to have selected once its match is on screen. */
+let pendingClip: number | null = null;
 
 interface Round {
   n: number;
@@ -53,6 +56,9 @@ interface View {
   note: HTMLElement | null;
   events: TimelineEvent[];
   rounds: Round[];
+  /** Clips taken during this match, as ranges of its file. */
+  clips: MatchClip[];
+  clipLayer: HTMLElement | null;
   inMs: number | null;
   outMs: number | null;
   frame: number;
@@ -67,6 +73,11 @@ export function initMatches(): void {
   on("sessions", () => {
     if (parts) render();
   });
+  // A clip saved, published or re-ranged moves its bar; a percentage only recolours it.
+  on("clips", () => {
+    if (view?.clipLayer) void loadMatchClips(view);
+  });
+  on("progress", () => paintClips());
   onLanguage(() => {
     if (!parts) return;
     // The match on screen is keyed on its data, which the language does not touch.
@@ -75,9 +86,10 @@ export function initMatches(): void {
   });
 }
 
-export function mountMatches(root: HTMLElement, session?: number, match?: number): void {
+export function mountMatches(root: HTMLElement, session?: number, match?: number, clip?: number): void {
   if (match !== undefined) selection = { kind: "match", id: match };
   else if (session !== undefined) selection = { kind: "session", id: session };
+  pendingClip = clip ?? null;
   const list = h("aside", { class: "session-list scroll" });
   const main = h("section", { class: "match-view" });
   parts = { list, main };
@@ -411,6 +423,8 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
       note,
       events: [],
       rounds: [],
+      clips: [],
+      clipLayer: null,
       inMs: null,
       outMs: null,
       frame: 0,
@@ -426,9 +440,11 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
     src: convertFileSrc(match.path),
   }) as HTMLVideoElement;
   const bar = h("div", { class: "tl-bar" });
+  // Its own lane along the bottom, so a clip never sits on top of a kill it contains.
+  const clipLayer = h("div", { class: "tl-clips" });
   const sel = h("div", { class: "tl-sel", hidden: true });
   const playhead = h("div", { class: "tl-head" });
-  const timeline = h("div", { class: "tl" }, bar, sel, playhead);
+  const timeline = h("div", { class: "tl" }, bar, clipLayer, sel, playhead);
   const range = h("span", { class: "range mono" });
   const clipButton = h("button", {
     type: "button",
@@ -451,6 +467,8 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
     note,
     events: [],
     rounds: [],
+    clips: [],
+    clipLayer,
     inMs: null,
     outMs: null,
     frame: 0,
@@ -458,6 +476,7 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
   };
 
   wireTimeline(timeline);
+  void loadMatchClips(view);
   document.addEventListener("keydown", onKey);
 
   fill(
@@ -607,6 +626,82 @@ function paintPlayhead(): void {
   view.head.style.left = pct(view.video.currentTime * 1000);
 }
 
+/** Loads the clips taken during the match on screen. A burst of clip changes collapses into
+ *  one reload running and at most one more queued behind it. */
+let clipsLoading = false;
+let clipsAgain = false;
+
+async function loadMatchClips(v: View): Promise<void> {
+  if (clipsLoading) {
+    clipsAgain = true;
+    return;
+  }
+  clipsLoading = true;
+  try {
+    const clips = await ipc.clipsForMatch(v.match.id);
+    if (view !== v) return;
+    v.clips = clips;
+    paintClips();
+    if (pendingClip !== null && clips.some((c) => c.clip_id === pendingClip)) {
+      selectClip(pendingClip);
+      pendingClip = null;
+    }
+  } catch (e) {
+    console.warn("clips for match", v.match.id, e);
+  } finally {
+    clipsLoading = false;
+    if (clipsAgain && view) {
+      clipsAgain = false;
+      void loadMatchClips(view);
+    }
+  }
+}
+
+/** Each clip as a bar in the bottom lane, coloured like its status circle in the library. */
+function paintClips(): void {
+  if (!view?.clipLayer) return;
+  const byId = new Map(data.clips.map((c) => [c.id, c]));
+  fill(
+    view.clipLayer,
+    ...view.clips.map((mc) => {
+      const row = byId.get(mc.clip_id);
+      const badge = row ? badgeFor(row, data.progress.get(row.id), data.status, data.settings) : null;
+      const kind = badge?.circle ?? (mc.published ? "published" : "local");
+      return h("button", {
+        type: "button",
+        class: `tl-clip ${kind}`,
+        "data-clip": mc.clip_id,
+        style: `left:${pct(mc.start_ms)};width:calc(${pct(mc.end_ms)} - ${pct(mc.start_ms)})`,
+        title: t("matches.clipTitle", {
+          status: badge?.label ?? "",
+          in: fmtPrecise(mc.start_ms),
+          out: fmtPrecise(mc.end_ms),
+        }),
+        onclick: () => selectClip(mc.clip_id),
+      });
+    }),
+  );
+}
+
+/** Selects a clip's range, puts the playhead at its start and offers the clip itself. */
+function selectClip(clipId: number): void {
+  const mc = view?.clips.find((c) => c.clip_id === clipId);
+  if (!view || !mc || !view.note) return;
+  setRange(mc.start_ms, mc.end_ms);
+  seek(mc.start_ms);
+  view.note.className = "match-msg ok";
+  fill(
+    view.note,
+    t("matches.clipSelected", { length: fmtLength(mc.end_ms - mc.start_ms) }),
+    h("button", {
+      type: "button",
+      class: "link",
+      text: t("matches.openClip"),
+      onclick: () => go({ view: "player", id: clipId }),
+    }),
+  );
+}
+
 function wireTimeline(timeline: HTMLElement): void {
   const msAt = (e: PointerEvent) => {
     const box = timeline.getBoundingClientRect();
@@ -614,6 +709,8 @@ function wireTimeline(timeline: HTMLElement): void {
   };
   timeline.addEventListener("pointerdown", (down) => {
     if (!view?.video) return;
+    // A clip bar is a button of its own; its click selects it.
+    if ((down.target as HTMLElement).closest(".tl-clip")) return;
     down.preventDefault();
     timeline.setPointerCapture(down.pointerId);
     const startX = down.clientX;

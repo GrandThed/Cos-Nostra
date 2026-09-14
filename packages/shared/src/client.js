@@ -112,16 +112,39 @@ export function createClient(options) {
      * @returns {Promise<import('./types.js').VoiceSnapshot>}
      */
     voiceSnapshot: () => request('POST', '/discord/voice-snapshot'),
+    /**
+     * The servers the Publish dialog may offer: set up with the bot, and confirmed by the bot to
+     * have the caller as a member. Rejects with ApiError 503 (`bot_unavailable`) when the bot
+     * cannot answer, which is different from an empty list.
+     * @returns {Promise<{ items: import('./types.js').PublishGuild[] }>}
+     */
+    listPublishGuilds: () => request('GET', '/discord/guilds'),
 
     // Clips (desktop and web)
     /**
      * Creates the clip record and mints its three upload URLs. `participantDiscordIds` on the
      * body is what voiceSnapshot() returned; it is stored on the clip and only ever read back
-     * through internalClip(), never through the public clip JSON.
+     * through internalClip(), never through the public clip JSON. `guildIds` is where the first
+     * complete posts it; see CreateClipBody.
      * @param {import('./types.js').CreateClipBody} body
      * @returns {Promise<import('./types.js').CreateClipResponse>}
      */
     createClip: (body) => request('POST', '/clips', { body }),
+    /**
+     * Posts a published clip to more servers. Ids that are not set up, or that already show a
+     * live post of the clip, are dropped; `queued` is what is left, and posting it happens in
+     * the background. ApiError 409 (`not_ready`) until the clip has finished uploading.
+     * @param {string} id
+     * @param {string[]} guildIds  1 to 25 guild ids
+     * @returns {Promise<import('./types.js').AddClipPostsResponse>}
+     */
+    addClipPosts: (id, guildIds) =>
+      request('POST', `/clips/${encodeURIComponent(id)}/posts`, { body: { guildIds } }),
+    /**
+     * Every live Discord post of the caller's ready clips, oldest first.
+     * @returns {Promise<{ items: import('./types.js').MyPost[] }>}
+     */
+    myPosts: () => request('GET', '/me/posts'),
     /** @param {string} id @returns {Promise<import('./types.js').Clip>} */
     completeClip: (id) => request('POST', `/clips/${encodeURIComponent(id)}/complete`),
     /** @param {string} id @returns {Promise<import('./types.js').Clip>} */
@@ -143,12 +166,22 @@ export function createClient(options) {
     internalReaction: (body) => request('POST', '/internal/reactions', { body, auth: 'bot' }),
     /**
      * The bot's view of a clip: adds `participants`, the Discord ids of whoever was in voice
-     * with the owner at capture time, which the public clip JSON never carries.
+     * with the owner at capture time, plus where the clip is meant to be and already is posted
+     * (`targetGuildIds`, `posts`). The public clip JSON carries none of them.
      * @param {string} id
-     * @returns {Promise<import('./types.js').Clip & { participants: string[] }>}
+     * @returns {Promise<import('./types.js').InternalClip>}
      */
     internalClip: (id) =>
       request('GET', `/internal/clips/${encodeURIComponent(id)}`, { auth: 'bot' }),
+    /**
+     * Marks the post behind a Discord message as taken down, after the bot's Hide button
+     * deleted it. The row is kept for the site and the rankings; it only stops being live.
+     * ApiError 404 (`unknown_message`) when no post has that message id.
+     * @param {string} messageId
+     * @returns {Promise<null>}
+     */
+    internalRemovePost: (messageId) =>
+      request('DELETE', `/internal/posts/${encodeURIComponent(messageId)}`, { auth: 'bot' }),
     /**
      * Takes a clip down on the owner's behalf, for the manage menu on a Discord post. Same
      * outcome as the owner's own deleteClip: the three objects are removed from the bucket and

@@ -6,14 +6,18 @@ import type {
   Bootstrap,
   CleanResult,
   CleanTarget,
+  ClipMatch,
+  ClipMatchRef,
   ClipProgress,
   ClipRow,
   EditSource,
   Encoders,
   LoginStarted,
-  Segment,
+  MatchClip,
+  PublishGuild,
   SessionRow,
   Settings,
+  SourceKind,
   Status,
   StorageStats,
   TimelineEvent,
@@ -39,9 +43,21 @@ export const openClipFolder = (id: number) => invoke<void>("open_clip_folder", {
 export const getThumbnail = (id: number) => invoke<string | null>("get_thumbnail", { id });
 
 export const editSource = (id: number) => invoke<EditSource>("edit_source", { id });
-/** An empty list keeps the whole recording, which is how an earlier cut is undone. */
-export const applyCut = (id: number, segments: Segment[]) =>
-  invoke<void>("apply_cut", { id, segments });
+/** One kept range, measured in the file `source` names (the match, or the clip's own). */
+export const applyRange = (id: number, source: SourceKind, startMs: number, endMs: number) =>
+  invoke<void>("apply_range", { id, source, startMs, endMs });
+
+/** Rejects with `not_logged_in` or `bot_unavailable`, which the dialog words itself. */
+export const listPublishGuilds = () => invoke<PublishGuild[]>("list_publish_guilds");
+export const publishClip = (id: number, title: string | null, game: string | null, guildIds: string[]) =>
+  invoke<void>("publish_clip", { id, title, game, guildIds });
+/** Resolves with the server ids the backend actually queued. */
+export const addClipPosts = (id: number, guildIds: string[]) =>
+  invoke<string[]>("add_clip_posts", { id, guildIds });
+export const unpublishClip = (id: number) => invoke<void>("unpublish_clip", { id });
+export const refreshPosts = () => invoke<void>("refresh_posts");
+export const openClipPost = (id: number, guildId: string) =>
+  invoke<void>("open_clip_post", { id, guildId });
 
 export const storageStats = () => invoke<StorageStats>("storage_stats");
 export const cleanStorage = (target: CleanTarget) => invoke<CleanResult>("clean_storage", { target });
@@ -64,6 +80,9 @@ export const clipFromMatch = (id: number, startMs: number, endMs: number) =>
   invoke<number>("clip_from_match", { id, startMs, endMs });
 export const openMatchFolder = (id: number) => invoke<void>("open_match_folder", { id });
 export const matchThumbnail = (id: number) => invoke<string | null>("match_thumbnail", { id });
+export const clipsForMatch = (matchId: number) => invoke<MatchClip[]>("clips_for_match", { matchId });
+export const matchForClip = (clipId: number) => invoke<ClipMatch | null>("match_for_clip", { clipId });
+export const clipMatchIndex = () => invoke<ClipMatchRef[]>("clip_match_index");
 
 export const getBootstrap = () => invoke<Bootstrap>("get_bootstrap");
 export const finishFirstRun = () => invoke<void>("finish_first_run");

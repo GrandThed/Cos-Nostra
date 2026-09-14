@@ -95,7 +95,7 @@ function render(): void {
 
   fill(
     root,
-    h("div", { class: "settings scroll" }, captureCard(s), behaviourCard(s), encodingCard(s), accountCard(s)),
+    h("div", { class: "settings scroll" }, captureCard(s), behaviourCard(s), encodingCard(s), accountCard()),
   );
   saveBar = null;
   syncSaveBar();
@@ -382,18 +382,11 @@ function syncAccountBlock(): void {
   accountBlockEl = fresh;
 }
 
-function accountCard(s: Settings): HTMLElement {
+function accountCard(): HTMLElement {
   accountBlockEl = accountBlock();
-  return card(
-    t("settings.account"),
-    accountBlockEl,
-    toggle(
-      t("settings.autoUpload.name"),
-      s.auto_upload,
-      (v) => (s.auto_upload = v),
-      t("settings.autoUpload.detail"),
-    ),
-  );
+  // There is no upload switch any more: a clip goes up when, and only when, someone presses
+  // Publish on it. The note says so where the switch used to be, for anyone looking for it.
+  return card(t("settings.account"), accountBlockEl, h("span", { class: "note", text: t("settings.publishNote") }));
 }
 
 // ---------------------------------------------------------------------------

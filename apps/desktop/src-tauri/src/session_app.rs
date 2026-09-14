@@ -16,9 +16,10 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use crate::cutter::{self, Processed};
 use crate::ffmpeg::{self, Segment};
+use crate::placement::{self, ClipMatch, MatchClip};
 use crate::queue::NewClip;
 use crate::session_watch::{self, Host, LiveSession};
-use crate::sessions::{parse_time, EventRow, SessionRow, SessionStatus, SessionStore};
+use crate::sessions::{format_time, parse_time, EventRow, SessionRow, SessionStatus, SessionStore};
 use crate::timeline::{Provider, SessionGame, Sighting};
 use crate::{emit_clips_changed, on_blocking_thread, queue_or_err, AppState};
 
@@ -398,14 +399,81 @@ fn clip_from_match_inner(app: &AppHandle, id: i64, start_ms: i64, end_ms: i64) -
         // A match is cut out long after it was played, so there is no moment to snapshot
         // voice membership at. Only the hotkey path carries participants.
         participants: None,
+        // The copy starts on the keyframe at `from`, which is what places the clip back on
+        // this match's timeline.
+        captured_at: Some(format_time(file_start + Duration::milliseconds(from))),
     };
     let clip_id = queue.enqueue_with_cut(clip, &cut)?;
     log::info!(
         "clip {clip_id} taken from match {id}: {start}..{end} ms of {}",
         Path::new(path).display()
     );
-    state.wake_worker();
+    // A local clip: nothing encodes it, so it gets its thumbnail here. The worker is not woken,
+    // there is nothing for it to do until the clip is published.
+    if let Err(e) = crate::edit::refresh_thumbnail(&bins, &queue, clip_id) {
+        log::warn!("clip {clip_id}: thumbnail failed: {e:#}");
+    }
     Ok(clip_id)
+}
+
+/// The clips taken during a match, as ranges on its timeline.
+#[tauri::command]
+pub async fn clips_for_match(app: AppHandle, match_id: i64) -> Result<Vec<MatchClip>, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let store = store_or_err(&state)?;
+        let clips = queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))?;
+        placement::clips_for_match(&store, &clips, match_id).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// The match a clip was taken in, if it is still on this PC.
+#[tauri::command]
+pub async fn match_for_clip(app: AppHandle, clip_id: i64) -> Result<Option<ClipMatch>, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let store = store_or_err(&state)?;
+        let Some(row) = queue_or_err(&state)?.get(clip_id).map_err(|e| format!("{e:#}"))? else {
+            return Ok(None);
+        };
+        let candidates = placement::candidates(&store).map_err(|e| format!("{e:#}"))?;
+        Ok(placement::best_match(&candidates, &row))
+    })
+    .await
+}
+
+/// Which clips have a match to show them in, all at once, so the library can offer "Show in
+/// match" without asking once per card.
+#[derive(Serialize, Clone)]
+pub struct ClipMatchRef {
+    clip_id: i64,
+    match_id: i64,
+    session_id: i64,
+}
+
+#[tauri::command]
+pub async fn clip_match_index(app: AppHandle) -> Result<Vec<ClipMatchRef>, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        // Before the session database opens there is simply nothing to show a clip in.
+        let Some(store) = state.sessions.lock().unwrap().clone() else {
+            return Ok(Vec::new());
+        };
+        let clips = queue_or_err(&state)?.list().map_err(|e| format!("{e:#}"))?;
+        let candidates = placement::candidates(&store).map_err(|e| format!("{e:#}"))?;
+        Ok(clips
+            .iter()
+            .filter_map(|c| {
+                placement::best_match(&candidates, c).map(|m| ClipMatchRef {
+                    clip_id: c.id,
+                    match_id: m.match_id,
+                    session_id: m.session_id,
+                })
+            })
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]

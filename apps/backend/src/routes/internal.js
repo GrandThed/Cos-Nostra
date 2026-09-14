@@ -1,21 +1,24 @@
 // Bot -> backend routes, protected by BOT_SHARED_SECRET. The bot records the Discord
 // message it posted for a clip and every reaction add/remove; reactions are append-only
 // rows closed with removed_at so history survives and rankings only count open rows.
+// Posts are closed the same way when their message is taken down (DELETE
+// /internal/posts/:messageId after Hide, lib/clip-purge.js on delete or unpublish).
 // It also reads and writes guild_settings, the per-guild channel and seed emojis that
 // `/clips setup` configures.
 //
-// Also registers plugins/bot.js so app.notifyBot exists app-wide (app.js only imports
-// route files; each route file owns the plugins it needs). Both plugins carry
-// skip-override: Fastify encapsulates each registered plugin, so a decorator added two
-// levels down would otherwise never reach the root instance the clips routes see.
+// Also registers plugins/bot.js so app.notifyBot and the other backend -> bot calls exist
+// app-wide (app.js only imports route files; each route file owns the plugins it needs). Both
+// plugins carry skip-override: Fastify encapsulates each registered plugin, so a decorator
+// added two levels down would otherwise never reach the root instance the clips routes see.
 
 import { timingSafeEqual } from 'node:crypto';
-import { and, asc, count, eq, isNull, ne } from 'drizzle-orm';
+import { and, asc, count, eq, isNull, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import botPlugin from '../plugins/bot.js';
 import { clips, guildSettings, posts, reactions, users } from '../db/schema.js';
 import { purgeClip } from '../lib/clip-purge.js';
+import { livePosts, parseTargetGuilds, safeParseJsonArray } from '../lib/publish.js';
 import { RESERVED_SLUGS } from './guildSite.js';
 
 const postBody = z.object({
@@ -56,23 +59,6 @@ const guildBody = z.object({
     .refine((s) => !RESERVED_SLUGS.has(s), 'reserved')
     .optional(),
 });
-
-/**
- * A column that holds a JSON array as plain text (clips.participants, guild_settings.
- * seed_emojis). Anything unparsable degrades to an empty array: only these routes write those
- * columns, so bad text means someone edited the row by hand, and that must not 500 the request
- * the bot needs to post at all.
- * @param {string | null | undefined} text
- * @returns {string[]}
- */
-function safeParseJsonArray(text) {
-  try {
-    const parsed = JSON.parse(text ?? '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
 
 /**
  * Fallback for when plugins/auth.js has not landed yet: the same check the auth package
@@ -194,6 +180,20 @@ async function internalRoutes(app) {
     return { ...rest, open: await countOpen(app, id) };
   });
 
+  // The bot deleted a post's Discord message (Hide in the manage menu). The row stays, with its
+  // reactions, so the clip keeps its place on the guild site and in the rankings; it only stops
+  // counting as live, which is what lets the owner post the clip to that guild again. A repeat
+  // call keeps the first removed_at, so a retried request cannot move the timestamp.
+  app.delete('/internal/posts/:messageId', opts, async (req, reply) => {
+    const updated = await app.db
+      .update(posts)
+      .set({ removedAt: sql`coalesce(${posts.removedAt}, now())` })
+      .where(eq(posts.messageId, req.params.messageId))
+      .returning({ id: posts.id });
+    if (updated.length === 0) return reply.code(404).send({ error: 'unknown_message' });
+    return reply.code(204).send();
+  });
+
   app.get('/internal/clips/:id', opts, async (req, reply) => {
     const id = req.params.id;
     const [row] = await app.db
@@ -206,6 +206,7 @@ async function internalRoutes(app) {
         recordedAt: clips.recordedAt,
         status: clips.status,
         participants: clips.participants,
+        targetGuilds: clips.targetGuilds,
         discordId: users.discordId,
         username: users.username,
       })
@@ -226,6 +227,12 @@ async function internalRoutes(app) {
       // Discord ids of whoever was in voice with the owner at capture time. Only the bot ever
       // sees these; the public clip JSON has no such field.
       participants: safeParseJsonArray(row.participants),
+      // Where the owner asked for the clip to be posted: null for a legacy clip (every
+      // configured guild), otherwise the ids chosen at publish time, possibly none.
+      targetGuildIds: parseTargetGuilds(row.targetGuilds),
+      // Messages of this clip still up in Discord, so the bot never posts twice to one guild,
+      // whether a /post is retried or the owner asks for more guilds later.
+      posts: await livePosts(app, row.id),
       urls: {
         h264: `${base}/clips/${id}/h264`,
         thumb: `${base}/clips/${id}/thumb`,

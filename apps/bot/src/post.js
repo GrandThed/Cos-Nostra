@@ -1,5 +1,13 @@
-// Posts one clip to every configured guild channel and records the resulting message ids
+// Posts one clip to the guild channels it is meant for and records the resulting message ids
 // with the backend.
+//
+// Which guilds those are is resolved here, not by the backend (see resolveTargets()). A clip
+// published from a current desktop build carries the servers its owner picked, and each one
+// must still have a clip channel and still have the owner as a member when the post happens:
+// the backend only knows what was picked, and only the bot can ask Discord who is in a guild.
+// A clip from an older build carries no targets and goes to every configured guild, as it
+// always did. Guilds that already show a live post of the clip are skipped either way, which
+// is what makes a retried notification or a second "post to more servers" safe.
 //
 // The attachment-vs-link decision is made per guild, not per clip: the upload limit is a
 // property of the guild's boost tier, so the same clip can go up as a playable attachment
@@ -16,6 +24,7 @@ import { AttachmentBuilder } from 'discord.js';
 
 import { resolveLocale, t } from './i18n.js';
 import { manageRow } from './manage.js';
+import { isMember } from './members.js';
 
 const MB = 1024 * 1024;
 
@@ -179,6 +188,9 @@ function isSendableText(channel) {
  * @property {string[]} participants  Discord ids of everyone who was in the owner's voice
  *   channel when the hotkey was pressed, recorded by the desktop app at capture time
  * @property {{ h264: string, thumb: string, page: string }} urls
+ * @property {string[] | null} [targetGuildIds]  the servers the owner picked when publishing;
+ *   null (or absent, from a backend older than publish-on-demand) means every configured guild
+ * @property {PostedMessage[]} [posts]  the clip's live Discord posts, one per guild at most
  */
 
 /**
@@ -202,7 +214,7 @@ function isSendableText(channel) {
  * }} options.backend
  * @param {{ info?: Function, warn?: Function, error?: Function }} [options.log]
  * @param {typeof globalThis.fetch} [options.fetch] injected in tests
- * @returns {{ postClip: (clipId: string) => Promise<PostedMessage[]> }}
+ * @returns {{ postClip: (clipId: string, guildIds?: string[] | null) => Promise<PostedMessage[]> }}
  */
 export function createPoster({
   client,
@@ -354,12 +366,89 @@ export function createPoster({
     return posted;
   }
 
+  /**
+   * Whether the clip's owner is in the guild, answering false - with a warning - whenever
+   * Discord cannot say yes. Posting someone's clip into a server they are not in is the one
+   * outcome this check exists to prevent, so "could not tell" errs on the side of not posting.
+   * @param {Clip} clip
+   * @param {string} guildId
+   * @returns {Promise<boolean>}
+   */
+  async function ownerIsMember(clip, guildId) {
+    const ownerId = clip.owner?.discordId;
+    if (!ownerId) {
+      log.warn?.(`clip ${clip.id}: owner has no Discord id, cannot check guild ${guildId}`);
+      return false;
+    }
+    let guild;
+    try {
+      // The Guilds intent keeps the cache complete; the fetch is for the moments it is not,
+      // such as a guild that became available again after an outage.
+      guild = client.guilds?.cache?.get(guildId) ?? (await client.guilds.fetch(guildId));
+    } catch (err) {
+      log.warn?.(`clip ${clip.id}: guild ${guildId} is not reachable by the bot: ${err?.message ?? err}`);
+      return false;
+    }
+    try {
+      if (await isMember(guild, ownerId)) return true;
+      log.warn?.(`clip ${clip.id}: owner ${ownerId} is not a member of guild ${guildId}, skipping`);
+    } catch (err) {
+      log.warn?.(
+        `clip ${clip.id}: membership of ${ownerId} in guild ${guildId} could not be checked, skipping: ${err?.message ?? err}`,
+      );
+    }
+    return false;
+  }
+
+  /**
+   * The configured guilds this post goes to, and whether each still needs the owner's
+   * membership confirmed before it gets the clip.
+   *
+   * `wanted = guildIds ?? clip.targetGuildIds`, so an explicit list from POST /post (a "post to
+   * more servers" call) wins over what was picked at publish time. Null there is the legacy
+   * clip: every configured guild, no membership check, exactly as before targets existed.
+   *
+   * @param {Clip} clip
+   * @param {GuildConfig[]} guilds  every configured guild
+   * @param {string[] | null | undefined} guildIds
+   * @returns {{ targets: GuildConfig[], checkMembership: boolean }}
+   */
+  function resolveTargets(clip, guilds, guildIds) {
+    const raw = guildIds ?? clip.targetGuildIds ?? null;
+    if (raw !== null && !Array.isArray(raw)) {
+      // Not "every guild": a malformed target list must never widen into posting everywhere.
+      throw new TypeError(`clip ${clip.id}: target guild list is not an array`);
+    }
+    const wanted = raw === null ? null : new Set(raw.map(String));
+    const live = new Set((clip.posts ?? []).map((post) => String(post?.guildId)));
+
+    if (wanted) {
+      const configured = new Set(guilds.map((config) => String(config?.guildId)));
+      const unknown = [...wanted].filter((guildId) => !configured.has(guildId));
+      if (unknown.length > 0) {
+        log.info?.(`clip ${clip.id}: guild(s) ${unknown.join(', ')} are not configured, skipping`);
+      }
+    }
+
+    const targets = guilds.filter((config) => {
+      const guildId = String(config?.guildId);
+      if (wanted && !wanted.has(guildId)) return false;
+      if (live.has(guildId)) {
+        log.info?.(`clip ${clip.id}: already posted in guild ${guildId}, skipping`);
+        return false;
+      }
+      return true;
+    });
+    return { targets, checkMembership: wanted !== null };
+  }
+
   return {
     /**
      * @param {string} clipId
+     * @param {string[] | null} [guildIds]  overrides the clip's own targets when given
      * @returns {Promise<PostedMessage[]>}
      */
-    async postClip(clipId) {
+    async postClip(clipId, guildIds) {
       const clip = await backend.getClip(clipId);
       if (!clip) {
         // Deleted, or not finished uploading. Neither is worth a retry.
@@ -376,13 +465,15 @@ export function createPoster({
       if (guilds.length === 0) {
         log.warn?.(`clip ${clipId}: no guild has a clip channel configured`);
       }
+      const { targets, checkMembership } = resolveTargets(clip, guilds, guildIds);
 
       /** @type {{ promise?: Promise<Buffer> }} */
       const cache = {};
       /** @type {PostedMessage[]} */
       const posted = [];
-      for (const config of guilds) {
+      for (const config of targets) {
         try {
+          if (checkMembership && !(await ownerIsMember(clip, config.guildId))) continue;
           const result = await postToGuild(clip, config, cache);
           if (result) posted.push(result);
         } catch (err) {

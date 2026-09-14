@@ -1,0 +1,185 @@
+/* The status circle and the server icons a clip wears (circles.ts). Token colours only, so
+   both themes come for free; the few rules for sitting on top of a thumbnail use the
+   theme-independent over-video scrim, like the duration chip beside them. */
+
+/* --- Status circle -------------------------------------------------------- */
+
+.status-dot {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+/* Local: nothing is happening to it and nothing will, so it is only an outline. */
+.status-dot.local {
+  border: 1.5px solid var(--mut);
+}
+
+.status-dot.published {
+  background: var(--ok);
+}
+
+.status-dot.retrying {
+  background: var(--warn);
+}
+
+.status-dot.failed {
+  background: var(--err);
+}
+
+/* Busy with no percentage to show (queued, waiting): a slow breath of the accent. */
+.status-dot.busy {
+  background: var(--acc);
+  animation: dot-breathe 1.8s ease-in-out infinite;
+}
+
+/* Busy with a percentage: a centre dot inside a thin ring that fills clockwise. */
+.status-dot.busy.ring {
+  background: none;
+  animation: none;
+}
+
+.status-dot.busy.ring::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    var(--acc) calc(var(--p, 0) * 3.6deg),
+    color-mix(in srgb, var(--acc) 26%, transparent) 0
+  );
+  -webkit-mask: radial-gradient(circle, transparent 3.6px, #000 4.1px);
+  mask: radial-gradient(circle, transparent 3.6px, #000 4.1px);
+}
+
+.status-dot.busy.ring::after {
+  content: "";
+  position: absolute;
+  inset: 3.5px;
+  border-radius: 50%;
+  background: var(--acc);
+}
+
+@keyframes dot-breathe {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.busy {
+    animation: none;
+  }
+}
+
+/* --- Server icons --------------------------------------------------------- */
+
+.servers {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.guild {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--ink);
+  background: var(--panel2);
+  /* The ring that separates overlapping circles is the colour of whatever they sit on. */
+  box-shadow: 0 0 0 2px var(--panel);
+}
+
+.servers .guild + .guild {
+  margin-left: -6px;
+}
+
+.guild img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.guild.tone-0 {
+  background: color-mix(in srgb, var(--acc) 34%, var(--panel));
+}
+
+.guild.tone-1 {
+  background: color-mix(in srgb, var(--info) 34%, var(--panel));
+}
+
+.guild.tone-2 {
+  background: color-mix(in srgb, var(--rel) 34%, var(--panel));
+}
+
+.guild.tone-3 {
+  background: color-mix(in srgb, var(--ok) 34%, var(--panel));
+}
+
+.guild.more {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--mut);
+  background: var(--panel2);
+}
+
+.guild.web {
+  color: var(--ok);
+  background: var(--okWash);
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+}
+
+/* --- On a thumbnail -------------------------------------------------------- */
+
+.shot .status-dot,
+.shot .servers {
+  position: absolute;
+  top: 8px;
+  /* Above the hover actions' dark wash, and out of the pointer's way. */
+  z-index: 1;
+  pointer-events: none;
+}
+
+.shot .status-dot {
+  left: 8px;
+  box-shadow: 0 0 0 2.5px var(--overVideo);
+}
+
+.shot .status-dot.local {
+  border-color: var(--overVideoInk);
+  background: var(--overVideo);
+}
+
+.shot .servers {
+  right: 8px;
+}
+
+.shot .guild {
+  box-shadow: 0 0 0 2px var(--overVideo);
+}
+
+.shot .guild.more {
+  color: var(--overVideoInk);
+  background: var(--overVideo);
+}
+
+.shot .guild.web {
+  color: var(--overVideoInk);
+  background: var(--overVideo);
+  border-color: rgba(241, 234, 219, 0.45);
+}

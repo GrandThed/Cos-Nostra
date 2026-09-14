@@ -107,8 +107,14 @@ pub struct Settings {
     pub device_token: Option<String>,
     /// Who the token belongs to; shown in the UI.
     pub account: Option<Account>,
-    /// Upload every encoded clip without asking.
-    pub auto_upload: bool,
+    /// The Discord servers the publish dialog had ticked last time, so the next clip offers the
+    /// same ones. Only a default: the dialog intersects it with the servers the account can
+    /// post to right now, and falls back to all of them when nothing is left.
+    ///
+    /// An `auto_upload` flag used to sit here. Clips no longer upload unless the user publishes
+    /// them, so it went; a `settings.json` that still carries the key loads fine, since serde
+    /// skips fields the struct does not name, and the next save drops it.
+    pub last_publish_guilds: Vec<String>,
     /// Delete the original replay-buffer recording once both encoder outputs exist. The buffer
     /// writes about ten times what the AV1 copy costs, so this is where the disk goes. Off by
     /// default because the original is the best source for a future re-encode or trim.
@@ -162,7 +168,7 @@ impl Default for Settings {
             valorant_shard: "na".into(),
             device_token: None,
             account: None,
-            auto_upload: true,
+            last_publish_guilds: Vec::new(),
             delete_source_after_encode: false,
             storage_limit_gb: 0,
             session_storage_limit_gb: 0,
@@ -388,7 +394,7 @@ mod tests {
     fn defaults_are_logged_out() {
         let s = Settings::default();
         assert!(!s.logged_in());
-        assert!(s.auto_upload);
+        assert!(s.last_publish_guilds.is_empty());
         assert_eq!(s.backend_url, DEFAULT_BACKEND_URL);
         s.validate().unwrap();
     }
@@ -407,7 +413,10 @@ mod tests {
         let s: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.hotkey, "Alt+F9");
         assert_eq!(s.buffer_seconds, 45);
-        assert!(!s.auto_upload);
+        // The removed upload switch is skipped on the way in and gone on the way out, and no
+        // server choice is remembered yet.
+        assert!(s.last_publish_guilds.is_empty());
+        assert!(!serde_json::to_string(&s).unwrap().contains("auto_upload"));
         assert_eq!(s.quality, Quality::Balanced);
         assert_eq!(s.encode_engine, EncodeEngine::Cpu);
         // The storage settings arrived later still, and both defaults mean "behave as before".

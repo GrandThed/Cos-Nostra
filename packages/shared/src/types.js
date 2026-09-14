@@ -89,6 +89,56 @@ export const DEFAULT_LOCALE = 'es';
  * @property {string} recordedAt  ISO 8601
  * @property {string[]} [participantDiscordIds]  who was in voice with the owner at capture
  *   time, from voiceSnapshot(). At most 50; omitted or null means nobody was.
+ * @property {string[] | null} [guildIds]  the servers picked in the Publish dialog, at most 25.
+ *   Omitted or null is the legacy behaviour: the first complete posts to every configured
+ *   guild. `[]` publishes to the web page only. Ids of guilds that are not set up are dropped.
+ */
+
+/**
+ * The internal clip's pointer to one Discord message.
+ * @typedef {object} PostRef
+ * @property {string} guildId
+ * @property {string} channelId
+ * @property {string} messageId
+ */
+
+/**
+ * Response of GET /internal/clips/:id: the clip as the bot needs it. `targetGuildIds` is null
+ * for a clip published by a build from before publish-on-demand, meaning every configured
+ * guild. `posts` lists only live posts, never hidden or unpublished ones.
+ * @typedef {Clip & {
+ *   participants: string[],
+ *   targetGuildIds: string[] | null,
+ *   posts: PostRef[],
+ * }} InternalClip
+ */
+
+/**
+ * One row of GET /discord/guilds: a server the Publish dialog may offer.
+ * @typedef {object} PublishGuild
+ * @property {string} guildId
+ * @property {string | null} name
+ * @property {string | null} iconUrl  96 px Discord CDN icon, null when the server has none
+ * @property {string | null} slug
+ */
+
+/**
+ * Response of POST /clips/:id/posts.
+ * @typedef {object} AddClipPostsResponse
+ * @property {string[]} queued  the guild ids the bot was asked to post to
+ */
+
+/**
+ * One row of GET /me/posts: a live Discord post of one of the caller's clips.
+ * @typedef {object} MyPost
+ * @property {string} clipId
+ * @property {string} guildId
+ * @property {string | null} name
+ * @property {string | null} iconUrl
+ * @property {string} channelId
+ * @property {string} messageId
+ * @property {string} messageUrl  https://discord.com/channels/<guild>/<channel>/<message>
+ * @property {string} postedAt  ISO 8601
  */
 
 /**

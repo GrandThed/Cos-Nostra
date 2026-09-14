@@ -3,6 +3,7 @@
  *  The selection, the search text, the filter chips and the sort survive a tab switch, so
  *  coming back from Storage puts you where you were. */
 
+import { paintStatusDot, serverStack, statusDot } from "./circles";
 import {
   badgeFor,
   clipsNote,
@@ -24,6 +25,7 @@ import { confirming, editInline, fill, h } from "./dom";
 import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhen, hueFor } from "./format";
 import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
+import { openPublishDialog } from "./publish";
 import { go } from "./router";
 import { data, loadClips, loadStorage, on } from "./store";
 import { keepOnly, resetWatches, watch } from "./thumbs";
@@ -68,11 +70,16 @@ export function initLibrary(): void {
   on("progress", () => {
     if (parts) refreshBadges();
   });
-  // The status poll runs every five seconds whether or not anything moved. Only two things in
-  // it reach the grid: which game is hooked (a clip waits for it) and the hotkey the empty
-  // state names.
+  // Which clips have a match arrives a moment after the clips do; it only shows or hides one
+  // button per card, so it does not rebuild the grid either.
+  on("clipMatches", () => {
+    if (parts) refreshMatchButtons();
+  });
+  // The status poll runs every five seconds whether or not anything moved. Only three things
+  // in it reach the grid: which game is hooked (a clip waits for it), whether Discord is
+  // linked (a published clip waits for that) and the hotkey the empty state names.
   on("status", () => {
-    const key = `${data.status?.hooked_game?.executable ?? ""}|${data.status?.hotkey ?? ""}`;
+    const key = `${data.status?.hooked_game?.executable ?? ""}|${data.status?.hotkey ?? ""}|${data.status?.account?.discord_id ?? ""}`;
     if (!parts || key === lastStatusKey) return;
     lastStatusKey = key;
     renderMain();
@@ -329,31 +336,38 @@ export function visibleClips(): ClipRow[] {
   return sortClips(clips, sort);
 }
 
-/** The badge elements on screen, per clip: a card carries two, one over the thumbnail for the
- *  grid and one at the end of the row for the compact layout. */
-const cardBadges = new Map<number, HTMLElement[]>();
+/** The status elements on screen, per clip: the circle over the thumbnail for the grid, and
+ *  the text badge at the end of the row for the compact layout. */
+const cardBadges = new Map<number, { dot: HTMLElement; trail: HTMLElement }>();
+/** Each card's "Show in match" button, shown only while the clip has a match to show. */
+const matchButtons = new Map<number, HTMLElement>();
 
-/** Repaints the badges whose clip has a live percentage, leaving the rest of the grid alone. */
+/** Repaints every card's circle and badge in place, leaving the rest of the grid alone: a
+ *  percentage moves several times a second. */
 function refreshBadges(): void {
   const byId = new Map(data.clips.map((c) => [c.id, c]));
-  for (const [id, nodes] of cardBadges) {
+  for (const [id, { dot, trail }] of cardBadges) {
     const clip = byId.get(id);
     if (!clip) continue;
     const badge = badgeFor(clip, data.progress.get(id), data.status, data.settings);
-    for (const node of nodes) {
-      if (node.textContent === badge.label) continue;
-      node.textContent = badge.label;
-      node.className = `badge ${node.classList.contains("over") ? "over" : "trail"} ${badge.kind}`;
-      if (badge.title) node.title = badge.title;
-      else node.removeAttribute("title");
-    }
+    paintStatusDot(dot, badge);
+    if (trail.textContent === badge.label) continue;
+    trail.textContent = badge.label;
+    trail.className = `badge trail ${badge.kind}`;
+    if (badge.title) trail.title = badge.title;
+    else trail.removeAttribute("title");
   }
+}
+
+function refreshMatchButtons(): void {
+  for (const [id, button] of matchButtons) button.hidden = !data.clipMatches.has(id);
 }
 
 function renderMain(): void {
   if (!parts) return;
   resetWatches();
   cardBadges.clear();
+  matchButtons.clear();
   const clips = visibleClips();
   const recent = selection.kind === "recent";
 
@@ -430,7 +444,7 @@ function filterChip(id: FilterId, label: string): HTMLElement {
   const scope =
     where.kind === "game" ? data.clips.filter((c) => c.game === where.game) : data.clips;
   const n = scope.filter(filter.match).length;
-  const showCount = id === "not-uploaded" || id === "failed";
+  const showCount = id === "local" || id === "failed";
   return h("button", {
     type: "button",
     class: "chip",
@@ -505,10 +519,10 @@ function grid(clips: ClipRow[], byGame: boolean): HTMLElement {
 function card(c: ClipRow, byGame: boolean): HTMLElement {
   const badge = badgeFor(c, data.progress.get(c.id), data.status, data.settings);
   const released = isReleased(c);
-  // Both copies of the badge are kept so a progress tick can repaint them in place.
-  const over = h("span", { class: `badge over ${badge.kind}`, text: badge.label, title: badge.title });
+  // Both are kept so a progress tick can repaint them in place.
+  const dot = statusDot(badge);
   const trail = h("span", { class: `badge trail ${badge.kind}`, text: badge.label, title: badge.title });
-  cardBadges.set(c.id, [over, trail]);
+  cardBadges.set(c.id, { dot, trail });
 
   const img = h("img", { alt: "" }) as HTMLImageElement;
   watch(img, c.id, c.thumb_path, c.updated_at);
@@ -517,6 +531,26 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
   if (c.page_url) {
     actions.append(copyLinkButton(c.page_url, "btn small"));
   }
+  // A clip on its way up has nothing to choose yet; its card says how far it got.
+  if (c.remote_id || !c.publish) {
+    actions.append(
+      h("button", {
+        type: "button",
+        class: c.remote_id ? "btn small" : "btn small publish",
+        text: c.remote_id ? t("library.servers") : t("library.publish"),
+        onclick: () => openPublishDialog(c.id),
+      }),
+    );
+  }
+  const inMatch = h("button", {
+    type: "button",
+    class: "btn small",
+    text: t("library.showInMatch"),
+    hidden: !data.clipMatches.has(c.id),
+    onclick: () => showInMatch(c.id),
+  });
+  matchButtons.set(c.id, inMatch);
+  actions.append(inMatch);
   if (!released) {
     actions.append(
       h("button", {
@@ -558,7 +592,8 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
       "div",
       { class: "shot" },
       img,
-      over,
+      dot,
+      serverStack(c),
       h("span", { class: "dur", text: fmtDuration(c.duration_ms) }),
       actions,
     ),
@@ -575,10 +610,11 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
         }),
         h("span", {
           class: "meta",
-          text: byGame ? recentMeta(c) : metaLine(c, data.settings),
+          text: byGame ? recentMeta(c) : metaLine(c, data.status),
           title: c.title ?? undefined,
         }),
       ),
+      serverStack(c),
       c.status === "failed"
         ? h("button", {
             type: "button",
@@ -594,6 +630,12 @@ function card(c: ClipRow, byGame: boolean): HTMLElement {
     ),
   );
   return node;
+}
+
+/** Opens the Matches tab on the match a clip was taken in, with the clip's range selected. */
+export function showInMatch(clipId: number): void {
+  const ref = data.clipMatches.get(clipId);
+  if (ref) go({ view: "matches", session: ref.session_id, match: ref.match_id, clip: clipId });
 }
 
 /** In the cross-game view the card is titled with the game, so the second line carries the

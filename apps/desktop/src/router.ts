@@ -4,7 +4,8 @@
 export type Tab = "library" | "matches" | "storage" | "settings";
 export type Route =
   | { view: Exclude<Tab, "matches"> }
-  | { view: "matches"; session?: number; match?: number }
+  /** `clip` opens the match with that clip's range selected on its timeline. */
+  | { view: "matches"; session?: number; match?: number; clip?: number }
   | { view: "player"; id: number }
   | { view: "editor"; id: number };
 

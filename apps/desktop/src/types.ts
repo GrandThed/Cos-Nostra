@@ -36,7 +36,6 @@ export interface Status {
   encoders: Encoders | null;
   ffmpeg_error: string | null;
   account: Account | null;
-  auto_upload: boolean;
   /** The game session being recorded right now, if one is. */
   session: LiveSession | null;
 }
@@ -67,7 +66,8 @@ export interface Settings {
   /** No `device_token`: `get_settings` blanks it, and `save_settings` puts the live one back.
    *  Whether a device is linked is `account` (or `get_account`), never the token itself. */
   account: Account | null;
-  auto_upload: boolean;
+  /** The servers the publish dialog had ticked last time; its default next time. */
+  last_publish_guilds: string[];
   delete_source_after_encode: boolean;
   storage_limit_gb: number;
   /** Same idea as `storage_limit_gb`, but for `<clip folder>\Matches`: 0 for no limit. */
@@ -92,18 +92,68 @@ export interface Segment {
   end_ms: number;
 }
 
-/** What the editor loads for a clip. Matches `EditSource` in `lib.rs`. */
+export type SourceKind = "match" | "clip";
+
+/** What the editor loads for a clip. Matches `edit::EditSource`. */
 export interface EditSource {
+  kind: SourceKind;
+  /** The match file, or the clip's own recording (or encoded copy). */
   path: string;
+  match_id: number | null;
   duration_ms: number;
   fps: number;
   width: number;
   height: number;
   has_audio: boolean;
-  /** The cut already on the clip, when it was measured against this file. */
-  cut: Segment[] | null;
-  /** True when the file is the untouched recording, so a cut can be changed again later. */
+  /** The clip's current range, in `path` milliseconds. */
+  range: Segment;
+  /** Where the footage the clip already has sits in `path`; null when it has none here. */
+  clip_span: Segment | null;
+  /** True when the clip's own file is the untouched recording. */
   original: boolean;
+  /** The stored cut has several parts, which Apply turns into one range. */
+  multi_part: boolean;
+}
+
+/** One live Discord post of a clip. Matches `queue::ClipPost`. */
+export interface ClipPost {
+  guild_id: string;
+  name: string | null;
+  icon_url: string | null;
+  message_url: string;
+  posted_at: string;
+}
+
+/** A server the publish dialog offers. */
+export interface PublishGuild {
+  guild_id: string;
+  name: string | null;
+  icon_url: string | null;
+}
+
+/** A clip drawn on a match timeline, in match-file milliseconds. `placement::MatchClip`. */
+export interface MatchClip {
+  clip_id: number;
+  start_ms: number;
+  end_ms: number;
+  status: ClipStatus;
+  published: boolean;
+}
+
+/** The match a clip was taken in. `placement::ClipMatch`. */
+export interface ClipMatch {
+  match_id: number;
+  session_id: number;
+  start_ms: number;
+  end_ms: number;
+  duration_ms: number;
+  path: string;
+}
+
+export interface ClipMatchRef {
+  clip_id: number;
+  match_id: number;
+  session_id: number;
 }
 
 export interface ClipRow {
@@ -132,6 +182,14 @@ export interface ClipRow {
   cut: Segment[] | null;
   /** When the row last changed; the thumbnail cache is keyed on it. */
   updated_at: string;
+  /** The user pressed Publish. Without it the clip is local, whatever its status. */
+  publish: boolean;
+  publish_guilds: string[] | null;
+  publish_title: string | null;
+  /** UTC time of the recording's first frame, which places the clip on its match. */
+  captured_at: string | null;
+  /** Live Discord posts, as the backend last reported them. */
+  posts: ClipPost[];
 }
 
 /** Live percentage of the encode or upload running right now. */

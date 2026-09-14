@@ -3,8 +3,9 @@
 //
 // Route files register themselves; each owns one resource:
 //   routes/auth.js      device login, Discord OAuth
-//   routes/clips.js     clip records, presigned uploads, media redirects, listing, rankings
-//   routes/discord.js   desktop -> bot lookups (voice snapshot at capture time)
+//   routes/clips.js     clip records, presigned uploads, media redirects, listing, rankings,
+//                       posting to more guilds and the caller's live posts
+//   routes/discord.js   desktop -> bot lookups (voice snapshot, guilds to publish to)
 //   routes/internal.js  bot -> backend: posts and reactions (shared secret)
 //   routes/player.js    GET /c/:id player page
 // Cross-cutting concerns are plugins under plugins/.

@@ -11,6 +11,7 @@ import { t } from "./i18n";
 import { initLibrary, mountLibrary, unmountLibrary } from "./library";
 import { initMatches, mountMatches, unmountMatches } from "./matches";
 import { initPlayer, mountPlayer, unmountPlayer } from "./player";
+import { initPublish, publishLoginFailed } from "./publish";
 import { activeTab, current, go, onRoute, type Route, type Tab } from "./router";
 import { initSettings, mountSettings, onLoginStateChanged, unmountSettings } from "./settings";
 import { initShell, noteClipSaved, renderBanners, renderToolbar } from "./shell";
@@ -20,6 +21,7 @@ import {
   applyProgress,
   data,
   loadBootstrap,
+  loadClipMatches,
   loadClips,
   loadProgress,
   loadSessions,
@@ -40,6 +42,7 @@ initStorage();
 initSettings();
 initFirstRun();
 initUpdater();
+initPublish();
 
 for (const tab of TABS) {
   el(`tab-${tab}`).addEventListener("click", () => go({ view: tab }));
@@ -63,7 +66,7 @@ function mount(route: Route): void {
 
   const view = el("view");
   if (route.view === "library") mountLibrary(view);
-  else if (route.view === "matches") mountMatches(view, route.session, route.match);
+  else if (route.view === "matches") mountMatches(view, route.session, route.match, route.clip);
   else if (route.view === "player") mountPlayer(view, route.id);
   else if (route.view === "editor") mountEditor(view, route.id);
   else if (route.view === "storage") mountStorage(view);
@@ -89,13 +92,18 @@ void listen("status-changed", () => {
 
 void listen("clips-changed", () => {
   void loadClips();
+  void loadClipMatches();
   // The folder scan is the expensive one, so it only runs where its numbers are on screen.
   if (current().view === "storage" || current().view === "library") void loadStorage();
 });
 
 void listen<ClipProgress>("clip-progress", (e) => applyProgress(e.payload));
 
-void listen("sessions-changed", () => void loadSessions());
+void listen("sessions-changed", () => {
+  void loadSessions();
+  // A match cut or deleted moves which clips can be shown in one.
+  void loadClipMatches();
+});
 
 // The player left a game: Rust has already brought the window up, so show that session.
 // Not while the editor is open, where jumping away would throw a cut in progress away.
@@ -123,6 +131,7 @@ void listen<Account | null>("account-changed", (e) => {
 void listen<string>("login-failed", (e) => {
   onLoginStateChanged(null, e.payload);
   loginFailed(e.payload);
+  publishLoginFailed(e.payload);
 });
 
 // ---------------------------------------------------------------------------
@@ -136,6 +145,7 @@ async function start(): Promise<void> {
     loadClips(),
     loadProgress(),
     loadSessions(),
+    loadClipMatches(),
   ]);
   renderToolbar();
   renderBanners();

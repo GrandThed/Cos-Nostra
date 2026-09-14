@@ -187,6 +187,98 @@ test('createClip carries participantDiscordIds through untouched', async () => {
   assert.deepEqual(JSON.parse(last().body).participantDiscordIds, ['1', '2']);
 });
 
+test('createClip carries guildIds through untouched, null and empty included', async () => {
+  // null is the legacy "post everywhere" and [] is "web page only": the client must not
+  // collapse either into the other, or drop the field.
+  answer = { status: 201, body: { id: 'c1', uploads: {}, expiresIn: 900 } };
+  const api = createClient({ baseUrl, token: 'user-token' });
+  for (const guildIds of [['1', '2'], [], null]) {
+    await api.createClip({ durationMs: 1, guildIds });
+    assert.deepEqual(JSON.parse(last().body).guildIds, guildIds);
+  }
+});
+
+test('listPublishGuilds reads /discord/guilds as the device', async () => {
+  const items = [{ guildId: '1', name: 'Fa Mafia', iconUrl: null, slug: 'famafia' }];
+  answer = { status: 200, body: { items } };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  assert.deepEqual(await api.listPublishGuilds(), { items });
+  assert.equal(last().method, 'GET');
+  assert.equal(last().url, '/discord/guilds');
+  assert.equal(last().headers.authorization, 'Bearer user-token');
+});
+
+test('listPublishGuilds surfaces bot_unavailable as a 503, not an empty list', async () => {
+  answer = { status: 503, body: { error: 'bot_unavailable' } };
+  const api = createClient({ baseUrl, token: 'user-token' });
+  await assert.rejects(api.listPublishGuilds(), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 503);
+    assert.deepEqual(err.body, { error: 'bot_unavailable' });
+    return true;
+  });
+});
+
+test('addClipPosts posts the guild ids to an encoded clip path', async () => {
+  answer = { status: 202, body: { queued: ['2'] } };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  assert.deepEqual(await api.addClipPosts('c1/x', ['1', '2']), { queued: ['2'] });
+  assert.equal(last().method, 'POST');
+  assert.equal(last().url, '/clips/c1%2Fx/posts');
+  assert.equal(last().headers.authorization, 'Bearer user-token');
+  assert.deepEqual(JSON.parse(last().body), { guildIds: ['1', '2'] });
+});
+
+test('myPosts reads /me/posts as the device', async () => {
+  const items = [
+    {
+      clipId: 'c1',
+      guildId: '1',
+      name: null,
+      iconUrl: null,
+      channelId: '2',
+      messageId: '3',
+      messageUrl: 'https://discord.com/channels/1/2/3',
+      postedAt: '2026-09-13T12:00:00.000Z',
+    },
+  ];
+  answer = { status: 200, body: { items } };
+  const api = createClient({ baseUrl, token: 'user-token' });
+  assert.deepEqual(await api.myPosts(), { items });
+  assert.equal(last().method, 'GET');
+  assert.equal(last().url, '/me/posts');
+  assert.equal(last().headers.authorization, 'Bearer user-token');
+});
+
+test('internalRemovePost deletes an encoded message id as the bot', async () => {
+  answer = { status: 204 };
+  const api = createClient({ baseUrl, token: 'user-token', botToken: 'bot-secret' });
+  assert.equal(await api.internalRemovePost('m/1'), null);
+  assert.equal(last().method, 'DELETE');
+  assert.equal(last().url, '/internal/posts/m%2F1');
+  assert.equal(last().headers.authorization, 'Bearer bot-secret', 'not the user token');
+  assert.equal(last().body, '');
+
+  answer = { status: 404, body: { error: 'unknown_message' } };
+  await assert.rejects(api.internalRemovePost('nope'), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 404);
+    return true;
+  });
+});
+
+test('internalClip hands back targetGuildIds and posts as the backend sent them', async () => {
+  const body = {
+    id: 'c1',
+    participants: [],
+    targetGuildIds: ['1'],
+    posts: [{ guildId: '1', channelId: '2', messageId: '3' }],
+  };
+  answer = { status: 200, body };
+  const api = createClient({ baseUrl, botToken: 'bot-secret' });
+  assert.deepEqual(await api.internalClip('c1'), body);
+});
+
 test('non-2xx throws ApiError with status and parsed body', async () => {
   answer = { status: 404, body: { statusCode: 404, error: 'Not Found', message: 'clip not found' } };
   const api = createClient({ baseUrl, token: 't' });

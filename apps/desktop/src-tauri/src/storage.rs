@@ -93,9 +93,10 @@ pub struct StorageStats {
     pub kinds: Kinds,
     /// Biggest first; every clip lands in exactly one entry.
     pub games: Vec<GameUsage>,
-    /// Clips the backend has a copy of.
+    /// Clips the backend has a copy of, which since publish on demand means clips the user
+    /// published.
     pub published: Bucket,
-    /// Clips that exist nowhere else.
+    /// Clips that exist nowhere else: local clips, and published ones still on their way up.
     pub local_only: Bucket,
     /// What each cleanup action would free right now. The first two overlap on clips that are
     /// both encoded and uploaded, so the numbers are recomputed after every action.
@@ -523,6 +524,7 @@ mod tests {
                 fps: 60.0,
                 size_source: bytes as i64,
                 participants: None,
+                captured_at: None,
             })
             .unwrap()
     }

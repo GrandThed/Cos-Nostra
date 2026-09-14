@@ -29,6 +29,8 @@ player leaves the game. The reasoning and what has been verified are in `docs/PL
 | `sessions.rs` | `sessions.db`: sessions, recordings, matches, events |
 | `cutter.rs` | a finished session into match files, by stream copy from the nearest keyframe |
 | `session_app.rs` | the app side: the real `Host`, processing, the Matches tab's commands |
+| `placement.rs` | where a clip sits on a match, from the clip's `captured_at` and the match file's `file_start_at` |
+| `edit.rs` | what the editor opens for a clip (its match, or its own recording) and what Apply does |
 
 Recordings (`session-<id>-<n>.mp4`) and match files live in `<clip folder>\Matches`.
 
@@ -42,9 +44,11 @@ pushes, and nothing renders from an event payload directly.
 |---|---|
 | `shell.ts` | title bar, toolbar, alarm banners, the status panel behind the recording pill |
 | `library.ts` | game sidebar, filters, the clip grid that becomes rows under 840 px |
-| `matches.ts` | sessions and their matches, the match player with its round timeline, in/out marks that become a clip |
-| `player.ts` | the clip detail view, which is also the player |
-| `editor.ts` | trim & cut: the timeline with handles, split, undo, and Apply, which sends the clip back through the queue |
+| `matches.ts` | sessions and their matches, the match player with its round timeline and your clips drawn on it, in/out marks that become a clip |
+| `player.ts` | the clip detail view, which is also the player, with the Publish button |
+| `editor.ts` | one range on the match: start and end handles, undo, and Apply |
+| `publish.ts` | the Publish dialog: title, game, servers; for a published clip, more servers, unpublish, delete |
+| `circles.ts` | the status circle and the stack of server icons on a clip |
 | `storage.ts`, `settings.ts`, `firstrun.ts` | the other three screens |
 | `clips.ts` | what a clip row means: its badge, its meta line, where its video is |
 | `styles/tokens.css` | the one token set both themes run on |
@@ -62,17 +66,33 @@ The player reads clip files through Tauri's asset protocol. `lib.rs` widens its 
 clip folder at startup and whenever the folder setting changes, so a clip outside that folder
 will not play.
 
-## Trim & cut
+## Local clips and publishing
 
-A cut is a list of kept ranges (`ffmpeg::Segment`) stored on the clip row (`cut`, schema v4)
-and measured against the original recording. Apply puts the row back to `saved`; the worker
-re-encodes both outputs from the recording with the cut applied (one segment is `-ss`/`-to`,
-several are a `trim`/`concat` filter graph in one pass), regenerates the thumbnail from inside
-the kept footage, records the new length, and re-uploads under the same clip id through
-`POST /clips/:id/replace`. While the recording is on disk the cut is non-destructive: the
-editor reopens on the whole recording with the cut drawn on it. Once the recording has been
-dropped, the encoded H.264 copy is the source, the cut is baked into it and the row's `cut` is
-cleared afterwards, and the editor warns and asks for a second click on Apply.
+Every clip starts **local**: saved, thumbnailed, playable, and never encoded or uploaded. The
+queue only moves rows with `publish = 1` (`clips.db` schema v6), which the Publish dialog sets
+together with the title, the game and the chosen servers (`publish_guilds`). The worker then
+encodes and uploads as before, sending `guildIds` with `POST /clips` so the bot posts only where
+the owner asked. `GET /me/posts` fills the row's `posts` cache (at startup, after an upload, after
+posting to more servers, every five minutes), which is what the server circles draw. Unpublish
+deletes the clip on the site and in Discord and puts the row back to local with its files;
+publishing again makes a new link.
+
+Each clip stores `captured_at`, the wall-clock time of its recording's first frame, so
+`placement.rs` can put it on the match it overlaps. Clips from before schema v6 got it from
+`recorded_at` minus their length, and match clips from those builds land early by up to a
+recording's length.
+
+## Trim
+
+The editor is one kept range, drawn on the match when the clip's match file is still here and
+on the clip's own recording otherwise. A range inside the clip's recording becomes a one-segment
+`cut` on it. A range that reaches past it copies that span plus three seconds out of the match
+into a new recording, which replaces the old one (and its encoded copies), so the clip no longer
+depends on the match surviving the storage limit. A local clip is not encoded by any of this; a
+published clip goes back to `saved` and re-uploads under the same clip id through
+`POST /clips/:id/replace`. A clip with only its encoded copy left is never cut in place: the
+range is stream-copied out of that copy into a recording of its own. The encoder still accepts a
+multi-segment `cut` for rows written by older builds; the editor opens those on their outer span.
 
 ## ffmpeg
 

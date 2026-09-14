@@ -39,7 +39,8 @@ export function createBackend({ baseUrl, botToken, fetch }) {
 
   return {
     /**
-     * Clip with owner and URLs, or null when it is unknown or not ready yet.
+     * Clip with owner, URLs, publish targets and live posts, or null when it is unknown or
+     * not ready yet.
      * @param {string} clipId
      */
     getClip: (clipId) => orNull(() => api.internalClip(clipId)),
@@ -62,6 +63,17 @@ export function createBackend({ baseUrl, botToken, fetch }) {
      */
     recordPost: ({ clipId, guildId, channelId, messageId }) =>
       api.internalPost({ clipId, guildId, channelId, messageId }),
+
+    /**
+     * Mark a post as taken down after Hide deleted its message. The row stays, so the clip
+     * keeps its votes on the site and in the rankings; it just stops counting as live.
+     *
+     * Keeps its ApiError like deleteClip: a 404 (`unknown_message`, a post the backend never
+     * recorded) is harmless and the caller says so, anything else it logs.
+     * @param {string} messageId
+     * @returns {Promise<null>}
+     */
+    removePost: (messageId) => api.internalRemovePost(messageId),
 
     /**
      * One vote. Retried by the outbox, so it must stay safe to send twice: the backend

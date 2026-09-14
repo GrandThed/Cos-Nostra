@@ -1,11 +1,13 @@
 mod api;
 mod cutter;
 mod capture;
+mod edit;
 mod settings;
 mod storage;
 mod ffmpeg;
 mod games;
 mod i18n;
+mod placement;
 mod providers;
 mod queue;
 mod session_app;
@@ -14,6 +16,7 @@ mod sessions;
 mod timeline;
 mod win;
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,10 +37,11 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use api::{Api, DevicePoll, NewClipUpload, ReplaceClipUpload};
 use capture::{CaptureConflict, HookCallback, HookedGame, Recorder};
-use ffmpeg::{Binaries, Cut, Encoders, Segment};
+use edit::{EditSource, SourceKind};
+use ffmpeg::{Binaries, Cut, Encoders};
 use games::DetectedGame;
 use queue::{
-    ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, Refused,
+    ClipPost, ClipRow, ClipStatus, Gate, NewClip, OnChange, Outputs, Processor, Queue, Refused,
     UploadResult, Uploader, Worker,
 };
 use settings::{Account, Language, Settings};
@@ -45,6 +49,18 @@ use settings::{Account, Language, Settings};
 /// How long the device login keeps polling before giving up.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LOGIN_POLL: Duration = Duration::from_secs(2);
+
+/// How often the posts cache is refreshed while logged in. Posts also change from Discord
+/// itself (Hide in the manage menu, a bot that could not post), which nothing tells us about.
+const POSTS_EVERY: Duration = Duration::from_secs(5 * 60);
+/// After an upload completes the bot posts on its own time, so the cache is refreshed twice:
+/// once when the post has usually landed, and once more for a slow bot or a rate limit.
+const POSTS_AFTER_UPLOAD: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
+
+/// Error texts the publish dialog recognises and puts in its own words. Anything else it shows
+/// as it came.
+const NOT_LOGGED_IN: &str = "not_logged_in";
+const BOT_UNAVAILABLE: &str = "bot_unavailable";
 
 struct AppState {
     settings: Mutex<Settings>,
@@ -77,6 +93,9 @@ struct AppState {
     live_session: Mutex<Option<session_watch::LiveSession>>,
     /// Sessions being cut into matches right now.
     processing: Mutex<session_app::Processing>,
+    /// Held while the posts cache is refreshed, so the timers after an upload and the periodic
+    /// refresh never write over each other with answers of different ages.
+    posts_refresh: Mutex<()>,
 }
 
 /// A running device login: the poll thread stops when `cancelled` is set.
@@ -134,7 +153,6 @@ struct Status {
     encoders: Option<Encoders>,
     ffmpeg_error: Option<String>,
     account: Option<Account>,
-    auto_upload: bool,
     /// The game session being recorded, if one is.
     session: Option<session_watch::LiveSession>,
 }
@@ -244,7 +262,6 @@ fn get_status(state: State<AppState>) -> Status {
         encoders: settings.encoders.clone(),
         ffmpeg_error: state.ffmpeg_error.lock().unwrap().clone(),
         account: settings.account.clone(),
-        auto_upload: settings.auto_upload,
         session: state.live_session.lock().unwrap().clone(),
     }
 }
@@ -489,9 +506,11 @@ fn poll_login(app: &AppHandle, api: Api, code: &str, poll_secret: &str, cancelle
 }
 
 /// Persists a token and account (or clears both), tells the UI and wakes the worker so
-/// pending `encoded` rows get uploaded.
+/// published clips that waited for a login get uploaded. A login also fetches the posts, which
+/// may already exist from another device.
 fn store_account(app: &AppHandle, token: Option<String>, account: Option<Account>) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    let logged_in = token.is_some();
     {
         let mut s = state.settings.lock().unwrap();
         s.device_token = token;
@@ -501,6 +520,9 @@ fn store_account(app: &AppHandle, token: Option<String>, account: Option<Account
     let _ = app.emit("account-changed", state.account());
     let _ = app.emit("status-changed", ());
     state.wake_worker();
+    if logged_in {
+        schedule_posts_refresh(app, Duration::ZERO);
+    }
     Ok(())
 }
 
@@ -707,118 +729,312 @@ fn get_thumbnail(state: State<AppState>, id: i64) -> Result<Option<String>, Stri
 // ---------------------------------------------------------------------------
 // Editor commands
 
-/// What the editor works on: the file, what ffprobe says about it, and the cut it already
-/// carries when that cut was measured against this very file.
-#[derive(Serialize, Clone)]
-struct EditSource {
-    path: String,
-    duration_ms: i64,
-    fps: f64,
-    width: u32,
-    height: u32,
-    has_audio: bool,
-    cut: Option<Vec<Segment>>,
-    /// True when `path` is the untouched recording, so a cut costs nothing and can be
-    /// changed again later. False means the encoded copy is all that is left and a cut is
-    /// baked into it for good.
-    original: bool,
+fn ffmpeg_or_err(state: &AppState) -> Result<Binaries, String> {
+    state
+        .ffmpeg
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "ffmpeg is not available".to_string())
 }
 
-/// The file an edit applies to: the original recording while it is still here, otherwise
-/// the best encoded copy. `None` when the clip has no video on this PC.
-fn edit_source_path(row: &ClipRow) -> Option<(String, bool)> {
-    if Path::new(&row.source_path).is_file() {
-        return Some((row.source_path.clone(), true));
-    }
-    [&row.h264_path, &row.av1_path]
-        .into_iter()
-        .flatten()
-        .find(|p| Path::new(p).is_file())
-        .map(|p| (p.clone(), false))
-}
-
-/// Probes the file the editor should load for a clip. Off the main thread: ffprobe.
+/// What the editor loads for a clip: the match it was taken in when that is still here, its own
+/// recording otherwise. Off the main thread: ffprobe.
 #[tauri::command]
 async fn edit_source(app: AppHandle, id: i64) -> Result<EditSource, String> {
     on_blocking_thread(move || {
         let state = app.state::<AppState>();
-        let row = queue_or_err(&state)?
-            .get(id)
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or_else(|| format!("clip {id} not found"))?;
-        let (path, original) = edit_source_path(&row)
-            .ok_or_else(|| "this clip has no video on this PC to edit".to_string())?;
-        let bins = state
-            .ffmpeg
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "ffmpeg is not available".to_string())?;
-        let info = ffmpeg::probe(&bins, Path::new(&path)).map_err(|e| format!("{e:#}"))?;
-        Ok(EditSource {
-            path,
-            duration_ms: info.duration_ms,
-            fps: info.fps,
-            width: info.width,
-            height: info.height,
-            has_audio: info.has_audio,
-            // A cut only means something against the recording it was made on.
-            cut: if original { row.cut.clone() } else { None },
-            original,
-        })
+        let queue = queue_or_err(&state)?;
+        let bins = ffmpeg_or_err(&state)?;
+        let store = state.sessions.lock().unwrap().clone();
+        edit::open(&bins, &queue, store.as_deref(), id).map_err(|e| format!("{e:#}"))
     })
     .await
 }
 
-/// Stores the editor's cut and sends the clip back through the encoder. An empty list is
-/// the whole recording, which is how an earlier cut is undone. A cut identical to the one
-/// the outputs already carry is a no-op, so pressing Apply twice does not encode twice.
+/// Applies the editor's one range, measured in the file of `source` (`"match"` or `"clip"`).
+/// See `edit::apply` for what that does to the clip. A published clip is woken up for the
+/// worker, which re-encodes it and replaces it on the site under the same link.
 #[tauri::command]
-async fn apply_cut(app: AppHandle, id: i64, segments: Vec<Segment>) -> Result<(), String> {
+async fn apply_range(
+    app: AppHandle,
+    id: i64,
+    source: SourceKind,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<(), String> {
     let emit_app = app.clone();
-    let changed = on_blocking_thread(move || {
+    let applied = on_blocking_thread(move || {
         let state = app.state::<AppState>();
         let queue = queue_or_err(&state)?;
-        let row = queue
-            .get(id)
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or_else(|| format!("clip {id} not found"))?;
-        let (path, original) = edit_source_path(&row)
-            .ok_or_else(|| "this clip has no video on this PC to edit".to_string())?;
-        let bins = state
-            .ffmpeg
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "ffmpeg is not available".to_string())?;
-        let info = ffmpeg::probe(&bins, Path::new(&path)).map_err(|e| format!("{e:#}"))?;
-        let cut = Cut::normalize(&segments, info.duration_ms).map_err(|e| format!("{e:#}"))?;
-
-        let current = if original { row.cut.clone().unwrap_or_default() } else { Vec::new() };
-        let settled = matches!(row.status, ClipStatus::Encoded | ClipStatus::Done);
-        if settled && cut.segments == current {
-            log::info!("clip {id}: cut unchanged, nothing to re-encode");
-            return Ok(false);
-        }
-        let stored = if cut.is_whole() { None } else { Some(cut.segments.as_slice()) };
-        queue
-            .request_reencode(id, stored)
-            .map_err(|e| format!("{e:#}"))?;
-        log::info!(
-            "clip {id}: re-encode requested with {} kept part(s) from {}",
-            cut.segments.len(),
-            path
-        );
-        Ok(true)
+        let bins = ffmpeg_or_err(&state)?;
+        let store = state.sessions.lock().unwrap().clone();
+        let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+        edit::apply(&bins, &queue, store.as_deref(), &clip_dir, id, source, start_ms, end_ms)
+            .map_err(|e| format!("{e:#}"))
     })
     .await?;
-    if changed {
+    if applied != edit::Applied::Unchanged {
         let state = emit_app.state::<AppState>();
         clear_progress(&emit_app, id);
         state.wake_worker();
         emit_clips_changed(&emit_app, Some(id));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Publishing
+
+/// A server the publish dialog offers.
+#[derive(Serialize, Clone)]
+struct PublishGuild {
+    guild_id: String,
+    name: Option<String>,
+    icon_url: Option<String>,
+}
+
+/// Only Discord's own CDN reaches the webview as an image URL; the CSP would block anything
+/// else anyway, and a URL that is not what it claims is better dropped here.
+fn discord_icon(url: Option<String>) -> Option<String> {
+    url.filter(|u| {
+        u.starts_with("https://cdn.discordapp.com/")
+            && !u.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\' || c == '"')
+    })
+}
+
+/// True for `https://discord.com/channels/<digits>/<digits>/<digits>` and nothing else: it is
+/// handed to the shell, which runs far more than web pages (see `check_verify_url`).
+fn is_discord_message_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://discord.com/channels/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    origin_of(url).is_some()
+        && parts.len() == 3
+        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Discord snowflakes, deduplicated, at most 25 of them, as the backend accepts.
+fn checked_guild_ids(ids: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        let id = id.trim().to_string();
+        if id.is_empty() || id.len() > 20 || !id.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("{id:?} is not a Discord server id"));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    if out.len() > 25 {
+        return Err("a clip can be posted to at most 25 servers at once".into());
+    }
+    Ok(out)
+}
+
+fn logged_in_api(state: &AppState) -> Result<Api, String> {
+    if !state.settings.lock().unwrap().logged_in() {
+        return Err(NOT_LOGGED_IN.into());
+    }
+    state.api().map_err(|e| format!("{e:#}"))
+}
+
+/// The servers this account can publish to. `bot_unavailable` when the backend could not ask
+/// the bot, which the dialog explains and offers to retry.
+#[tauri::command]
+async fn list_publish_guilds(app: AppHandle) -> Result<Vec<PublishGuild>, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let api = logged_in_api(&state)?;
+        match api.publish_guilds() {
+            Ok(guilds) => Ok(guilds
+                .into_iter()
+                .map(|g| PublishGuild { guild_id: g.guild_id, name: g.name, icon_url: discord_icon(g.icon_url) })
+                .collect()),
+            Err(e) if api::status_of(&e) == Some(503) => {
+                log::warn!("listing publish guilds: {e:#}");
+                Err(BOT_UNAVAILABLE.into())
+            }
+            Err(e) => Err(format!("{e:#}")),
+        }
+    })
+    .await
+}
+
+/// Publishes a local clip: records what the dialog chose and lets the worker encode and upload
+/// it. The chosen servers are remembered as next time's default.
+#[tauri::command]
+async fn publish_clip(
+    app: AppHandle,
+    id: i64,
+    title: Option<String>,
+    game: Option<String>,
+    guild_ids: Vec<String>,
+) -> Result<(), String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        if !state.settings.lock().unwrap().logged_in() {
+            return Err(NOT_LOGGED_IN.into());
+        }
+        let guilds = checked_guild_ids(guild_ids)?;
+        let tidy = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let (title, game) = (tidy(title), tidy(game));
+        queue_or_err(&state)?
+            .publish(id, title.as_deref(), game.as_deref(), &guilds)
+            .map_err(|e| format!("{e:#}"))?;
+        {
+            let mut s = state.settings.lock().unwrap();
+            s.last_publish_guilds = guilds.clone();
+            if let Err(e) = s.save() {
+                log::warn!("remembering the publish servers: {e:#}");
+            }
+        }
+        log::info!("clip {id}: published to {} server(s)", guilds.len());
+        clear_progress(&app, id);
+        state.wake_worker();
+        emit_clips_changed(&app, Some(id));
+        let _ = app.emit("status-changed", ());
+        Ok(())
+    })
+    .await
+}
+
+/// Posts an already published clip in more servers. Returns the ids the backend queued.
+#[tauri::command]
+async fn add_clip_posts(app: AppHandle, id: i64, guild_ids: Vec<String>) -> Result<Vec<String>, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let api = logged_in_api(&state)?;
+        let guilds = checked_guild_ids(guild_ids)?;
+        if guilds.is_empty() {
+            return Err("pick at least one server".into());
+        }
+        let queue = queue_or_err(&state)?;
+        let row = queue
+            .get(id)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("clip {id} not found"))?;
+        let remote = row.remote_id.ok_or_else(|| "this clip is not published".to_string())?;
+        let queued = api.add_clip_posts(&remote, &guilds).map_err(|e| match api::status_of(&e) {
+            Some(409) => "the site is still processing this clip; try again in a moment".to_string(),
+            _ => format!("{e:#}"),
+        })?;
+        if let Err(e) = queue.add_publish_guilds(id, &queued.queued) {
+            log::warn!("clip {id}: remembering the new servers: {e:#}");
+        }
+        log::info!("clip {id}: {} more post(s) queued", queued.queued.len());
+        for after in POSTS_AFTER_UPLOAD {
+            schedule_posts_refresh(&app, after);
+        }
+        Ok(queued.queued)
+    })
+    .await
+}
+
+/// Takes a clip off the site and out of Discord, and keeps it here as a local clip. Publishing
+/// it again later makes a new clip with a new link. The site goes first: if it cannot be
+/// reached the clip stays exactly as published as it was.
+#[tauri::command]
+async fn unpublish_clip(app: AppHandle, id: i64) -> Result<(), String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let queue = queue_or_err(&state)?;
+        let held = queue.begin_unpublish(id).map_err(|e| format!("{e:#}"))?;
+        if let Some(remote) = held.remote_id.as_deref() {
+            match state.api().and_then(|api| api.delete_clip(remote)) {
+                Ok(()) => log::info!("clip {id}: unpublished {remote}"),
+                Err(e) if api::status_of(&e) == Some(404) => {
+                    log::info!("clip {id}: the site no longer had {remote}");
+                }
+                Err(e) => {
+                    if let Err(restore) = queue.restore_publish(id, held.publish) {
+                        log::error!("clip {id}: could not put the publish flag back: {restore:#}");
+                    }
+                    return Err(format!("the site could not be reached, so the clip is still published: {e:#}"));
+                }
+            }
+        }
+        queue.finish_unpublish(id).map_err(|e| format!("{e:#}"))?;
+        clear_progress(&app, id);
+        emit_clips_changed(&app, Some(id));
+        schedule_posts_refresh(&app, Duration::ZERO);
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn refresh_posts(app: AppHandle) -> Result<(), String> {
+    on_blocking_thread(move || refresh_posts_now(&app).map_err(|e| format!("{e:#}"))).await
+}
+
+/// Opens one of a clip's Discord posts, by guild, from the cached link.
+#[tauri::command]
+fn open_clip_post(app: AppHandle, id: i64, guild_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let row = queue_or_err(&state)?
+        .get(id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("clip {id} not found"))?;
+    let post = row
+        .posts
+        .iter()
+        .find(|p| p.guild_id == guild_id)
+        .ok_or_else(|| "that post is not there any more".to_string())?;
+    if !is_discord_message_url(&post.message_url) {
+        return Err(format!("{} is not a Discord message link; refusing to open it", post.message_url));
+    }
+    app.opener()
+        .open_url(&post.message_url, None::<&str>)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Replaces the posts cache with `GET /me/posts`. Quietly does nothing while logged out or
+/// before the queue opened.
+fn refresh_posts_now(app: &AppHandle) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    let _one_at_a_time = state.posts_refresh.lock().unwrap_or_else(|e| e.into_inner());
+    if !state.settings.lock().unwrap().logged_in() {
+        return Ok(());
+    }
+    let Some(queue) = state.queue() else {
+        return Ok(());
+    };
+    let posts = state.api()?.my_posts()?;
+    let mut by_remote: HashMap<String, Vec<ClipPost>> = HashMap::new();
+    for p in posts {
+        by_remote.entry(p.clip_id).or_default().push(ClipPost {
+            guild_id: p.guild_id,
+            name: p.name,
+            icon_url: discord_icon(p.icon_url),
+            message_url: p.message_url,
+            posted_at: p.posted_at,
+        });
+    }
+    let changed = queue.replace_posts(&by_remote)?;
+    if !changed.is_empty() {
+        log::info!("posts cache changed for {} clip(s)", changed.len());
+        emit_clips_changed(app, None);
+    }
+    Ok(())
+}
+
+/// Refreshes the posts cache after `after`, on a thread of its own: HTTP must stay off the
+/// async runtime and the worker thread alike.
+fn schedule_posts_refresh(app: &AppHandle, after: Duration) {
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("posts-refresh".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            if let Err(e) = refresh_posts_now(&app) {
+                log::warn!("refreshing Discord posts: {e:#}");
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start a posts refresh: {e}");
+    }
 }
 
 #[tauri::command]
@@ -955,7 +1171,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     // the recording only while it is still here. After the Storage tab (or the setting) has
     // dropped it, a re-encode - which only the editor asks for - reads the encoded copy
     // instead, and the cut is then baked in rather than kept as an instruction.
-    let (source, original) = edit_source_path(row).with_context(|| {
+    let (source, original) = edit::edit_source_path(row).with_context(|| {
         format!("clip {}: the recording {} is gone and no encoded copy is left", row.id, row.source_path)
     })?;
     let source = Path::new(&source);
@@ -1054,9 +1270,11 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
     };
 
     if !original && !cut.is_whole() {
-        // Baked into the copy the next edit would read from, so it must not apply again.
+        // Baked into the copy the next edit would read from, so it must not apply again, and
+        // that copy now starts where the cut did. Only rows queued by a build from before the
+        // range editor get here: an edit now always gives a clip a recording of its own.
         if let Some(queue) = state.queue() {
-            if let Err(e) = queue.clear_cut(row.id) {
+            if let Err(e) = queue.bake_cut(row.id, cut.segments[0].start_ms) {
                 log::warn!("clip {}: could not clear the baked cut: {e:#}", row.id);
             }
         }
@@ -1104,7 +1322,9 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
     let create = || {
         api.create_clip(&NewClipUpload {
             game: row.game.clone(),
-            title: row.title.clone(),
+            // What the publish dialog named it, or the window title a clip from before the
+            // dialog carried.
+            title: row.publish_title.clone().or_else(|| row.title.clone()),
             duration_ms: row.duration_ms,
             width: row.width,
             height: row.height,
@@ -1113,6 +1333,9 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
             size_h264,
             size_thumb,
             participant_discord_ids: row.participants.clone(),
+            // A clip published before the dialog existed and since forgotten by the site comes
+            // back as a web page only, rather than being posted to every server a second time.
+            guild_ids: row.publish_guilds.clone().unwrap_or_default(),
         })
         .map_err(explain)
         .context("creating clip record")
@@ -1196,10 +1419,10 @@ fn upload_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<UploadResult> {
     })
 }
 
-/// True when the worker may upload: logged in and auto-upload on.
+/// True when the worker may upload: logged in. Which clips go up is the queue's business, and
+/// it only ever offers the ones the user published.
 fn upload_allowed(app: &AppHandle) -> bool {
-    let s = app.state::<AppState>().settings.lock().unwrap().clone();
-    s.logged_in() && s.auto_upload
+    app.state::<AppState>().settings.lock().unwrap().logged_in()
 }
 
 /// True when the worker may encode: the user opted in, or nothing game-like is running.
@@ -1220,15 +1443,19 @@ fn encode_allowed(app: &AppHandle) -> bool {
 /// return.
 fn on_clip_changed(app: &AppHandle, id: i64) {
     let state = app.state::<AppState>();
+    let status = state.queue().and_then(|q| q.get(id).ok()).flatten().map(|r| r.status);
     // A status change means the job that owned the percentage is over, one way or another.
     // The next one sets its own before the first event arrives.
-    if !matches!(
-        state.queue().and_then(|q| q.get(id).ok()).flatten().map(|r| r.status),
-        Some(ClipStatus::Encoding) | Some(ClipStatus::Uploading)
-    ) {
+    if !matches!(status, Some(ClipStatus::Encoding) | Some(ClipStatus::Uploading)) {
         clear_progress(app, id);
     }
     emit_clips_changed(app, Some(id));
+    // The upload is complete, and the bot now posts it on its own time.
+    if status == Some(ClipStatus::Done) {
+        for after in POSTS_AFTER_UPLOAD {
+            schedule_posts_refresh(app, after);
+        }
+    }
     let (drop_sources, limit_gb, clip_dir) = {
         let s = state.settings.lock().unwrap();
         (
@@ -1346,21 +1573,41 @@ fn start_pipeline(app: &AppHandle) {
     *state.worker.lock().unwrap() = Some(worker);
     log::info!("clip queue ready at {}", db.display());
     emit_clips_changed(app, None);
+    // The posts cache: now, then every few minutes for as long as the app runs. Both check the
+    // login themselves, so a login later on is picked up by the next round.
+    schedule_posts_refresh(app, Duration::ZERO);
+    let periodic = app.clone();
+    let spawned = std::thread::Builder::new().name("posts-periodic".into()).spawn(move || loop {
+        std::thread::sleep(POSTS_EVERY);
+        if let Err(e) = refresh_posts_now(&periodic) {
+            log::warn!("refreshing Discord posts: {e:#}");
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("could not start the periodic posts refresh: {e}");
+    }
     // Sessions that ended while ffmpeg was not yet located can be cut now.
     session_app::process_pending(app);
 }
 
-/// Probes the freshly written file and enqueues it. libobs may still be flushing the MP4
-/// when the replay buffer returns, so the probe is retried for about three seconds.
-fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedGame>) {
+/// Probes the freshly written file and adds it to the library as a local clip. libobs may
+/// still be flushing the MP4 when the replay buffer returns, so the probe is retried for about
+/// three seconds. `saved_at` is the moment just before the buffer was flushed: the file ends
+/// there, so it starts its own length earlier, and that is what places the clip on a match.
+fn enqueue_saved_clip(
+    app: &AppHandle,
+    path: PathBuf,
+    detected: Option<DetectedGame>,
+    saved_at: chrono::DateTime<chrono::Utc>,
+) {
     let state = app.state::<AppState>();
     let Some(queue) = state.queue() else {
-        log::warn!("clip queue unavailable; {} will not be encoded", path.display());
+        log::warn!("clip queue unavailable; {} is not in the library", path.display());
         return;
     };
     let bins = state.ffmpeg.lock().unwrap().clone();
     let Some(bins) = bins else {
-        log::warn!("ffmpeg unavailable; {} will not be encoded", path.display());
+        log::warn!("ffmpeg unavailable; {} is not in the library", path.display());
         return;
     };
 
@@ -1400,19 +1647,27 @@ fn enqueue_saved_clip(app: &AppHandle, path: PathBuf, detected: Option<DetectedG
         size_source: info.size as i64,
         // Filled in by `snapshot_voice_participants` below, once the row has an id.
         participants: None,
+        captured_at: Some(sessions::format_time(
+            saved_at - chrono::Duration::milliseconds(info.duration_ms),
+        )),
     };
     match queue.enqueue(clip) {
         Ok(id) => {
             log::info!(
-                "queued clip {id}: {} ({} ms, {}x{})",
+                "saved clip {id}: {} ({} ms, {}x{})",
                 path.display(),
                 info.duration_ms,
                 info.width,
                 info.height
             );
-            state.wake_worker();
             emit_clips_changed(app, Some(id));
             snapshot_voice_participants(app, &queue, id);
+            // A local clip is never encoded until it is published, and the encoder is what
+            // used to make the thumbnail, so the card gets one here.
+            match edit::refresh_thumbnail(&bins, &queue, id) {
+                Ok(()) => emit_clips_changed(app, Some(id)),
+                Err(e) => log::warn!("clip {id}: thumbnail failed: {e:#}"),
+            }
         }
         Err(e) => log::error!("enqueue {} failed: {e:#}", path.display()),
     }
@@ -1481,12 +1736,15 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
         let s = state.settings.lock().unwrap();
         (s.notify_on_save, s.sound_on_save, s.language)
     };
-    let result = {
+    let (result, saved_at) = {
         let recorder = state.recorder.lock().unwrap();
-        match recorder.as_ref() {
+        // Taken right before the flush, not after the probe: the file ends here.
+        let saved_at = chrono::Utc::now();
+        let result = match recorder.as_ref() {
             Some(r) => r.save().map_err(|e| format!("{e:#}")),
             None => Err("recorder is not running".to_string()),
-        }
+        };
+        (result, saved_at)
     };
     match &result {
         Ok(path) => {
@@ -1503,7 +1761,7 @@ fn save_clip_inner(app: &AppHandle) -> Result<PathBuf, String> {
             }
             let queue_app = app.clone();
             let queue_path = path.clone();
-            std::thread::spawn(move || enqueue_saved_clip(&queue_app, queue_path, detected));
+            std::thread::spawn(move || enqueue_saved_clip(&queue_app, queue_path, detected, saved_at));
             let _ = app.emit(
                 "clip-saved",
                 ClipSaved {
@@ -1809,18 +2067,17 @@ fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()>
         new.device_token = live.device_token.clone();
         new.account = live.account.clone();
     }
-    // The UI never edits these either; they belong to the shell.
+    // The UI never edits these either; they belong to the shell and the publish dialog, and a
+    // Settings screen opened before the last publish would otherwise put an old choice back.
     new.first_run_done = old.first_run_done;
     new.tray_hint_shown = old.tray_hint_shown;
+    new.last_publish_guilds = old.last_publish_guilds.clone();
 
     // Persist before touching the recorder so a libobs failure does not lose the change.
     new.save().context("saving settings")?;
     *state.settings.lock().unwrap() = new.clone();
     if new.clip_dir != old.clip_dir {
         allow_clip_dir(app, &new.clip_dir);
-    }
-    if new.auto_upload && !old.auto_upload {
-        state.wake_worker();
     }
     if new.language != old.language {
         relabel_tray(app, new.language);
@@ -1996,6 +2253,7 @@ pub fn run() {
             sessions: Mutex::new(None),
             live_session: Mutex::new(None),
             processing: Mutex::new(session_app::Processing::new()),
+            posts_refresh: Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -2018,7 +2276,13 @@ pub fn run() {
             get_encoders,
             reprobe_encoders,
             edit_source,
-            apply_cut,
+            apply_range,
+            list_publish_guilds,
+            publish_clip,
+            add_clip_posts,
+            unpublish_clip,
+            refresh_posts,
+            open_clip_post,
             start_login,
             cancel_login,
             logout,
@@ -2033,7 +2297,10 @@ pub fn run() {
             session_app::retry_session,
             session_app::clip_from_match,
             session_app::open_match_folder,
-            session_app::match_thumbnail
+            session_app::match_thumbnail,
+            session_app::clips_for_match,
+            session_app::match_for_clip,
+            session_app::clip_match_index
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -2127,6 +2394,35 @@ mod tests {
         assert!(check_verify_url("http://localhost:3000", "http://evil.example/x").is_err());
         // And "localhost" in the verification URL does not excuse a remote backend.
         assert!(check_verify_url("https://cosnostra.benja.ar", "http://localhost/x").is_err());
+    }
+
+    /// A post link comes from the backend and is handed to the shell, so only the one shape a
+    /// Discord message link has gets through.
+    #[test]
+    fn only_discord_message_links_are_opened() {
+        assert!(is_discord_message_url("https://discord.com/channels/111/222/333"));
+        for bad in [
+            "https://discord.com/channels/111/222",
+            "https://discord.com/channels/111/222/333/444",
+            "https://discord.com/channels/111/222/abc",
+            "https://discord.com/channels/111/222/333?x=1",
+            "https://discord.com.evil.example/channels/1/2/3",
+            "https://evil.example/https://discord.com/channels/1/2/3",
+            "http://discord.com/channels/1/2/3",
+            r"https://discord.com/channels/1/2/3\..\..\calc.exe",
+            "https://discord.com/channels/1/2/3 ",
+            "",
+        ] {
+            assert!(!is_discord_message_url(bad), "should be refused: {bad:?}");
+        }
+        assert_eq!(
+            discord_icon(Some("https://cdn.discordapp.com/icons/1/a.png?size=96".into())).as_deref(),
+            Some("https://cdn.discordapp.com/icons/1/a.png?size=96")
+        );
+        assert_eq!(discord_icon(Some("https://evil.example/a.png".into())), None);
+        assert_eq!(checked_guild_ids(vec![" 12 ".into(), "12".into(), "34".into()]).unwrap(), vec!["12", "34"]);
+        assert!(checked_guild_ids(vec!["12; drop".into()]).is_err());
+        assert!(checked_guild_ids((0..26).map(|n| n.to_string()).collect()).is_err());
     }
 
     /// `get_settings` is the only way settings reach the webview, and the device token is the

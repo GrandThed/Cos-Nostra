@@ -22,15 +22,19 @@ let logged;
 function fakePoster(settle = async () => {}) {
   /** @type {string[]} */
   const calls = [];
+  /** @type {Array<string[] | undefined>} the guildIds each call was given */
+  const targets = [];
   /** @type {() => void} */
   let resolveDone = () => {};
   const done = new Promise((r) => (resolveDone = r));
   return {
     calls,
+    targets,
     done,
-    /** @param {string} clipId */
-    postClip(clipId) {
+    /** @param {string} clipId @param {string[]} [guildIds] */
+    postClip(clipId, guildIds) {
       calls.push(clipId);
+      targets.push(guildIds);
       try {
         return settle(clipId);
       } finally {
@@ -64,7 +68,9 @@ function fakeClient(guilds) {
   return { guilds: { cache: new Map(built.map((guild, i) => [`g${i}`, guild])) } };
 }
 
-/** @param {{ poster?: ReturnType<typeof fakePoster>, client?: any }} [opts] */
+/**
+ * @param {{ poster?: ReturnType<typeof fakePoster>, client?: any, memberGuildsTimeoutMs?: number }} [opts]
+ */
 async function start(opts = {}) {
   // BOT_PORT 0 keeps parallel test runs from colliding.
   poster = opts.poster ?? fakePoster();
@@ -73,14 +79,18 @@ async function start(opts = {}) {
     poster,
     log,
     client: opts.client,
+    ...(opts.memberGuildsTimeoutMs ? { memberGuildsTimeoutMs: opts.memberGuildsTimeoutMs } : {}),
   });
   await server.listen();
   return `http://127.0.0.1:${server.port}`;
 }
 
-/** @param {string} base @param {unknown} body @param {string} [authorization] */
-function snapshot(base, body, authorization = `Bearer ${SECRET}`) {
-  return fetch(`${base}/voice-snapshot`, {
+/**
+ * POSTs JSON (or a raw string) to one of the server's routes with the shared secret.
+ * @param {string} base @param {string} path @param {unknown} body @param {string} [authorization]
+ */
+function postTo(base, path, body, authorization = `Bearer ${SECRET}`) {
+  return fetch(`${base}${path}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -88,6 +98,87 @@ function snapshot(base, body, authorization = `Bearer ${SECRET}`) {
     },
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
+}
+
+/** @param {string} base @param {unknown} body @param {string} [authorization] */
+function snapshot(base, body, authorization = `Bearer ${SECRET}`) {
+  return postTo(base, '/voice-snapshot', body, authorization);
+}
+
+/**
+ * Resolves once `check()` is true, polling on the event loop. For work the server does after
+ * it has already answered.
+ * @param {() => boolean} check @param {string} label
+ */
+async function eventually(check, label, ms = 2_000) {
+  const until = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > until) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** A Discord error shaped the way discord.js throws one. */
+function discordError(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * A client for /member-guilds: each guild's members.fetch answers from `members`, throws
+ * Unknown Member for anyone else, throws `error`, or never settles when `hang` is set.
+ * @param {Record<string, { members?: string[], error?: Error, hang?: boolean }>} guilds
+ */
+function memberClient(guilds) {
+  /** @type {Array<[string, any]>} */
+  const fetches = [];
+  const cache = new Map(
+    Object.entries(guilds).map(([guildId, { members = [], error, hang }]) => [
+      guildId,
+      {
+        id: guildId,
+        members: {
+          fetch(options) {
+            fetches.push([guildId, options]);
+            if (hang) return new Promise(() => {});
+            if (error) return Promise.reject(error);
+            if (members.includes(options?.user)) return Promise.resolve({ id: options.user });
+            return Promise.reject(discordError('Unknown Member', 10007));
+          },
+        },
+      },
+    ]),
+  );
+  return { fetches, guilds: { cache } };
+}
+
+/**
+ * A client for /unpost whose channels record deletes, and whose `gone` message ids answer
+ * Unknown Message the way a message someone already deleted does.
+ * @param {{ gone?: string[], missingChannels?: string[] }} [opts]
+ */
+function deletingClient({ gone = [], missingChannels = [] } = {}) {
+  /** @type {string[]} */
+  const attempted = [];
+  /** @type {string[]} */
+  const deleted = [];
+  return {
+    attempted,
+    deleted,
+    channels: {
+      async fetch(channelId) {
+        if (missingChannels.includes(channelId)) throw discordError('Unknown Channel', 10003);
+        return {
+          messages: {
+            async delete(messageId) {
+              attempted.push(`${channelId}/${messageId}`);
+              if (gone.includes(messageId)) throw discordError('Unknown Message', 10008);
+              deleted.push(`${channelId}/${messageId}`);
+            },
+          },
+        };
+      },
+    },
+  };
 }
 
 beforeEach(() => {
@@ -309,6 +400,196 @@ test('/voice-snapshot rejects a body without a usable discordId', async () => {
 test('a GET on /voice-snapshot is a 404 like any other unknown route', async () => {
   const base = await start({ client: fakeClient([]) });
   assert.equal((await fetch(`${base}/voice-snapshot`)).status, 404);
+});
+
+// ---- POST /post guildIds -----------------------------------------------------------------
+
+test('POST /post hands guildIds to the poster, and absent or null as no override', async () => {
+  const base = await start();
+  const cases = [
+    [{ clipId: 'a', guildIds: ['1', '2'] }, ['1', '2']],
+    [{ clipId: 'b', guildIds: [] }, []],
+    [{ clipId: 'c' }, undefined],
+    [{ clipId: 'd', guildIds: null }, undefined],
+  ];
+  for (const [body, expected] of cases) {
+    const res = await postTo(base, '/post', body);
+    assert.equal(res.status, 202, `for ${JSON.stringify(body)}`);
+    await res.text();
+  }
+  await eventually(() => poster.targets.length === cases.length, 'every post to reach the poster');
+  assert.deepEqual(poster.calls, ['a', 'b', 'c', 'd']);
+  assert.deepEqual(
+    poster.targets,
+    cases.map(([, expected]) => expected),
+  );
+});
+
+test('POST /post rejects guildIds that are not a list of ids', async () => {
+  const base = await start();
+  for (const guildIds of ['1', 1, {}, [1], [''], ['1', null], true]) {
+    const res = await postTo(base, '/post', { clipId: 'x', guildIds });
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(guildIds)}`);
+    assert.equal((await res.json()).error, 'bad_request');
+  }
+  assert.deepEqual(poster.calls, []);
+});
+
+// ---- POST /member-guilds -----------------------------------------------------------------
+
+test('/member-guilds keeps only the guilds the bot is in and the user is a member of', async () => {
+  const client = memberClient({
+    member: { members: ['4242'] },
+    stranger: { members: ['99'] },
+    broken: { error: discordError('Service Unavailable', 0) },
+    alsoMember: { members: ['4242'] },
+  });
+  const base = await start({ client });
+
+  const res = await postTo(base, '/member-guilds', {
+    discordId: '4242',
+    guildIds: ['alsoMember', 'notInCache', 'broken', 'member', 'stranger', 'member'],
+  });
+
+  assert.equal(res.status, 200);
+  // In the order asked, deduped. A guild missing from the cache is never fetched at all.
+  assert.deepEqual(await res.json(), { guildIds: ['alsoMember', 'member'] });
+  assert.deepEqual(
+    client.fetches.map(([guildId]) => guildId).sort(),
+    ['alsoMember', 'broken', 'member', 'stranger'],
+  );
+  for (const [, options] of client.fetches) {
+    assert.deepEqual(options, { user: '4242', force: true, cache: false });
+  }
+  // Unknown Member is an answer; any other error is a warning.
+  const warnings = logged.filter((line) => line.startsWith('warn'));
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+  assert.match(warnings[0], /broken.*Service Unavailable/);
+});
+
+test('/member-guilds answers within its bound when Discord does not', async () => {
+  const client = memberClient({ fast: { members: ['4242'] }, slow: { hang: true } });
+  const base = await start({ client, memberGuildsTimeoutMs: 150 });
+
+  const began = Date.now();
+  const res = await postTo(base, '/member-guilds', { discordId: '4242', guildIds: ['slow', 'fast'] });
+  const took = Date.now() - began;
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { guildIds: ['fast'] });
+  assert.ok(took >= 140 && took < 1_500, `answered after ${took} ms`);
+  assert.ok(logged.some((line) => line.startsWith('warn') && line.includes('slow')));
+});
+
+test('/member-guilds is an empty list without a client, and fast when nothing is pending', async () => {
+  const base = await start({ client: undefined, memberGuildsTimeoutMs: 5_000 });
+  const began = Date.now();
+  const res = await postTo(base, '/member-guilds', { discordId: '4242', guildIds: ['1'] });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { guildIds: [] });
+  assert.ok(Date.now() - began < 1_000, 'the timeout is a bound, not a wait');
+});
+
+test('/member-guilds needs the shared secret and a well-formed body', async () => {
+  const base = await start({ client: memberClient({ g: { members: ['4242'] } }) });
+  for (const authorization of [`Bearer ${'y'.repeat(SECRET.length)}`, SECRET, '']) {
+    const res = await postTo(base, '/member-guilds', { discordId: '4242', guildIds: ['g'] }, authorization);
+    assert.equal(res.status, 401);
+    assert.deepEqual(await res.json(), { error: 'unauthorized' });
+  }
+  for (const body of [
+    '{}',
+    '{"discordId":"4242"}',
+    '{"guildIds":["g"]}',
+    '{"discordId":"","guildIds":["g"]}',
+    '{"discordId":4242,"guildIds":["g"]}',
+    '{"discordId":"4242","guildIds":"g"}',
+    '{"discordId":"4242","guildIds":[7]}',
+    'null',
+    '[]',
+  ]) {
+    const res = await postTo(base, '/member-guilds', body);
+    assert.equal(res.status, 400, `expected 400 for ${body}`);
+    assert.equal((await res.json()).error, 'bad_request');
+  }
+  const bad = await postTo(base, '/member-guilds', '{not json');
+  assert.deepEqual(await bad.json(), { error: 'bad_json' });
+});
+
+// ---- POST /unpost ------------------------------------------------------------------------
+
+test('/unpost answers 202 and deletes every message, past one that is already gone', async () => {
+  const client = deletingClient({ gone: ['m1'], missingChannels: ['c3'] });
+  const base = await start({ client });
+
+  const res = await postTo(base, '/unpost', {
+    clipId: 'clip-1',
+    posts: [
+      { guildId: 'g1', channelId: 'c1', messageId: 'm1' },
+      { guildId: 'g3', channelId: 'c3', messageId: 'm3' },
+      { guildId: 'g2', channelId: 'c2', messageId: 'm2' },
+    ],
+  });
+
+  assert.equal(res.status, 202);
+  assert.deepEqual(await res.json(), { ok: true, clipId: 'clip-1' });
+  await eventually(() => logged.some((line) => line.includes('took down')), 'the removal to finish');
+  // A gone message and a gone channel are warnings, and neither stops the next delete.
+  assert.deepEqual(client.attempted, ['c1/m1', 'c2/m2']);
+  assert.deepEqual(client.deleted, ['c2/m2']);
+  assert.ok(logged.some((line) => line.startsWith('warn') && line.includes('Unknown Message')));
+  assert.ok(logged.some((line) => line.startsWith('warn') && line.includes('Unknown Channel')));
+  assert.deepEqual(logged.filter((line) => line.startsWith('error')), []);
+  assert.equal((await fetch(`${base}/health`)).status, 200);
+});
+
+test('/unpost does not wait for Discord before answering', async () => {
+  /** @type {() => void} */
+  let release = () => {};
+  const client = {
+    channels: {
+      fetch: () => new Promise((r) => (release = () => r({ messages: { delete: async () => {} } }))),
+    },
+  };
+  const base = await start({ client });
+  const res = await postTo(base, '/unpost', {
+    clipId: 'clip-1',
+    posts: [{ guildId: 'g1', channelId: 'c1', messageId: 'm1' }],
+  });
+  assert.equal(res.status, 202);
+  await res.text();
+  release();
+});
+
+test('/unpost needs the shared secret and a well-formed body', async () => {
+  const client = deletingClient();
+  const base = await start({ client });
+  const good = { clipId: 'clip-1', posts: [{ guildId: 'g1', channelId: 'c1', messageId: 'm1' }] };
+  for (const authorization of [`Bearer ${'y'.repeat(SECRET.length)}`, SECRET, '']) {
+    const res = await postTo(base, '/unpost', good, authorization);
+    assert.equal(res.status, 401);
+  }
+  for (const body of [
+    {},
+    { clipId: 'clip-1' },
+    { posts: good.posts },
+    { clipId: '', posts: good.posts },
+    { clipId: 'clip-1', posts: 'm1' },
+    { clipId: 'clip-1', posts: [null] },
+    { clipId: 'clip-1', posts: [{ guildId: 'g1', channelId: 'c1' }] },
+    { clipId: 'clip-1', posts: [{ guildId: 'g1', channelId: '', messageId: 'm1' }] },
+    { clipId: 'clip-1', posts: [{ guildId: 1, channelId: 'c1', messageId: 'm1' }] },
+  ]) {
+    const res = await postTo(base, '/unpost', body);
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+    assert.equal((await res.json()).error, 'bad_request');
+  }
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(client.attempted, [], 'a rejected request deletes nothing');
+
+  // An empty list is valid: the clip simply had no live posts.
+  const empty = await postTo(base, '/unpost', { clipId: 'clip-1', posts: [] });
+  assert.equal(empty.status, 202);
 });
 
 test('close() is safe to call twice', async () => {

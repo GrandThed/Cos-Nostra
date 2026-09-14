@@ -6,6 +6,14 @@
 // expose bucket URLs: /clips/:id/{av1,h264,thumb} are the stable addresses and redirect to
 // a short-lived presigned GET.
 //
+// Publishing is on demand: the desktop only creates a clip when the user presses Publish, and
+// says which Discord guilds it goes to (`guildIds`, stored as target_guilds; `[]` is web page
+// only, so /complete does not ping the bot at all). A desktop build from before that never
+// sends the field, and its clips post to every configured guild exactly as they always did.
+// Afterwards POST /clips/:id/posts sends a ready clip to more guilds, GET /me/posts tells the
+// desktop where each clip is live, and DELETE /clips/:id - unpublish and delete alike - also
+// takes every Discord message of the clip down (lib/clip-purge.js).
+//
 // Those three PUT URLs are the only bucket write anybody but the backend ever holds, so
 // create is where every limit is applied: each URL is signed for the exact size the desktop
 // declared (config MAX_CLIP_MB caps it), and the user's stored bytes have to stay under
@@ -15,12 +23,13 @@
 // Auth decorators (authenticateDevice) and the bot notifier (notifyBot) come from sibling
 // plugins that may register after this file, so they are resolved per request, not at load.
 
-import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
-import { clips, posts, reactions, users } from '../db/schema.js';
+import { clips, guildSettings, posts, reactions, users } from '../db/schema.js';
 import { purgeClip } from '../lib/clip-purge.js';
 import { newClipId } from '../lib/ids.js';
+import { configuredGuildIds, guildIcon, livePosts, parseTargetGuilds } from '../lib/publish.js';
 import { bearer } from '../plugins/auth.js';
 import { clipKeys } from '../plugins/storage.js';
 
@@ -37,6 +46,10 @@ const MEDIA_NAMES = Object.keys(MEDIA);
 // URL across retries - a failed upload job creates a new clip - so nothing needs the hour.
 const UPLOAD_TTL = 15 * 60;
 const MEDIA_TTL = 3600;
+
+// Discord guild ids are snowflakes, digits only. Anything else cannot be a guild the bot is
+// in, so it is a malformed request rather than an id to drop silently.
+const guildIdList = z.array(z.string().regex(/^[0-9]+$/));
 
 // Optional metadata is `nullish`, not `optional`: the desktop serialises a Rust
 // `Option::None` as JSON null, so a clip saved with no game detected used to fail its whole
@@ -62,6 +75,10 @@ const createSchema = z.object({
   // write a mention storm, and nullish for the same reason the other optional fields are:
   // the desktop serialises a Rust None as null.
   participantDiscordIds: z.array(z.string().min(1)).max(50).nullish(),
+  // The Discord guilds the owner picked in the publish dialog. Absent or null is the legacy
+  // "every configured guild", which is what a desktop build from before publish-on-demand
+  // gets by never sending it; `[]` is a clip for the web page only.
+  guildIds: guildIdList.max(25).nullish(),
 });
 
 // A clip the desktop edited: same record, new files. Only what a cut can change is accepted;
@@ -83,6 +100,9 @@ const updateSchema = z
   .refine((v) => v.title !== undefined || v.game !== undefined, 'nothing to update');
 
 const idSchema = z.object({ id: z.string().regex(/^[0-9A-Za-z]{12}$/) });
+
+// Post a ready clip to more guilds. At least one, or there is nothing to queue.
+const addPostsSchema = z.object({ guildIds: guildIdList.min(1).max(25) });
 
 const listSchema = z.object({
   user: z.string().min(1).optional(),
@@ -323,6 +343,13 @@ export default async function clipRoutes(app) {
       return reply.code(413).send(refusal);
     }
 
+    // Only guilds with a guild_settings row survive: one without has no channel to post in.
+    // Membership is not checked here: the bot checks it at post time, which is when it matters,
+    // and asking it now would make every upload depend on the bot being up.
+    const targetGuilds = body.guildIds
+      ? JSON.stringify(await configuredGuildIds(app, body.guildIds))
+      : null;
+
     const id = newClipId();
     const keys = clipKeys(request.user.id, id);
     await app.db.insert(clips).values({
@@ -339,6 +366,7 @@ export default async function clipRoutes(app) {
       keyH264: keys.h264,
       keyThumb: keys.thumb,
       participants: JSON.stringify(body.participantDiscordIds ?? []),
+      targetGuilds,
       recordedAt: new Date(body.recordedAt),
       status: 'pending',
     });
@@ -414,8 +442,11 @@ export default async function clipRoutes(app) {
     if (!found) return;
     const { clip } = found;
     // A replace completes through here too; the bot only hears about the first upload,
-    // since the Discord post already exists and points at the same URL.
+    // since the Discord post already exists and points at the same URL. A clip published for
+    // the web page only (target_guilds '[]') has nothing to post, so the bot is not asked;
+    // a legacy clip (null) and one with targets are, and the bot reads the targets itself.
     const firstUpload = clip.status === 'pending';
+    const postsToDiscord = parseTargetGuilds(clip.targetGuilds)?.length !== 0;
 
     const heads = await Promise.all(
       MEDIA_NAMES.map((n) => app.storage.head(clip[MEDIA[n].column])),
@@ -453,13 +484,92 @@ export default async function clipRoutes(app) {
       .returning();
     request.log.info({ clipId: clip.id }, firstUpload ? 'clip ready' : 'clip replaced');
 
-    if (firstUpload && app.hasDecorator('notifyBot')) {
+    if (firstUpload && postsToDiscord && app.hasDecorator('notifyBot')) {
       // Fire and forget: the bot has its own retry queue and the upload is already durable.
       Promise.resolve()
         .then(() => app.notifyBot(clip.id))
         .catch((err) => request.log.warn({ err, clipId: clip.id }, 'notifyBot failed'));
     }
     return clipToJson(app, updated, found.owner, found.reactions);
+  });
+
+  // ---- publish to more guilds -----------------------------------------------------------
+  //
+  // A clip is uploaded once; posting it somewhere else later is only a message to the bot. Ids
+  // with no guild_settings row, and guilds the clip is already live in, are dropped here so the
+  // answer tells the desktop what will actually happen. The bot checks the live posts again when
+  // it posts, which is what stops two requests that overlap from posting twice. What is left is
+  // merged into target_guilds, so the stored targets stay the full list of where the owner wants
+  // the clip.
+
+  app.post('/clips/:id/posts', { preHandler: deviceAuth }, async (request, reply) => {
+    const found = await loadOwned(request, reply);
+    if (!found) return;
+    const { clip } = found;
+    if (clip.status !== 'ready') return reply.code(409).send({ error: 'not_ready' });
+    const parsed = addPostsSchema.safeParse(request.body);
+    if (!parsed.success) return badRequest(reply, parsed.error.issues);
+
+    const live = await livePosts(app, clip.id);
+    const liveGuilds = new Set(live.map((p) => p.guildId));
+    const queued = (await configuredGuildIds(app, parsed.data.guildIds)).filter(
+      (id) => !liveGuilds.has(id),
+    );
+    if (queued.length === 0) return reply.code(202).send({ queued });
+
+    // A legacy clip has no stored targets; where it is live right now is the closest thing to
+    // what its owner chose, so that becomes the base the new guilds are added to.
+    const current = parseTargetGuilds(clip.targetGuilds) ?? [...liveGuilds];
+    const merged = [...new Set([...current, ...queued])];
+    await app.db
+      .update(clips)
+      .set({ targetGuilds: JSON.stringify(merged) })
+      .where(eq(clips.id, clip.id));
+
+    if (app.hasDecorator('notifyBot')) {
+      Promise.resolve()
+        .then(() => app.notifyBot(clip.id, queued))
+        .catch((err) => request.log.warn({ err, clipId: clip.id }, 'notifyBot failed'));
+    }
+    request.log.info({ clipId: clip.id, guildIds: queued }, 'clip posts queued');
+    return reply.code(202).send({ queued });
+  });
+
+  // Where each of the caller's clips is live in Discord, for the guild icons on the desktop's
+  // clip cards. One list for all clips rather than a field per clip, so the desktop can refresh
+  // every card with a single request. Removed posts and clips that are not `ready` are left out:
+  // neither has a message anyone can open.
+  app.get('/me/posts', { preHandler: deviceAuth }, async (request) => {
+    const rows = await app.db
+      .select({
+        clipId: posts.clipId,
+        guildId: posts.guildId,
+        channelId: posts.channelId,
+        messageId: posts.messageId,
+        postedAt: posts.postedAt,
+        name: guildSettings.name,
+        icon: guildSettings.icon,
+      })
+      .from(posts)
+      .innerJoin(clips, eq(clips.id, posts.clipId))
+      .leftJoin(guildSettings, eq(guildSettings.guildId, posts.guildId))
+      .where(
+        and(eq(clips.userId, request.user.id), eq(clips.status, 'ready'), isNull(posts.removedAt)),
+      )
+      .orderBy(asc(posts.postedAt), asc(posts.id));
+
+    return {
+      items: rows.map((r) => ({
+        clipId: r.clipId,
+        guildId: r.guildId,
+        name: r.name ?? null,
+        iconUrl: guildIcon(r.guildId, r.icon),
+        channelId: r.channelId,
+        messageId: r.messageId,
+        messageUrl: `https://discord.com/channels/${r.guildId}/${r.channelId}/${r.messageId}`,
+        postedAt: toIso(r.postedAt),
+      })),
+    };
   });
 
   // ---- read ---------------------------------------------------------------------------

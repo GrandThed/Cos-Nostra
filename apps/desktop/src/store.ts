@@ -6,6 +6,7 @@
 import * as ipc from "./ipc";
 import type {
   Bootstrap,
+  ClipMatchRef,
   ClipProgress,
   ClipRow,
   SessionRow,
@@ -19,6 +20,7 @@ export type Topic =
   | "settings"
   | "clips"
   | "sessions"
+  | "clipMatches"
   | "storage"
   | "progress"
   | "bootstrap"
@@ -30,6 +32,8 @@ interface Data {
   clips: ClipRow[];
   /** Recorded game sessions with their matches, newest first. */
   sessions: SessionRow[];
+  /** The match each clip can be shown in, by clip id. Only clips that have one are here. */
+  clipMatches: Map<number, ClipMatchRef>;
   storage: StorageStats | null;
   /** Live percentages, keyed by clip id. Only clips mid-job are in here. */
   progress: Map<number, ClipProgress>;
@@ -43,6 +47,7 @@ export const data: Data = {
   settings: null,
   clips: [],
   sessions: [],
+  clipMatches: new Map(),
   storage: null,
   progress: new Map(),
   bootstrap: { phase: "ready" },
@@ -103,6 +108,11 @@ export const loadClips = loader("clips", ipc.listClips, (c) => {
 
 export const loadSessions = loader("sessions", ipc.listSessions, (s) => {
   data.sessions = s;
+});
+
+/** Reloaded when clips or sessions change: either side can make or break the link. */
+export const loadClipMatches = loader("clipMatches", ipc.clipMatchIndex, (list) => {
+  data.clipMatches = new Map(list.map((m) => [m.clip_id, m]));
 });
 
 export const loadStorage = loader("storage", ipc.storageStats, (s) => {

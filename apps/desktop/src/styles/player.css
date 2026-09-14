@@ -393,6 +393,14 @@
   align-self: flex-start;
 }
 
+/* Where the clip stands: its circle and badge, and the servers it is posted in. */
+.rail .status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+
 .rail .label {
   color: var(--mut);
   font-size: 11px;

@@ -1,6 +1,6 @@
-/* The cut editor. It borrows the player's frame (head, stage, transport, rail) and adds the
-   timeline: a ruler, a filmstrip, the kept parts drawn as bright ranges with accent handles,
-   the removed ranges hatched dark, and a playhead with a head in the ruler. */
+/* The range editor. It borrows the player's frame (head, stage, transport, rail) and adds the
+   timeline: a ruler, a filmstrip, the one kept range with accent handles, what it leaves out
+   hatched dark, the footage the clip already has as a band beneath, and a playhead. */
 
 .editor .player-head .mode {
   flex: none;
@@ -12,6 +12,20 @@
   border: 1px solid var(--acc);
   border-radius: 5px;
   padding: 2px 7px;
+}
+
+.editor .rail .summary .range {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+}
+
+.editor .rail .note.beyond {
+  color: var(--info);
+}
+
+.editor .rail .note.warn {
+  color: var(--warn);
 }
 
 /* --- Timeline ------------------------------------------------------------ */
@@ -70,6 +84,7 @@
   white-space: nowrap;
 }
 
+/* Only the part of the track in view is drawn; editor.ts positions and sizes it. */
 .editor canvas.film {
   position: absolute;
   left: 0;
@@ -77,27 +92,25 @@
   display: block;
   width: 100%;
   height: 56px;
-  background: linear-gradient(90deg, hsl(var(--hue) 20% 18%), hsl(var(--hue) 24% 12%));
 }
 
-.editor .gaps,
-.editor .parts {
+/* Behind the filmstrip, so a strip still loading reads as footage rather than a hole. */
+.editor .track::before {
+  content: "";
   position: absolute;
   left: 0;
   right: 0;
   top: 18px;
   height: 56px;
+  background: linear-gradient(90deg, hsl(var(--hue) 20% 18%), hsl(var(--hue) 24% 12%));
 }
 
-/* Removed: hatched dark, with a way back under the pointer. */
-.editor .gap {
+/* Outside the range: hatched dark, like everything a clip leaves out. */
+.editor .outside {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
+  top: 18px;
+  height: 56px;
+  pointer-events: none;
   background: repeating-linear-gradient(
     135deg,
     rgba(0, 0, 0, 0.6) 0 6px,
@@ -105,30 +118,24 @@
   );
 }
 
-.editor .gap .restore {
-  border: 1px solid rgba(241, 234, 219, 0.5);
-  border-radius: 6px;
-  padding: 2px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  background: rgba(12, 9, 4, 0.72);
-  color: var(--overVideoInk);
-  opacity: 0;
-  transition: opacity 0.1s ease;
+/* The footage the clip already has, as a band under the filmstrip. Going past it is what
+   makes Apply copy from the match. */
+.editor .footage {
+  position: absolute;
+  top: 77px;
+  height: 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--info) 75%, transparent);
+  pointer-events: none;
 }
 
-.editor .gap:hover .restore {
-  opacity: 1;
-}
-
-/* Kept: an accent outline; the selected one is solid and lifted. */
+/* The range: an accent outline with a handle at either end. */
 .editor .part {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: 18px;
+  height: 56px;
   border: 2px solid color-mix(in srgb, var(--acc) 70%, transparent);
   border-radius: 4px;
-  cursor: pointer;
 }
 
 .editor .part.selected {
@@ -239,11 +246,6 @@
   opacity: 0.6;
 }
 
-.editor .controls .skip[aria-pressed="true"] {
-  border-color: var(--acc);
-  color: var(--acc);
-}
-
 .editor .controls .zoom {
   display: flex;
   align-items: center;
@@ -276,61 +278,6 @@
   font-family: var(--display);
   font-size: 17px;
   font-weight: 600;
-}
-
-.editor .part-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.editor .part-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 5px 8px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: transparent;
-  color: inherit;
-  font-size: 11.5px;
-  text-align: left;
-}
-
-.editor .part-row:hover {
-  border-color: var(--mut);
-}
-
-.editor .part-row.selected {
-  border-color: var(--acc);
-  background: var(--panel2);
-}
-
-.editor .part-row .n {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--acc);
-  color: var(--accInk);
-  font-size: 10px;
-  font-weight: 700;
-  text-align: center;
-  line-height: 16px;
-}
-
-.editor .part-row .range {
-  flex: 1;
-  min-width: 0;
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.editor .part-row .mono {
-  font-size: 11px;
 }
 
 /* Waiting for a second click on the only copy: amber, like the Storage tab's cleanups. */

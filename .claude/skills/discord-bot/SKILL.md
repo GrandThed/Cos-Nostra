@@ -21,8 +21,10 @@ collaborators as arguments and is testable with plain fakes.
 |---|---|---|
 | `config.js` | `loadConfig(env)` | Validates the environment, reporting **every** problem at once like the backend does |
 | `backend.js` | `createBackend({baseUrl, botToken, fetch})` | The only door to the API; wraps `@cos-nostra/shared` |
-| `server.js` | `createServer({config, poster, log})` | `GET /health`, `POST /post` on `BOT_PORT` |
-| `post.js` | `createPoster({client, backend, log, fetch})`, `uploadLimitBytes(tier)` | Posts one clip to every configured guild |
+| `server.js` | `createServer({config, poster, log, client})` | `GET /health`, `POST /post`, `/voice-snapshot`, `/member-guilds`, `/unpost` on `BOT_PORT` |
+| `post.js` | `createPoster({client, backend, log, fetch})`, `uploadLimitBytes(tier)` | Posts one clip to the guilds its owner chose (`targetGuildIds`), or every configured guild for a clip from an older desktop build |
+| `members.js` | membership check | Whether a user is in a guild, by REST (`members.fetch` with `force`), no GuildMembers intent |
+| `manage.js` | `registerManage`, `manageRow`, `deleteMessage` | The ⚙️ Manage menu: Hide (deletes the message, records the post as removed) and Delete everywhere |
 | `reactions.js` | `registerReactions({client, backend, outbox, log})` | Gateway reactions to backend votes |
 | `commands.js` | `commands`, `registerCommands({client, backend, log})` | `/clips setup latest top mine link` |
 | `outbox.js` | `createOutbox({send, onError, delays, log})` | FIFO retry queue for reaction writes |
@@ -30,6 +32,11 @@ collaborators as arguments and is testable with plain fakes.
 
 `POST /post` answers **202 immediately** and posts in the background: the clip is already
 durable in the bucket, so the backend's `notifyBot` must never wait on a Discord round trip.
+Its optional `guildIds` overrides the clip's `targetGuildIds`; `null` targets mean the legacy
+"every configured guild, no membership check" path. A guild that already has a live post of the
+clip is always skipped, so a retry never double-posts. `POST /unpost` is fire-and-forget the same
+way; `POST /member-guilds` answers inline (capped at 3.5 s, the backend waits 4 s) and backs the
+desktop's publish dialog through `GET /discord/guilds`.
 
 ## Running it
 

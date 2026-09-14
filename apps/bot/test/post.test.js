@@ -87,11 +87,44 @@ function makeChannel({
 }
 
 /**
- * Fake discord.js client. `channels` maps a channel id to the channel to resolve, or to an
- * Error to make the fetch reject the way a missing-access fetch does.
- * @param {Record<string, any>} channels
+ * A Discord error shaped the way discord.js throws one: the JSON error code on `.code`.
+ * @param {string} message
+ * @param {number} code
  */
-function client(channels) {
+function discordError(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * Fake guild whose members.fetch knows `members`, answers Unknown Member (10007) for anyone
+ * else, or throws `error` for everyone. Every fetch is recorded.
+ * @param {{ members?: string[], error?: Error }} [opts]
+ */
+function makeGuild({ members = [], error } = {}) {
+  /** @type {any[]} */
+  const memberFetches = [];
+  return {
+    memberFetches,
+    members: {
+      async fetch(options) {
+        memberFetches.push(options);
+        if (error) throw error;
+        const user = typeof options === 'string' ? options : options?.user;
+        if (members.includes(user)) return { id: user };
+        throw discordError('Unknown Member', 10007);
+      },
+    },
+  };
+}
+
+/**
+ * Fake discord.js client. `channels` maps a channel id to the channel to resolve, or to an
+ * Error to make the fetch reject the way a missing-access fetch does. `guilds` is the guild
+ * cache; a guild missing from it is not fetchable either.
+ * @param {Record<string, any>} channels
+ * @param {Record<string, ReturnType<typeof makeGuild>>} [guilds]
+ */
+function client(channels, guilds = {}) {
   /** @type {string[]} */
   const fetched = [];
   return {
@@ -103,6 +136,13 @@ function client(channels) {
         const entry = channels[channelId];
         if (entry instanceof Error) throw entry;
         return entry ?? null;
+      },
+    },
+    guilds: {
+      cache: new Map(Object.entries(guilds)),
+      /** @param {string} guildId */
+      async fetch(guildId) {
+        throw discordError(`Unknown Guild ${guildId}`, 10004);
       },
     },
   };
@@ -755,4 +795,179 @@ test('a clip titled @everyone is posted as text that cannot ping', async () => {
   // nobody: `users` lists who may be pinged, it does not bless what the content contains.
   assert.deepEqual(payload.allowedMentions, { parse: [], users: ['4242'] });
   assert.ok(!payload.allowedMentions.users.includes('999'));
+});
+
+// ---- target resolution -------------------------------------------------------------------
+
+/** Three configured guilds, each with its own channel c<n> posting as message m<n>. */
+function threeGuilds() {
+  const channels = {
+    c1: makeChannel({ channelId: 'c1', guildId: 'g1', messageId: 'm1' }),
+    c2: makeChannel({ channelId: 'c2', guildId: 'g2', messageId: 'm2' }),
+    c3: makeChannel({ channelId: 'c3', guildId: 'g3', messageId: 'm3' }),
+  };
+  const guilds = [
+    { guildId: 'g1', channelId: 'c1', seedEmojis: [] },
+    { guildId: 'g2', channelId: 'c2', seedEmojis: [] },
+    { guildId: 'g3', channelId: 'c3', seedEmojis: [] },
+  ];
+  return { channels, guilds };
+}
+
+test('a clip with null targets posts to every configured guild without asking who is in them', async () => {
+  const { channels, guilds } = threeGuilds();
+  // Nobody is a member anywhere: a membership check would post nothing, so posting everywhere
+  // proves the legacy path never asked.
+  const discordGuilds = { g1: makeGuild(), g2: makeGuild(), g3: makeGuild() };
+  const backend = makeBackend({ clip: makeClip({ targetGuildIds: null, posts: [] }), guilds });
+  const poster = createPoster({
+    client: client(channels, discordGuilds),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  const posted = await poster.postClip('clip1');
+
+  assert.deepEqual(posted.map((p) => p.guildId), ['g1', 'g2', 'g3']);
+  for (const guild of Object.values(discordGuilds)) assert.deepEqual(guild.memberFetches, []);
+});
+
+test('explicit targets post only to configured guilds the owner is a member of', async () => {
+  const { channels, guilds } = threeGuilds();
+  const discordGuilds = {
+    g1: makeGuild({ members: ['4242'] }),
+    g2: makeGuild({ members: ['someone-else'] }),
+    g3: makeGuild({ members: ['4242'] }),
+  };
+  // g3 is configured and the owner is in it, but was not picked; g9 was picked and is not set up.
+  const backend = makeBackend({
+    clip: makeClip({ targetGuildIds: ['g1', 'g2', 'g9'], posts: [] }),
+    guilds,
+  });
+  const log = makeLog();
+  const fake = client(channels, discordGuilds);
+  const poster = createPoster({ client: fake, backend, log, fetch: makeFetch() });
+
+  const posted = await poster.postClip('clip1');
+
+  assert.deepEqual(posted, [{ guildId: 'g1', channelId: 'c1', messageId: 'm1' }]);
+  assert.deepEqual(fake.fetched, ['c1'], 'a skipped guild never has its channel fetched');
+  // The check goes past the cache: without the GuildMembers intent a cached member can be stale.
+  assert.deepEqual(discordGuilds.g1.memberFetches, [{ user: '4242', force: true, cache: false }]);
+  assert.deepEqual(discordGuilds.g3.memberFetches, [], 'an unpicked guild is not even checked');
+  assert.ok(log.lines.warn.some((l) => l.includes('g2') && l.includes('not a member')));
+  assert.ok(log.lines.info.some((l) => l.includes('g9') && l.includes('not configured')));
+});
+
+test('a membership check that fails, or a guild the bot cannot reach, skips only that guild', async () => {
+  const { channels, guilds } = threeGuilds();
+  const discordGuilds = {
+    g1: makeGuild({ error: discordError('Internal Server Error', 0) }),
+    // g2 is not in the cache, and the fake client cannot fetch it.
+    g3: makeGuild({ members: ['4242'] }),
+  };
+  const backend = makeBackend({
+    clip: makeClip({ targetGuildIds: ['g1', 'g2', 'g3'], posts: [] }),
+    guilds,
+  });
+  const log = makeLog();
+  const poster = createPoster({
+    client: client(channels, discordGuilds),
+    backend,
+    log,
+    fetch: makeFetch(),
+  });
+
+  const posted = await poster.postClip('clip1');
+
+  assert.deepEqual(posted.map((p) => p.guildId), ['g3']);
+  assert.ok(log.lines.warn.some((l) => l.includes('g1') && l.includes('Internal Server Error')));
+  assert.ok(log.lines.warn.some((l) => l.includes('g2') && l.includes('not reachable')));
+  assert.deepEqual(log.lines.error, [], 'a skipped guild is a warning, not a failed post');
+});
+
+test('a guild that already has a live post of the clip is skipped, targets or not', async () => {
+  for (const targetGuildIds of [null, ['g1', 'g2']]) {
+    const { channels, guilds } = threeGuilds();
+    const discordGuilds = {
+      g1: makeGuild({ members: ['4242'] }),
+      g2: makeGuild({ members: ['4242'] }),
+    };
+    const backend = makeBackend({
+      clip: makeClip({
+        targetGuildIds,
+        posts: [{ guildId: 'g1', channelId: 'c1', messageId: 'old' }],
+      }),
+      guilds,
+    });
+    const poster = createPoster({
+      client: client(channels, discordGuilds),
+      backend,
+      log: makeLog(),
+      fetch: makeFetch(),
+    });
+
+    const posted = await poster.postClip('clip1');
+
+    const expected = targetGuildIds ? ['g2'] : ['g2', 'g3'];
+    assert.deepEqual(posted.map((p) => p.guildId), expected, `for ${JSON.stringify(targetGuildIds)}`);
+    assert.equal(channels.c1.sent.length, 0, 'a retried notification must not double-post');
+    assert.deepEqual(discordGuilds.g1.memberFetches, [], 'no membership check for a skipped guild');
+  }
+});
+
+test('guildIds passed to postClip override the clip own targets', async () => {
+  const { channels, guilds } = threeGuilds();
+  const discordGuilds = {
+    g1: makeGuild({ members: ['4242'] }),
+    g2: makeGuild({ members: ['4242'] }),
+    g3: makeGuild({ members: ['4242'] }),
+  };
+  const backend = makeBackend({
+    clip: makeClip({ targetGuildIds: ['g1'], posts: [] }),
+    guilds,
+  });
+  const poster = createPoster({
+    client: client(channels, discordGuilds),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  assert.deepEqual((await poster.postClip('clip1', ['g3'])).map((p) => p.guildId), ['g3']);
+  assert.equal(channels.c1.sent.length, 0);
+});
+
+test('explicit guildIds on a legacy clip still require the owner to be a member', async () => {
+  const { channels, guilds } = threeGuilds();
+  const discordGuilds = { g1: makeGuild({ members: ['4242'] }), g2: makeGuild() };
+  const backend = makeBackend({ clip: makeClip({ targetGuildIds: null, posts: [] }), guilds });
+  const poster = createPoster({
+    client: client(channels, discordGuilds),
+    backend,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+
+  assert.deepEqual((await poster.postClip('clip1', ['g1', 'g2'])).map((p) => p.guildId), ['g1']);
+});
+
+test('an empty target list posts nowhere, and a malformed one rejects instead of posting everywhere', async () => {
+  const { channels, guilds } = threeGuilds();
+  const fake = client(channels, { g1: makeGuild({ members: ['4242'] }) });
+
+  const empty = makeBackend({ clip: makeClip({ targetGuildIds: [], posts: [] }), guilds });
+  const poster = createPoster({ client: fake, backend: empty, log: makeLog(), fetch: makeFetch() });
+  assert.deepEqual(await poster.postClip('clip1'), []);
+
+  const broken = makeBackend({ clip: makeClip({ targetGuildIds: 'g1', posts: [] }), guilds });
+  const brokenPoster = createPoster({
+    client: fake,
+    backend: broken,
+    log: makeLog(),
+    fetch: makeFetch(),
+  });
+  await assert.rejects(() => brokenPoster.postClip('clip1'), /not an array/);
+  assert.deepEqual(fake.fetched, []);
 });

@@ -1,6 +1,6 @@
 /** What a clip row means: the badge it wears, the line under it, where its video is, and the
- *  filters the library offers. One place, because the card, the row and the player rail all
- *  have to agree. */
+ *  filters the library offers. One place, because the card, the row, the player rail, the
+ *  match timeline and the publish dialog all have to agree. */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { fmtBytes, fmtCount } from "./format";
@@ -10,22 +10,32 @@ import type { ClipProgress, ClipRow, Segment, Settings, Status } from "./types";
 /** Matches `queue::MAX_ATTEMPTS`. */
 export const MAX_ATTEMPTS = 5;
 
+/** How much of "Publishing · N%" the encode is. It is most of the wait: a minute of software
+ *  encoding against a few seconds of upload for a typical clip. */
+const ENCODE_SHARE = 0.85;
+
 export type BadgeKind =
-  | "saved"
+  | "local"
+  | "queued"
   | "waiting"
-  | "encoding"
-  | "ready"
-  | "uploading"
+  | "publishing"
   | "retrying"
-  | "done"
+  | "published"
   | "failed"
   | "released";
+
+/** The status circle's five looks: outlined, accent (with a ring or a pulse), green, amber,
+ *  red. Every badge maps to exactly one. */
+export type CircleKind = "local" | "busy" | "published" | "retrying" | "failed";
 
 export interface Badge {
   kind: BadgeKind;
   label: string;
   /** Hover text, for the states that have a reason worth reading. */
   title?: string;
+  circle: CircleKind;
+  /** 0–100 while a job with a percentage runs, for the circle's ring. */
+  percent?: number;
 }
 
 /** True once the clip's video is only on the site: the row, the thumbnail and the link are
@@ -34,15 +44,17 @@ export function isReleased(c: ClipRow): boolean {
   return c.status === "done" && !c.av1_path && !c.h264_path;
 }
 
-/** True while this PC still holds something playable. */
-export function isLocal(c: ClipRow): boolean {
-  return !!(c.av1_path || c.h264_path) || c.status === "saved" || c.status === "encoding";
+/** A clip nobody published: it lives on this PC and nothing will encode or upload it. */
+export function isLocalClip(c: ClipRow): boolean {
+  return !c.publish && c.remote_id === null;
 }
 
-/** True when the editor can open the clip: there is a file here to cut, and no job is busy
- *  writing the outputs a cut would replace. Rust checks the same thing before it acts. */
-export function canEdit(c: ClipRow): boolean {
+/** True when the editor can open the clip: there is a file here to cut (or the match it was
+ *  taken in), and no job is busy writing the outputs a cut would replace. Rust checks the
+ *  same thing before it acts. */
+export function canEdit(c: ClipRow, hasMatch = false): boolean {
   if (c.status === "encoding" || c.status === "uploading") return false;
+  if (hasMatch) return true;
   return !!(c.av1_path || c.h264_path) || c.status === "saved" || c.status === "failed";
 }
 
@@ -57,89 +69,134 @@ export function encodingIsWaiting(status: Status | null, settings: Settings | nu
   return !!status?.hooked_game && settings?.encode_while_gaming === false;
 }
 
+/** The encode and the upload as one percentage, so the ring never runs backwards between
+ *  the two. */
+function overallPercent(progress: ClipProgress | undefined): number | undefined {
+  if (!progress || progress.stage === "idle") return undefined;
+  const p = Math.min(Math.max(progress.percent, 0), 100);
+  const share = ENCODE_SHARE * 100;
+  return Math.round(progress.stage === "encode" ? (p * share) / 100 : share + (p * (100 - share)) / 100);
+}
+
 export function badgeFor(
   c: ClipRow,
   progress: ClipProgress | undefined,
   status: Status | null,
   settings: Settings | null,
 ): Badge {
-  const percent = progress ? ` · ${progress.percent}%` : "";
+  // Once the site has it, every job is an update of the published clip rather than a first
+  // publish, and the copy says so.
+  const updating = c.remote_id !== null;
   const retrying = (): Badge => ({
     kind: "retrying",
+    circle: "retrying",
     label: t("clips.badge.retrying", { attempts: c.attempts, max: MAX_ATTEMPTS }),
     title: c.error
       ? t("clips.badge.attemptFailed", { attempts: c.attempts, error: c.error })
       : undefined,
   });
+  const publishing = (): Badge => {
+    const percent = overallPercent(progress);
+    const verb = updating ? t("clips.badge.updating") : t("clips.badge.publishing");
+    return {
+      kind: "publishing",
+      circle: "busy",
+      label: percent === undefined ? verb : `${verb} · ${percent}%`,
+      percent,
+    };
+  };
+  const queued = (): Badge =>
+    updating
+      ? {
+          kind: "queued",
+          circle: "busy",
+          label: t("clips.badge.updateQueued"),
+          title: t("clips.badge.updateQueuedTitle"),
+        }
+      : {
+          kind: "queued",
+          circle: "busy",
+          label: t("clips.badge.queued"),
+          title: t("clips.badge.queuedTitle"),
+        };
+
+  if (c.status === "failed") {
+    return {
+      kind: "failed",
+      circle: "failed",
+      label: c.stage === "upload" ? t("clips.badge.uploadFailed") : t("clips.badge.failed"),
+      title: c.error ?? undefined,
+    };
+  }
+  if (isLocalClip(c)) {
+    return {
+      kind: "local",
+      circle: "local",
+      label: t("clips.badge.local"),
+      title: t("clips.badge.localTitle"),
+    };
+  }
   switch (c.status) {
     case "saved":
       if (c.attempts > 0) return retrying();
       if (encodingIsWaiting(status, settings)) {
         return {
           kind: "waiting",
+          circle: "busy",
           label: t("clips.badge.waiting"),
           title: t("clips.badge.waitingTitle"),
         };
       }
-      // A clip that has outputs and is `saved` again is one the editor sent back.
-      return c.cut || c.av1_path
-        ? {
-            kind: "saved",
-            label: t("clips.badge.cutQueued"),
-            title: t("clips.badge.cutQueuedTitle"),
-          }
-        : { kind: "saved", label: t("clips.badge.saved"), title: t("clips.badge.savedTitle") };
+      return queued();
     case "encoding":
-      return {
-        kind: "encoding",
-        label: `${c.cut ? t("clips.badge.cutting") : t("clips.badge.encoding")}${percent}`,
-      };
+    case "uploading":
+      return publishing();
     case "encoded":
       if (c.attempts > 0) return retrying();
-      return {
-        kind: "ready",
-        label: t("clips.badge.ready"),
-        title: settings?.auto_upload === false ? t("clips.badge.readyUploadsOff") : undefined,
-      };
-    case "uploading":
-      return { kind: "uploading", label: `${t("clips.badge.uploading")}${percent}` };
+      // The upload gate is the login and nothing else.
+      if (status && !status.account) {
+        return {
+          kind: "waiting",
+          circle: "busy",
+          label: t("clips.badge.waitingLogin"),
+          title: t("clips.badge.waitingLoginTitle"),
+        };
+      }
+      return queued();
     case "done":
       return isReleased(c)
         ? {
             kind: "released",
+            circle: "published",
             label: t("clips.badge.released"),
             title: t("clips.badge.releasedTitle"),
           }
-        : { kind: "done", label: t("clips.badge.done") };
-    case "failed":
-      return {
-        kind: "failed",
-        label: c.stage === "upload" ? t("clips.badge.uploadFailed") : t("clips.badge.failed"),
-        title: c.error ?? undefined,
-      };
+        : {
+            kind: "published",
+            circle: "published",
+            label: t("clips.badge.published"),
+            title: t("clips.badge.publishedTitle"),
+          };
   }
 }
 
 /** The grey line under a card's title: what this clip cost, or why it is where it is. */
-export function metaLine(c: ClipRow, settings: Settings | null): string {
+export function metaLine(c: ClipRow, status: Status | null): string {
   const source = fmtBytes(c.size_source);
+  if (c.status === "failed") return c.error ? firstLine(c.error) : t("clips.meta.failed");
+  if (isLocalClip(c)) return t("clips.meta.local", { size: source });
   switch (c.status) {
     case "saved":
       if (c.attempts > 0) {
         return t("clips.meta.attempt", { attempts: c.attempts, max: MAX_ATTEMPTS });
       }
-      return c.cut || c.av1_path
-        ? t("clips.meta.waitingToCut", { size: source })
-        : t("clips.meta.waitingToEncode", { size: source });
+      return t("clips.meta.waitingToEncode", { size: source });
     case "encoding":
-      return c.cut
-        ? t("clips.meta.cutting", { size: source })
-        : t("clips.meta.encoding", { size: source });
+      return t("clips.meta.encoding", { size: source });
     case "encoded":
-      return t("clips.meta.encoded", {
+      return t(status && !status.account ? "clips.meta.encodedLogin" : "clips.meta.encoded", {
         source,
         encoded: fmtBytes(c.size_av1),
-        uploads: settings?.auto_upload === false ? t("clips.meta.uploadsOff") : "",
       });
     case "uploading":
       return t("clips.meta.uploading", { size: fmtBytes(c.size_av1) });
@@ -147,8 +204,6 @@ export function metaLine(c: ClipRow, settings: Settings | null): string {
       return isReleased(c)
         ? t("clips.meta.released")
         : t("clips.meta.done", { source, encoded: fmtBytes(c.size_av1) });
-    case "failed":
-      return c.error ? firstLine(c.error) : t("clips.meta.failed");
   }
 }
 
@@ -188,13 +243,15 @@ export function gameLabel(game: string | null): string {
 // ---------------------------------------------------------------------------
 // Filters, sorting and grouping
 
-export type FilterId = "not-uploaded" | "failed" | "released" | "local";
+export type FilterId = "local" | "published" | "failed" | "released";
 
+/** Local and Published split the library on whether the site has the clip, so a clip on its
+ *  way up for the first time still counts as local until it lands. */
 export const FILTERS: { id: FilterId; match: (c: ClipRow) => boolean }[] = [
-  { id: "not-uploaded", match: (c) => c.remote_id === null },
+  { id: "local", match: (c) => c.remote_id === null },
+  { id: "published", match: (c) => c.remote_id !== null },
   { id: "failed", match: (c) => c.status === "failed" },
   { id: "released", match: isReleased },
-  { id: "local", match: isLocal },
 ];
 
 export function filterLabel(id: FilterId): string {

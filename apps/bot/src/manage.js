@@ -4,10 +4,13 @@
 // Two very different actions hide behind one button, and the difference is the whole reason
 // the menu exists:
 //
-//   - Hide deletes the *Discord message* and nothing else. The clip stays in the bucket, on
+//   - Hide deletes the *Discord message* and tells the backend that post is no longer live,
+//     so the desktop stops showing the server on the clip. The clip stays in the bucket, on
 //     the site and in the rankings. It is the "wrong channel / not now" button.
 //   - Delete calls DELETE /internal/clips/:id and the clip is gone everywhere: files, row,
-//     votes, every post of it. It asks for a confirmation first, because nothing undoes it.
+//     votes, every post of it. The backend's purge sends POST /unpost back to us for the
+//     clip's messages in other guilds, so this module only takes down the one it was clicked
+//     on. It asks for a confirmation first, because nothing undoes it.
 //
 // Authorization is re-read from the backend on *every* click, never carried over from the
 // click before it: an ephemeral message lives for as long as the person keeps its tab open,
@@ -166,13 +169,16 @@ function confirmRow(locale, { clipId, channelId, messageId }) {
 }
 
 /**
- * Deletes a message we posted, tolerating the case where it is already gone.
+ * Deletes a message we posted, tolerating the case where it is already gone. Never rejects.
+ *
+ * Exported for POST /unpost in server.js, so the one decision about which failures are worth
+ * surfacing lives here and nowhere else.
  * @param {any} client
  * @param {string} channelId
  * @param {string} messageId
  * @param {{ warn: Function }} log
  */
-async function deleteMessage(client, channelId, messageId, log) {
+export async function deleteMessage(client, channelId, messageId, log) {
   try {
     const channel = await client.channels.fetch(channelId);
     await channel.messages.delete(messageId);
@@ -193,6 +199,32 @@ export function registerManage({ client, backend, log }) {
   if (!client) throw new TypeError('registerManage: client is required');
   if (!backend) throw new TypeError('registerManage: backend is required');
   const logger = normalizeLog(log);
+
+  /**
+   * Tells the backend a hidden post is gone, so it stops counting as live.
+   *
+   * Nothing here reaches the user: by the time this runs the message is down, which is what
+   * they asked for. A 404 means the backend never recorded the post (recordPost failed when it
+   * went up), so there is nothing to mark. Anything else leaves the backend believing in a post
+   * that no longer exists - the desktop would keep showing that server - which is worth an
+   * error line, not a failed reply.
+   * @param {string} clipId
+   * @param {string} messageId
+   */
+  async function markRemoved(clipId, messageId) {
+    try {
+      await backend.removePost(messageId);
+    } catch (err) {
+      const status = statusOf(err);
+      if (status === 404) {
+        logger.info(`clip ${clipId}: hidden post ${messageId} was never recorded by the backend`);
+        return;
+      }
+      logger.error(
+        `clip ${clipId}: post ${messageId} hidden but not marked removed${status ? ` (status ${status})` : ''}: ${errorText(err)}`,
+      );
+    }
+  }
 
   /**
    * Everything a click does once it has been acknowledged and the clip has been read.
@@ -246,6 +278,7 @@ export function registerManage({ client, backend, log }) {
 
     if (action === 'hide') {
       await deleteMessage(client, target.channelId, target.messageId, logger);
+      await markRemoved(clipId, target.messageId);
       logger.info(`clip ${clipId}: post ${target.messageId} hidden by ${interaction.user?.id}`);
       return finish({ content: t(locale, 'manage.hidden') });
     }

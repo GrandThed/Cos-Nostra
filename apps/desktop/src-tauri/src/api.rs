@@ -131,6 +131,11 @@ pub struct NewClipUpload {
     /// it either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_discord_ids: Option<Vec<String>>,
+    /// The Discord servers the owner picked in the publish dialog. Always sent, and always an
+    /// array: to the backend an absent or null `guildIds` means "every configured server", the
+    /// behaviour of builds from before the dialog, while `[]` means the web page only. A clip
+    /// this build publishes must never fall into the first meaning by accident.
+    pub guild_ids: Vec<String>,
 }
 
 /// Body of `POST /clips/:id/replace`: the new files for a clip the site already has. The
@@ -167,6 +172,51 @@ pub struct ClipUrls {
 pub struct CompletedClip {
     pub id: String,
     pub urls: ClipUrls,
+}
+
+/// A server the caller can publish to: configured on the backend, with the bot confirming the
+/// caller is a member. `slug` names the guild's site, which the desktop has no use for yet.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishGuild {
+    pub guild_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub slug: Option<String>,
+}
+
+/// One live Discord post of one of the caller's clips (`GET /me/posts`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyPost {
+    pub clip_id: String,
+    pub guild_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    #[allow(dead_code)]
+    pub channel_id: String,
+    #[allow(dead_code)]
+    pub message_id: String,
+    pub message_url: String,
+    pub posted_at: String,
+}
+
+/// `POST /clips/:id/posts` answers with the guilds it actually queued, after dropping ones that
+/// are not configured or already carry a live post of the clip.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueuedPosts {
+    pub queued: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Items<T> {
+    items: Vec<T>,
 }
 
 /// Callback for upload progress: the total bytes handed to the socket so far. Shared rather
@@ -358,6 +408,31 @@ impl Api {
         let req = self.auth(self.client.post(self.url(&format!("/clips/{id}/complete"))))?;
         Self::send_json(req, &what)
     }
+
+    /// The servers the publish dialog offers. A 503 (`bot_unavailable`) means the backend could
+    /// not ask the bot who the caller is in, and is left for the caller to explain.
+    pub fn publish_guilds(&self) -> Result<Vec<PublishGuild>> {
+        let req = self.auth(self.client.get(self.url("/discord/guilds")))?;
+        Self::send_json::<Items<PublishGuild>>(req, "GET /discord/guilds").map(|b| b.items)
+    }
+
+    /// Asks the bot to post an already published clip in more servers. Answers once queued;
+    /// the posts themselves land a few seconds later.
+    pub fn add_clip_posts(&self, id: &str, guild_ids: &[String]) -> Result<QueuedPosts> {
+        let what = format!("POST /clips/{id}/posts");
+        let req = self.auth(
+            self.client
+                .post(self.url(&format!("/clips/{id}/posts")))
+                .json(&serde_json::json!({ "guildIds": guild_ids })),
+        )?;
+        Self::send_json(req, &what)
+    }
+
+    /// Every live post of every one of the caller's clips.
+    pub fn my_posts(&self) -> Result<Vec<MyPost>> {
+        let req = self.auth(self.client.get(self.url("/me/posts")))?;
+        Self::send_json::<Items<MyPost>>(req, "GET /me/posts").map(|b| b.items)
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +591,7 @@ mod tests {
                 size_h264: 2000,
                 size_thumb: 100,
                 participant_discord_ids: Some(vec!["123".into(), "456".into()]),
+                guild_ids: Vec::new(),
             })
             .unwrap();
         assert_eq!(created.id, "clip1");
@@ -567,6 +643,8 @@ mod tests {
         assert_eq!(clip_body["recordedAt"], "2026-09-10T10:00:00Z");
         assert_eq!(clip_body["participantDiscordIds"][1], "456");
         assert!(clip_body.get("title").is_none(), "an optional None is left out entirely");
+        // No server ticked is still an explicit list: absent would mean "post everywhere".
+        assert_eq!(clip_body["guildIds"], serde_json::json!([]));
 
         for (i, (path, len, ct)) in [
             ("/s3/av1?sig=1", 3000usize, "video/mp4"),
@@ -673,6 +751,47 @@ mod tests {
         );
         assert_eq!(seen[0].header("authorization"), Some("Bearer tok"));
         assert!(seen[0].body.is_empty(), "no request body");
+    }
+
+    /// The three publish routes, read in the contract's shapes: nullable name and icon, a 503
+    /// that callers can tell apart, and the post list keyed by the backend's clip id.
+    #[test]
+    fn publish_routes_read_the_contract_shapes() {
+        let (base, seen) = stub(|_| {
+            let s = |x: &str| x.to_string();
+            vec![
+                ("200 OK", s(r#"{"items":[{"guildId":"111","name":"Cos Nostra","iconUrl":"https://cdn.discordapp.com/icons/111/abc.png?size=96","slug":"cn"},{"guildId":"222","name":null,"iconUrl":null,"slug":null}]}"#)),
+                ("503 Service Unavailable", s(r#"{"error":"bot_unavailable"}"#)),
+                ("202 Accepted", s(r#"{"queued":["222"]}"#)),
+                ("200 OK", s(r#"{"items":[{"clipId":"c1","guildId":"111","name":"Cos Nostra","iconUrl":null,"channelId":"5","messageId":"6","messageUrl":"https://discord.com/channels/111/5/6","postedAt":"2026-09-13T20:00:00.000Z"}]}"#)),
+            ]
+        });
+        let api = Api::new(&base, Some("tok".into())).unwrap();
+
+        let guilds = api.publish_guilds().unwrap();
+        assert_eq!(guilds.len(), 2);
+        assert_eq!(guilds[0].guild_id, "111");
+        assert_eq!(guilds[0].icon_url.as_deref(), Some("https://cdn.discordapp.com/icons/111/abc.png?size=96"));
+        assert_eq!((guilds[1].name.as_deref(), guilds[1].icon_url.as_deref()), (None, None));
+
+        let err = api.publish_guilds().unwrap_err();
+        let http = http_error(&err).unwrap();
+        assert_eq!((http.status, http.error.as_str()), (503, "bot_unavailable"));
+
+        let queued = api.add_clip_posts("c1", &["111".into(), "222".into()]).unwrap();
+        assert_eq!(queued.queued, vec!["222"]);
+
+        let posts = api.my_posts().unwrap();
+        assert_eq!(posts[0].clip_id, "c1");
+        assert_eq!(posts[0].message_url, "https://discord.com/channels/111/5/6");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].method.as_str(), seen[0].path.as_str()), ("GET", "/discord/guilds"));
+        assert_eq!(seen[0].header("authorization"), Some("Bearer tok"));
+        assert_eq!((seen[2].method.as_str(), seen[2].path.as_str()), ("POST", "/clips/c1/posts"));
+        let body: serde_json::Value = serde_json::from_slice(&seen[2].body).unwrap();
+        assert_eq!(body, serde_json::json!({ "guildIds": ["111", "222"] }));
+        assert_eq!((seen[3].method.as_str(), seen[3].path.as_str()), ("GET", "/me/posts"));
     }
 
     #[test]

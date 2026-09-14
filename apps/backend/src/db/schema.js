@@ -2,7 +2,8 @@
 // column names follow docs/PLAN.md section "Phase 3, Data model".
 //
 // Reactions are append-only with a removed_at timestamp: rankings count rows where
-// removed_at is null, and the yearly recap can replay history.
+// removed_at is null, and the yearly recap can replay history. Posts carry a removed_at of
+// their own for the same reason: a Discord message that was taken down keeps its row.
 
 import {
   bigint,
@@ -106,6 +107,11 @@ export const clips = pgTable(
     // people on the post. Never part of the public clip JSON: who you were playing with is not
     // something the player page or the listing should hand out.
     participants: text('participants').notNull().default('[]'),
+    // The Discord guild ids the owner picked when publishing, as a JSON array string (same
+    // convention as `participants`). Null is the legacy "every configured guild" that desktop
+    // builds from before publish-on-demand get by never sending the field; '[]' means the web
+    // page only, no Discord post. POST /clips/:id/posts merges more ids in later.
+    targetGuilds: text('target_guilds'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -126,6 +132,11 @@ export const posts = pgTable(
     channelId: text('channel_id').notNull(),
     messageId: text('message_id').notNull(),
     postedAt: timestamp('posted_at', { withTimezone: true }).notNull().defaultNow(),
+    // Set when the Discord message is taken down (Hide in the manage menu, unpublish, delete).
+    // A post is live while this is null. The row stays either way, so rankings and the guild
+    // site keep counting its reactions - Hide was always "gone from the channel, still on the
+    // site" - and only the publish routes (GET /me/posts, the bot's dedupe) look at it.
+    removedAt: timestamp('removed_at', { withTimezone: true }),
   },
   (t) => [
     uniqueIndex('posts_message_idx').on(t.messageId),
