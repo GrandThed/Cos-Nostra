@@ -62,7 +62,7 @@
         "installerHooks": "installer-hooks.nsh"
       }
     },
-    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "externalBin": ["binaries/ffmpeg"],
     "createUpdaterArtifacts": true
   },
   "plugins": {

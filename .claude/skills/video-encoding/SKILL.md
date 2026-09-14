@@ -23,6 +23,8 @@ If all fail, use `libsvtav1`. `ffmpeg -encoders | findstr av1` lists what the bu
 
 `apps/desktop/src-tauri/src/ffmpeg.rs` holds every invocation (`probe_encoders`, `probe`, `encode_av1`, `encode_h264`, `thumbnail`); `queue.rs` drives them from the worker thread and `lib.rs::process_clip` chooses output names. `cargo test ffmpeg -- --nocapture` runs a real end-to-end encode on a generated sample and prints the probe result. Measured on the dev machine: probe 1.2 s total (nvenc fails in ~150 ms, amf passes in ~500 ms), a 29 s 1080p60 clip encodes in 7.5 s to AV1 and 6.5 s to H.264 on AMF.
 
+**The shipped ffmpeg is not the one on PATH.** Installers carry a minimal static build from `apps/desktop/scripts/build-ffmpeg.sh` (`npm run build-ffmpeg -w apps/desktop`), configured with `--disable-everything` and only the encoders, decoders, muxers, demuxers, filters and bitstream filters the app uses, and there is no ffprobe in it: `ffmpeg::probe` parses the `Input #0` block ffmpeg prints, and the keyframe lookup reads `-f framecrc`. A command that works against the winget build can fail in the installer with "Unknown encoder", "No such filter" or "no decoder found for" (lavfi sources, for example, need the `wrapped_avframe` and `pcm_s16le` decoders). When `ffmpeg.rs` gains one, add it to that script's `configure` line, rebuild, and run `cargo test ffmpeg` with the minimal `ffmpeg.exe` first on PATH, since the tests otherwise pick up the full build.
+
 The AV1 preset was retuned on 2026-09-10 after AV1 came out bigger than the H.264 fallback: AMF quantizers run 0-255, so the old `-qp_i 28` was asking for near-lossless. See "Where the AV1 numbers come from" below for the measurements and for why `testsrc2` must never be used to judge a preset.
 
 ## Presets

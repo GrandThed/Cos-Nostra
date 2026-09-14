@@ -72,7 +72,7 @@ struct AppState {
     hooked_game: Mutex<Option<HookedGame>>,
     /// Bumped on every (re)start so a slow start that got superseded discards its result.
     generation: AtomicU64,
-    /// ffmpeg/ffprobe, once located at startup. `None` means encoding is unavailable.
+    /// ffmpeg, once located at startup. `None` means encoding is unavailable.
     ffmpeg: Mutex<Option<Binaries>>,
     /// Why ffmpeg is unavailable, shown in the Status tab.
     ffmpeg_error: Mutex<Option<String>>,
@@ -739,7 +739,7 @@ fn ffmpeg_or_err(state: &AppState) -> Result<Binaries, String> {
 }
 
 /// What the editor loads for a clip: the match it was taken in when that is still here, its own
-/// recording otherwise. Off the main thread: ffprobe.
+/// recording otherwise. Off the main thread: it runs ffmpeg to probe them.
 #[tauri::command]
 async fn edit_source(app: AppHandle, id: i64) -> Result<EditSource, String> {
     on_blocking_thread(move || {

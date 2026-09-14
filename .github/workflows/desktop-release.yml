@@ -30,6 +30,32 @@ jobs:
 
       - run: npm ci
 
+      # The installer ships the minimal ffmpeg from build-ffmpeg.sh, never a full build. The
+      # exe is cached by the script's hash, and ci.yml builds it under the same key on main, so
+      # a tag usually restores it instead of spending ~20 minutes compiling. ensure-ffmpeg (run
+      # by tauri-action's beforeBuildCommand) then finds it in place.
+      - name: Cache minimal ffmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: apps/desktop/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+          key: ffmpeg-minimal-${{ hashFiles('apps/desktop/scripts/build-ffmpeg.sh') }}
+
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            make diffutils bzip2 xz curl
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build minimal ffmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: bash apps/desktop/scripts/build-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-build" apps/desktop/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,10 +1,13 @@
-//! ffmpeg and ffprobe invocations: encoder probing, media probing, AV1 and H.264 encodes,
-//! thumbnails. Everything runs as a child process at below-normal priority with no console
-//! window, and every encode writes to `<dst>.part` first so a crash never leaves a half file
-//! that looks finished.
+//! ffmpeg invocations: encoder probing, media probing, AV1 and H.264 encodes, thumbnails.
+//! Everything runs as a child process at below-normal priority with no console window, and
+//! every encode writes to `<dst>.part` first so a crash never leaves a half file that looks
+//! finished.
 //!
-//! The binaries are Tauri sidecars (`bundle.externalBin`), copied next to the app exe as
-//! `ffmpeg.exe` / `ffprobe.exe`. `scripts/ensure-ffmpeg.ps1` puts them in place for builds.
+//! The binary is a Tauri sidecar (`bundle.externalBin`), copied next to the app exe as
+//! `ffmpeg.exe`. Releases ship the minimal build from `scripts/build-ffmpeg.sh`, which enables
+//! only what this module uses; a new encoder, filter or format here has to be added there too.
+//! There is no ffprobe: it would be a second copy of every library, so `probe` reads ffmpeg's
+//! own description of its input and `keyframe_at_or_before` its `framecrc` packet list.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,11 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::Quality;
 
-/// Resolved ffmpeg and ffprobe executables.
+/// The resolved ffmpeg executable.
 #[derive(Debug, Clone)]
 pub struct Binaries {
     pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
 }
 
 /// ffmpeg encoder names chosen by the startup probe, e.g. `av1_amf` / `h264_amf`, or the
@@ -31,7 +33,7 @@ pub struct Encoders {
     pub h264: String,
 }
 
-/// What ffprobe reports about a source file.
+/// What `probe` reports about a source file.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaInfo {
     pub duration_ms: i64,
@@ -65,7 +67,7 @@ pub struct Cut {
 pub const MIN_SEGMENT_MS: i64 = 100;
 
 /// How close to the ends a single segment may be and still count as "the whole clip". The
-/// editor measures the duration from the browser's decoder, ffprobe from the container,
+/// editor measures the duration from the browser's decoder, `probe` from the container,
 /// and the two disagree by a frame or two.
 const WHOLE_TOLERANCE_MS: i64 = 60;
 
@@ -178,29 +180,36 @@ const CREATION_FLAGS: u32 = 0x4000 | 0x0800_0000;
 /// Keyframe interval in frames (two seconds at 60 fps) so seeking and trimming stay cheap.
 const GOP: &str = "120";
 
-/// Finds the sidecar `ffmpeg.exe` / `ffprobe.exe` next to the running exe, falling back to
-/// whatever is on PATH. Errors if neither can be found.
+/// Finds the sidecar `ffmpeg.exe` next to the running exe, falling back to whatever is on
+/// PATH. Errors if neither can be found.
 pub fn locate() -> Result<Binaries> {
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         let bins = Binaries {
             ffmpeg: dir.join("ffmpeg.exe"),
-            ffprobe: dir.join("ffprobe.exe"),
         };
-        if bins.ffmpeg.is_file() && bins.ffprobe.is_file() && works(&bins.ffmpeg) && works(&bins.ffprobe) {
+        if bins.ffmpeg.is_file() && works(&bins.ffmpeg) {
             log::info!("using sidecar ffmpeg in {}", dir.display());
+            // Builds before the minimal ffmpeg also shipped a ~160 MB ffprobe.exe, which an
+            // update installs over but never removes.
+            let stale = dir.join("ffprobe.exe");
+            if stale.is_file() {
+                match fs::remove_file(&stale) {
+                    Ok(()) => log::info!("removed the unused {}", stale.display()),
+                    Err(e) => log::warn!("could not remove the unused {}: {e}", stale.display()),
+                }
+            }
             return Ok(bins);
         }
     }
 
     let bins = Binaries {
         ffmpeg: PathBuf::from("ffmpeg"),
-        ffprobe: PathBuf::from("ffprobe"),
     };
-    if works(&bins.ffmpeg) && works(&bins.ffprobe) {
+    if works(&bins.ffmpeg) {
         log::info!("using ffmpeg from PATH");
         return Ok(bins);
     }
-    bail!("ffmpeg.exe and ffprobe.exe were found neither next to the app nor on PATH")
+    bail!("ffmpeg.exe was found neither next to the app nor on PATH")
 }
 
 /// True when `exe -version` can be spawned and exits 0; this is the `where.exe` check that
@@ -355,85 +364,167 @@ fn first_working<'a>(bins: &Binaries, candidates: &[&'a str]) -> Option<&'a str>
     })
 }
 
-#[derive(Deserialize)]
-struct ProbeOutput {
-    #[serde(default)]
-    format: ProbeFormat,
-    #[serde(default)]
-    streams: Vec<ProbeStream>,
+/// ffmpeg's description of an input file: the `Input #0` block it prints to stderr.
+#[derive(Debug, Default, PartialEq)]
+struct InputDump {
+    duration_ms: Option<i64>,
+    /// The container's start time in seconds, what ffprobe calls `format.start_time`.
+    start: f64,
+    streams: Vec<DumpStream>,
 }
 
-#[derive(Deserialize, Default)]
-struct ProbeFormat {
-    duration: Option<String>,
-    size: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProbeStream {
-    codec_type: Option<String>,
+#[derive(Debug, Default, PartialEq)]
+struct DumpStream {
+    /// `Video`, `Audio`, `Data`, ...
+    kind: String,
     /// Only the tests assert on codec names; the app trusts the encoder it asked for.
     #[cfg_attr(not(test), allow(dead_code))]
-    codec_name: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-    r_frame_rate: Option<String>,
+    codec: String,
+    width: u32,
+    height: u32,
+    /// The stream's `r_frame_rate`, which ffmpeg prints as `tbr` rounded to two decimals.
+    fps: f64,
 }
 
-/// Runs ffprobe and parses its JSON. Shared by the public probe and the tests.
-fn probe_raw(bins: &Binaries, src: &Path) -> Result<ProbeOutput> {
-    let mut cmd = command(&bins.ffprobe);
-    cmd.args(["-v", "error", "-show_entries"])
-        .arg("format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate")
-        .args(["-of", "json"])
-        .arg(src);
-    let output = run(cmd, &format!("probe {}", src.display()))?;
-    serde_json::from_slice(&output.stdout).with_context(|| format!("probe {}: unparsable ffprobe output", src.display()))
+/// Reads the block ffmpeg prints about its input before doing anything else with it:
+///
+/// ```text
+/// Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
+///   Duration: 00:00:06.00, start: 0.000000, bitrate: 4339 kb/s
+///   Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 1280x720 [SAR 1:1 DAR 16:9], 4227 kb/s, 60 fps, 60 tbr, 15360 tbn (default)
+///   Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 96 kb/s (default)
+/// ```
+///
+/// That is text for people, not an interface, but it is `av_dump_format`'s and has kept this
+/// shape for well over a decade; the tests pin it against the ffmpeg they run. `Duration` has
+/// centisecond precision, finer than any tolerance the callers use. `None` when there is no
+/// such block, which is how ffmpeg says it could not open the file at all.
+fn parse_input_dump(stderr: &str) -> Option<InputDump> {
+    let mut lines = stderr.lines().skip_while(|l| !l.starts_with("Input #0"));
+    lines.next()?;
+    let mut dump = InputDump::default();
+    // The block ends at the first line that is not indented: "Stream mapping:", "Output #0",
+    // or the complaint that no output was given.
+    for line in lines.take_while(|l| l.starts_with(' ')).map(str::trim_start) {
+        if let Some(rest) = line.strip_prefix("Duration: ") {
+            let mut fields = rest.split(", ");
+            dump.duration_ms = fields.next().and_then(parse_clock);
+            if let Some(start) = fields.find_map(|f| f.strip_prefix("start: ")) {
+                dump.start = start.trim().parse().unwrap_or(0.0);
+            }
+        } else if let Some(rest) = line.strip_prefix("Stream #0:") {
+            // `0[0x1](und): Video: h264 ...`. The id holds colons, but never a colon and a space.
+            let Some((kind, desc)) = rest.split_once(": ").and_then(|(_, rest)| rest.split_once(": ")) else {
+                continue;
+            };
+            dump.streams.push(parse_stream(kind, desc));
+        }
+    }
+    Some(dump)
 }
 
-/// Duration, dimensions, frame rate and size of a video file through `ffprobe -of json`.
-pub fn probe(bins: &Binaries, src: &Path) -> Result<MediaInfo> {
-    let parsed = probe_raw(bins, src)?;
-    let video = parsed
-        .streams
-        .iter()
-        .find(|s| s.codec_type.as_deref() == Some("video"))
-        .with_context(|| format!("probe {}: no video stream", src.display()))?;
-    let duration: f64 = parsed
-        .format
-        .duration
-        .as_deref()
-        .and_then(|d| d.parse().ok())
-        .with_context(|| format!("probe {}: no duration", src.display()))?;
-    let size = parsed.format.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let has_audio = parsed
-        .streams
-        .iter()
-        .any(|s| s.codec_type.as_deref() == Some("audio"));
-    Ok(MediaInfo {
-        duration_ms: (duration * 1000.0).round() as i64,
-        width: video.width.unwrap_or(0),
-        height: video.height.unwrap_or(0),
-        fps: parse_fraction(video.r_frame_rate.as_deref().unwrap_or("0/1")),
-        size,
-        has_audio,
-    })
-}
-
-/// `60000/1001` -> 59.94. Also accepts a plain number.
-fn parse_fraction(s: &str) -> f64 {
-    match s.split_once('/') {
-        Some((num, den)) => {
-            let num: f64 = num.trim().parse().unwrap_or(0.0);
-            let den: f64 = den.trim().parse().unwrap_or(1.0);
-            if den == 0.0 {
-                0.0
-            } else {
-                num / den
+/// One stream line after its kind: the codec first, then comma-separated facts in no fixed
+/// order, recognised by their shape (`1280x720 ...`, `60 tbr`).
+fn parse_stream(kind: &str, desc: &str) -> DumpStream {
+    let parts = split_top_level(desc);
+    let mut stream = DumpStream {
+        kind: kind.to_string(),
+        codec: parts[0].split_whitespace().next().unwrap_or_default().to_string(),
+        ..DumpStream::default()
+    };
+    for part in &parts[1..] {
+        let first = part.split_whitespace().next().unwrap_or_default();
+        if let Some((w, h)) = first.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+                (stream.width, stream.height) = (w, h);
             }
         }
-        None => s.trim().parse().unwrap_or(0.0),
+        // `fps` is the average rate and comes first; `tbr` is `r_frame_rate` and wins.
+        if let Some(rate) = part.strip_suffix(" tbr") {
+            stream.fps = parse_rate(rate);
+        } else if let Some(rate) = part.strip_suffix(" fps") {
+            if stream.fps == 0.0 {
+                stream.fps = parse_rate(rate);
+            }
+        }
     }
+    stream
+}
+
+/// Splits on the commas that are not inside `(...)` or `[...]`, so `yuv420p(tv, bt709)` stays
+/// one part.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// A rate as ffmpeg prints it: `60`, `59.94`, or `1k` for 1000.
+fn parse_rate(s: &str) -> f64 {
+    let s = s.trim();
+    match s.strip_suffix('k') {
+        Some(thousands) => thousands.parse::<f64>().map(|v| v * 1000.0).unwrap_or(0.0),
+        None => s.parse().unwrap_or(0.0),
+    }
+}
+
+/// `00:01:02.50` -> 62500. `N/A` (a container that does not know its length) -> `None`.
+fn parse_clock(s: &str) -> Option<i64> {
+    let mut parts = s.trim().splitn(3, ':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let secs: f64 = parts.next()?.parse().ok()?;
+    Some(((hours * 3600 + minutes * 60) * 1000) + (secs * 1000.0).round() as i64)
+}
+
+/// Opens `src` with no output, which makes ffmpeg describe the input and stop. It exits
+/// non-zero for want of an output, so success is the description being there.
+fn inspect(bins: &Binaries, src: &Path) -> Result<InputDump> {
+    let mut cmd = ffmpeg_command(bins);
+    cmd.arg("-i").arg(src);
+    log::debug!("probe: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("probe {}: failed to spawn {:?}", src.display(), cmd.get_program()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_input_dump(&stderr)
+        .ok_or_else(|| anyhow!("{}", stderr_tail(&stderr)))
+        .with_context(|| format!("probe {}: ffmpeg could not read it", src.display()))
+}
+
+/// Duration, dimensions, frame rate and size of a video file.
+pub fn probe(bins: &Binaries, src: &Path) -> Result<MediaInfo> {
+    let dump = inspect(bins, src)?;
+    let video = dump
+        .streams
+        .iter()
+        .find(|s| s.kind == "Video")
+        .with_context(|| format!("probe {}: no video stream", src.display()))?;
+    let duration_ms = dump
+        .duration_ms
+        .with_context(|| format!("probe {}: no duration", src.display()))?;
+    Ok(MediaInfo {
+        duration_ms,
+        width: video.width,
+        height: video.height,
+        fps: video.fps,
+        size: fs::metadata(src).map(|m| m.len()).unwrap_or(0),
+        has_audio: dump.streams.iter().any(|s| s.kind == "Audio"),
+    })
 }
 
 fn seconds(ms: i64) -> String {
@@ -717,22 +808,43 @@ pub fn thumbnail(bins: &Binaries, src: &Path, dst: &Path, at_ms: i64) -> Result<
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct PacketProbe {
-    #[serde(default)]
-    packets: Vec<ProbePacket>,
-    format: Option<ProbeStart>,
-}
-
-#[derive(Deserialize)]
-struct ProbePacket {
-    pts_time: Option<String>,
-    flags: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProbeStart {
-    start_time: Option<String>,
+/// Presentation times, in seconds, of the keyframes in a `framecrc` listing of stream 0:
+///
+/// ```text
+/// #tb 0: 1/15360
+/// 0,      14848,      15360,      256,    26425, 0xc1af470d
+/// 0,      15104,      16128,      256,     1180, 0x2b3e6c1a, F=0x0
+/// ```
+///
+/// The columns are stream, dts, pts, duration, size and checksum. `F=` is only printed for a
+/// packet whose flags are anything but exactly "keyframe", so a keyframe is a line without it,
+/// or with bit 0 set in it.
+fn keyframe_times(listing: &str) -> Vec<f64> {
+    let mut time_base = None;
+    let mut times = Vec::new();
+    for line in listing.lines() {
+        if let Some(tb) = line.strip_prefix("#tb 0: ") {
+            time_base = tb.split_once('/').and_then(|(num, den)| {
+                let (num, den) = (num.trim().parse::<f64>().ok()?, den.trim().parse::<f64>().ok()?);
+                (den != 0.0).then_some((num, den))
+            });
+            continue;
+        }
+        let Some((num, den)) = time_base else { continue };
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if line.starts_with('#') || fields.len() < 6 || fields[0] != "0" {
+            continue;
+        }
+        let key = match fields[6..].iter().find_map(|f| f.strip_prefix("F=0x")) {
+            None => true,
+            Some(hex) => u32::from_str_radix(hex, 16).is_ok_and(|flags| flags & 1 == 1),
+        };
+        if let (true, Ok(pts)) = (key, fields[2].parse::<i64>()) {
+            // Multiply before dividing: `pts * (1 / den)` lands a hair off whole seconds.
+            times.push(pts as f64 * num / den);
+        }
+    }
+    times
 }
 
 /// How far back from a cut point to look for its keyframe. Far past any GOP a recorder uses.
@@ -740,31 +852,26 @@ const KEYFRAME_LOOKBACK_MS: i64 = 30_000;
 
 /// The time of the last video keyframe at or before `at_ms`, measured from the start of the
 /// file the way `-ss` measures it. A stream copy can only begin on a keyframe, so this is
-/// where a copy that wants `at_ms` really starts. Reads packet headers only, and only around
-/// the point, so it costs the same on a three hour recording as on a clip.
+/// where a copy that wants `at_ms` really starts. Reads packets without decoding them, and only
+/// around the point, so it costs the same on a three hour recording as on a clip.
 pub fn keyframe_at_or_before(bins: &Binaries, src: &Path, at_ms: i64) -> Result<i64> {
     if at_ms <= 0 {
         return Ok(0);
     }
     let from = (at_ms - KEYFRAME_LOOKBACK_MS).max(0);
-    let mut cmd = command(&bins.ffprobe);
-    cmd.args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-read_intervals", &format!("{}%{}", seconds(from), seconds(at_ms + 500))])
-        .args(["-show_entries", "packet=pts_time,flags:format=start_time", "-of", "json"])
-        .arg(src);
+    // Stream-copy the window into `framecrc`, which lists every packet with its flags and
+    // never decodes a frame. `-copyts` keeps the demuxer's own timestamps, so subtracting the
+    // container start time (from the input description on stderr) measures from the start of
+    // the file the way `-ss` does.
+    let mut cmd = ffmpeg_command(bins);
+    cmd.args(["-nostats", "-copyts", "-ss", &seconds(from), "-t", &seconds(at_ms + 500 - from)])
+        .arg("-i")
+        .arg(src)
+        .args(["-map", "0:v:0", "-c", "copy", "-f", "framecrc", "-"]);
     let output = run(cmd, &format!("keyframes of {}", src.display()))?;
-    let parsed: PacketProbe = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("keyframes of {}: unparsable ffprobe output", src.display()))?;
-    let start = parsed
-        .format
-        .and_then(|f| f.start_time)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let best = parsed
-        .packets
-        .iter()
-        .filter(|p| p.flags.as_deref().is_some_and(|f| f.starts_with('K')))
-        .filter_map(|p| p.pts_time.as_deref()?.parse::<f64>().ok())
+    let start = parse_input_dump(&String::from_utf8_lossy(&output.stderr)).map_or(0.0, |d| d.start);
+    let best = keyframe_times(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
         .map(|t| ((t - start) * 1000.0).round() as i64)
         .filter(|&ms| ms <= at_ms)
         .max();
@@ -843,7 +950,7 @@ mod tests {
     use super::*;
 
     fn bins() -> Binaries {
-        locate().expect("ffmpeg and ffprobe must be reachable for these tests")
+        locate().expect("ffmpeg must be reachable for these tests")
     }
 
     fn tmp_dir() -> PathBuf {
@@ -867,24 +974,88 @@ mod tests {
     }
 
     fn codecs(bins: &Binaries, path: &Path) -> (String, String) {
-        let parsed = probe_raw(bins, path).unwrap();
-        let by_type = |t: &str| {
-            parsed
-                .streams
+        let dump = inspect(bins, path).unwrap();
+        let by_kind = |kind: &str| {
+            dump.streams
                 .iter()
-                .find(|s| s.codec_type.as_deref() == Some(t))
-                .and_then(|s| s.codec_name.clone())
+                .find(|s| s.kind == kind)
+                .map(|s| s.codec.clone())
                 .unwrap_or_default()
         };
-        (by_type("video"), by_type("audio"))
+        (by_kind("Video"), by_kind("Audio"))
     }
 
     #[test]
-    fn parses_fractions() {
-        assert_eq!(parse_fraction("60/1"), 60.0);
-        assert!((parse_fraction("60000/1001") - 59.94).abs() < 0.01);
-        assert_eq!(parse_fraction("0/0"), 0.0);
-        assert_eq!(parse_fraction("30"), 30.0);
+    fn parses_input_descriptions() {
+        // Real ffmpeg 9 output: a fragmented recording (per-stream start, colour info with
+        // commas inside parentheses) and an NTSC-rate AV1 clip decoded through libdav1d.
+        // Built from lines: a `\` continuation in a string literal would eat the indentation
+        // that tells the block apart from what follows it.
+        let recording = [
+            "[mov,mp4,m4a,3gp,3g2,mj2 @ 000001] a warning before the block",
+            r"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'C:\Clips\Matches\session.mp4':",
+            "  Metadata:",
+            "    major_brand     : iso5",
+            "  Duration: 01:02:03.45, start: -0.023220, bitrate: 4310 kb/s",
+            "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 1920x1080 [SAR 1:1 DAR 16:9], 4227 kb/s, 60 fps, 60 tbr, 15360 tbn, start 0.033333 (default)",
+            "    Metadata:",
+            "      handler_name    : VideoHandler",
+            "  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 160 kb/s (default)",
+            "At least one output file must be specified",
+        ]
+        .join("\n");
+        let dump = parse_input_dump(&recording).unwrap();
+        assert_eq!(dump.duration_ms, Some(3_723_450));
+        assert!((dump.start + 0.02322).abs() < 1e-9);
+        assert_eq!(
+            dump.streams,
+            vec![
+                DumpStream { kind: "Video".into(), codec: "h264".into(), width: 1920, height: 1080, fps: 60.0 },
+                DumpStream { kind: "Audio".into(), codec: "aac".into(), width: 0, height: 0, fps: 0.0 },
+            ]
+        );
+
+        let clip = [
+            "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'av1.mp4':",
+            "  Duration: 00:00:03.00, start: 0.000000, bitrate: 1878 kb/s",
+            "  Stream #0:0[0x1](und): Video: av1 (libdav1d) (Main) (av01 / 0x31307661), yuv420p(tv, progressive), 640x360 [SAR 1:1 DAR 16:9], 1788 kb/s, 59.94 fps, 59.94 tbr, 60k tbn (default)",
+            "  Stream #0:1[0x2](und): Audio: opus (Opus / 0x7375704F), 48000 Hz, mono, fltp, 77 kb/s (default)",
+            "Stream mapping:",
+            "  Stream #0:0 -> #0:0 (copy)",
+        ]
+        .join("\n");
+        let dump = parse_input_dump(&clip).unwrap();
+        assert_eq!(dump.duration_ms, Some(3_000));
+        assert_eq!(dump.start, 0.0);
+        assert_eq!(dump.streams.len(), 2, "the stream mapping is not part of the input");
+        assert_eq!((dump.streams[0].codec.as_str(), dump.streams[0].width, dump.streams[0].fps), ("av1", 640, 59.94));
+        assert_eq!(dump.streams[1].codec, "opus");
+
+        // A file ffmpeg cannot open has no description; one without a length has no duration.
+        assert_eq!(parse_input_dump("broken.mp4: Invalid data found when processing input\n"), None);
+        let unknown = parse_input_dump("Input #0, mov, from 'x':\n  Duration: N/A, bitrate: N/A\n").unwrap();
+        assert_eq!((unknown.duration_ms, unknown.start), (None, 0.0));
+        assert_eq!(parse_rate("1k"), 1000.0);
+    }
+
+    #[test]
+    fn parses_framecrc_keyframes() {
+        let listing = "\
+#format: frame checksums\n\
+#tb 0: 1/15360\n\
+#media_type 0: video\n\
+#dimensions 0: 1280x720\n\
+0,      14848,      15360,      256,    26425, 0xc1af470d\n\
+0,      15104,      16128,      256,     1180, 0x2b3e6c1a, F=0x0\n\
+0,      15360,      15616,      256,     1180, 0x2b3e6c1a, F=0x4\n\
+0,      30208,      30720,      256,    27688, 0xd91ec37b, S=1,       24, 0x0bd50212\n\
+0,      45568,      46080,      256,    28364, 0x11c4a1a9, F=0x5\n";
+        assert_eq!(keyframe_times(listing), vec![1.0, 2.0, 3.0]);
+        assert!(keyframe_times("0,      14848,      15360,      256,    26425, 0xc1af470d\n").is_empty(), "no time base, no times");
+    }
+
+    #[test]
+    fn formats_times_and_parts() {
         assert_eq!(seconds(500), "0.500");
         assert_eq!(seconds(2500), "2.500");
         assert_eq!(part_path(Path::new("C:/x/clip.mp4")), PathBuf::from("C:/x/clip.mp4.part"));

@@ -84,7 +84,8 @@ Goal: every saved clip becomes a small AV1 file plus an H.264 fallback and a thu
 
 What exists:
 
-- ffmpeg and ffprobe as Tauri sidecars. `scripts/ensure-ffmpeg.ps1` copies them from PATH or downloads the BtbN GPL build into the gitignored `src-tauri/binaries/`; it runs before every `tauri dev` and `tauri build` because tauri-build refuses to build without them.
+- ffmpeg as a Tauri sidecar. `scripts/ensure-ffmpeg.ps1` copies it from PATH or downloads the BtbN GPL build into the gitignored `src-tauri/binaries/`; it runs before every `tauri dev` and `tauri build` because tauri-build refuses to build without it.
+- *Later:* releases ship a minimal static ffmpeg from `scripts/build-ffmpeg.sh` (pinned sources, only the components `ffmpeg.rs` uses) and no ffprobe, whose two uses now read ffmpeg's own input description and `framecrc` output. Two full builds were 313 MB of the 452 MB install.
 - Encoder probe at startup, cached in settings, re-probe from the UI. AMF was chosen for AV1 and H.264 on the dev GPU.
 - Clip queue in SQLite (`%APPDATA%\Cos Nostra\clips.db`), worker thread, backoff retries up to five attempts, stale `encoding` rows reset at startup.
 - Game detection from the foreground window at hotkey time: a table of about 240 executables, window title cleanup as fallback, a list of programs that are never games.
@@ -96,7 +97,7 @@ What changed from the plan and why:
 - Encoding waits while a game is hooked or the foreground window looks like a game, rather than watching process priority alone. ffmpeg still runs at below-normal priority with half the cores.
 - Trim is plumbed through (`ffmpeg::Trim`) but not exposed in the UI until phase 6.
 - The AV1 preset was wrong until 2026-09-10 and is now fixed: AMF quantizers run 0-255, not 0-51, so `-qp_i 28` asked for near-lossless AV1 and produced files about twice the size of the H.264 fallback on real gameplay (53 MB against 27 MB for one 27 s clip). `av1_amf` now uses cqp 95, measured at 32 percent smaller than the H.264 fallback with a 0.87 VMAF gap, and 65 percent smaller than the old output. The measurements, the rejected knobs and the method are in the video-encoding skill. `av1_nvenc` and `av1_qsv` keep 28, which is correct on their native 0-51 scales but is still unmeasured because this is an AMD machine.
-- The installer grows by two 220 MB static ffmpeg binaries (compressed by NSIS). If that hurts, switch to a download at first launch like the OBS runtime.
+- The installer grows by two 220 MB static ffmpeg binaries (compressed by NSIS). *Resolved later* by the minimal ffmpeg build and dropping ffprobe (see the sidecar note above), not by a download at first launch, which would have saved installer size but no disk.
 
 Acceptance (ten clips saved during gameplay all encoded within a few minutes of leaving the game, at low priority) was run with ffplay fullscreen as the game: eleven clips queued, none encoded while it was focused, all done 143 seconds after closing it, ffmpeg observed at BelowNormal priority.
 

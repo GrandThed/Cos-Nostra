@@ -123,7 +123,7 @@ pub struct NewClip {
     pub duration_ms: i64,
     pub width: u32,
     pub height: u32,
-    /// Frames per second the source was captured at, as ffprobe read it.
+    /// Frames per second the source was captured at, as `ffmpeg::probe` read it.
     pub fps: f64,
     pub size_source: i64,
     /// Discord ids who were in the owner's voice channel when the clip was taken. Always

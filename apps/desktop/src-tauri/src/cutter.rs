@@ -293,7 +293,7 @@ mod tests {
     use crate::timeline::{Event, GameEvent, Outcome, SessionGame};
 
     fn bins() -> Binaries {
-        ffmpeg::locate().expect("ffmpeg and ffprobe must be reachable for these tests")
+        ffmpeg::locate().expect("ffmpeg must be reachable for these tests")
     }
 
     fn dir(name: &str) -> PathBuf {

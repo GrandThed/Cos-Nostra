@@ -428,7 +428,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> Fixture {
-        let bins = ffmpeg::locate().expect("ffmpeg and ffprobe must be reachable for these tests");
+        let bins = ffmpeg::locate().expect("ffmpeg must be reachable for these tests");
         let dir = std::env::temp_dir().join(format!(
             "cos-nostra-edit-{name}-{}-{}",
             std::process::id(),

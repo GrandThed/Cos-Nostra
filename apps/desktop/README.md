@@ -96,13 +96,29 @@ multi-segment `cut` for rows written by older builds; the editor opens those on 
 
 ## ffmpeg
 
-`ffmpeg.exe` and `ffprobe.exe` ship as Tauri sidecars (`bundle.externalBin` in `tauri.conf.json`)
-and are copied next to the app exe at build time. `src-tauri/src/ffmpeg.rs` looks there first and
-falls back to `ffmpeg` on PATH. The sidecar files live in `src-tauri/binaries/` as
-`ffmpeg-x86_64-pc-windows-msvc.exe` / `ffprobe-x86_64-pc-windows-msvc.exe`; they are about
-220 MB each and are gitignored. `npm run ensure-ffmpeg` (run automatically before `tauri dev` and
-`tauri build`) creates them from ffmpeg on PATH, the winget `Gyan.FFmpeg` package directory, or
-the pinned BtbN GPL build download, in that order. Delete `src-tauri/binaries/` to refresh them.
+`ffmpeg.exe` ships as a Tauri sidecar (`bundle.externalBin` in `tauri.conf.json`) and is copied
+next to the app exe at build time. `src-tauri/src/ffmpeg.rs` looks there first and falls back to
+`ffmpeg` on PATH. The sidecar lives, gitignored, in `src-tauri/binaries/` as
+`ffmpeg-x86_64-pc-windows-msvc.exe`.
+
+There is no ffprobe. `ffmpeg::probe` reads the `Input #0` description ffmpeg prints about a file,
+and `ffmpeg::keyframe_at_or_before` stream-copies the window into the `framecrc` muxer, which lists
+each packet with its keyframe flag. A second binary would have been a second full copy of every
+codec library.
+
+What ships is a minimal static build: `npm run build-ffmpeg` runs `scripts/build-ffmpeg.sh` in
+MSYS2 (a private copy is unpacked into `%LOCALAPPDATA%\cos-nostra-ffmpeg-build` when none is
+installed) and writes the sidecar. FFmpeg and every library in it are pinned by version and
+SHA-256, and it enables only the encoders, decoders, formats and filters `ffmpeg.rs` uses. **A new
+encoder, filter or format in `ffmpeg.rs` has to be added to the `configure` line there too**, or it
+fails at runtime with "Unknown encoder" or "No such filter" even though it works against the full
+ffmpeg on PATH. CI builds the same script, caches the exe by the script's hash, and puts it in every
+release.
+
+`npm run ensure-ffmpeg` (run automatically before `tauri dev` and `tauri build`) leaves an existing
+sidecar alone. When there is none it copies ffmpeg from PATH, the winget `Gyan.FFmpeg` package
+directory, or the BtbN GPL build download, in that order. Those are full builds of 150-200 MB:
+fine for `tauri dev`, and it warns that an installer built with one ships all of it.
 
 ## Develop
 

@@ -1,8 +1,9 @@
 # Runs on every push and pull request. Two jobs:
 #   node     npm ci + npm test for every workspace with a test script (backend on PGlite, shared)
 #   desktop  cargo check of the Tauri app on Windows. tauri-build's build.rs needs the ffmpeg
-#            sidecars under src-tauri/binaries even for a type check, so ensure-ffmpeg runs first
-#            (downloads ~100 MB on a cold runner; cached by the script's hash afterwards).
+#            sidecar under src-tauri/binaries even for a type check. This builds the minimal
+#            one with build-ffmpeg.sh (~20 minutes, only when that script changes; cached by its
+#            hash), which also keeps the cache warm for desktop-release.yml under the same key.
 name: ci
 
 on:
@@ -39,11 +40,25 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
       - run: npm ci
-      - name: Cache ffmpeg sidecars
+      - name: Cache minimal ffmpeg
+        id: ffmpeg-cache
         uses: actions/cache@v4
         with:
-          path: apps/desktop/src-tauri/binaries
-          key: ffmpeg-sidecars-${{ runner.os }}-${{ hashFiles('apps/desktop/scripts/ensure-ffmpeg.ps1') }}
+          path: apps/desktop/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+          key: ffmpeg-minimal-${{ hashFiles('apps/desktop/scripts/build-ffmpeg.sh') }}
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            make diffutils bzip2 xz curl
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+      - name: Build minimal ffmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: bash apps/desktop/scripts/build-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-build" apps/desktop/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
       - run: npm run ensure-ffmpeg -w apps/desktop
       - run: cargo check
         working-directory: apps/desktop/src-tauri

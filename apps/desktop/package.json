@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "ensure-ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-ffmpeg.ps1"
+    "ensure-ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-ffmpeg.ps1",
+    "build-ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-ffmpeg.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
