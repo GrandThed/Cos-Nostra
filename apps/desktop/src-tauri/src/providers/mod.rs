@@ -17,5 +17,7 @@ pub fn for_game(game: SessionGame) -> Option<Box<dyn Provider>> {
         // Teamfight Tactics has no provider: its sessions keep whole recordings, the same
         // treatment Counter-Strike had before its GSI provider.
         SessionGame::TeamfightTactics => None,
+        // Whatever game this is, nothing here knows how to read it.
+        SessionGame::Other => None,
     }
 }

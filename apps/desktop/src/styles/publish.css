@@ -197,6 +197,53 @@ body.maximized .dialog-scrim {
   font-size: 11.5px;
 }
 
+/* --- Export (exporter.ts) ----------------------------------------------- */
+
+.export-dialog {
+  width: min(520px, 100%);
+}
+
+.export-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.export-fields .field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.export-fields .chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.export-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.export-path {
+  word-break: break-all;
+}
+
+.guild-row.mic-row {
+  align-items: flex-start;
+}
+
+.guild-row.mic-row .name {
+  white-space: normal;
+}
+
+.guild-row.mic-row .name small {
+  display: block;
+}
+
 .guild-state {
   display: flex;
   align-items: center;

@@ -3,17 +3,28 @@
 import { locale, t } from "./i18n";
 
 /** Sizes as the design writes them: three significant figures at most, so "212 MB" and
- *  "6.1 MB" and "51.5 GB" but never "212.4 MB". */
+ *  "6.1 MB" and "51.5 GB" but never "212.4 MB". The decimal mark is the language's, so Spanish
+ *  reads "6,1 MB". */
 export function fmtBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || n < 0) return "–";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
   if (n < 1024 * 1024 * 1024) {
     const mb = n / (1024 * 1024);
-    return `${mb >= 100 ? Math.round(mb) : mb.toFixed(1)} MB`;
+    return `${mb >= 100 ? Math.round(mb) : fmtDecimal(mb, 1)} MB`;
   }
   const gb = n / (1024 * 1024 * 1024);
-  return `${gb >= 100 ? Math.round(gb) : gb.toFixed(1)} GB`;
+  return `${gb >= 100 ? Math.round(gb) : fmtDecimal(gb, 1)} GB`;
+}
+
+/** `toFixed` with the language's decimal mark and no grouping, so "12,5" in Spanish and a
+ *  four-digit count never grows a thousands separator. */
+export function fmtDecimal(n: number, digits: number): string {
+  return n.toLocaleString(locale(), {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  });
 }
 
 /** m:ss, which is what a clip always is. */
@@ -42,7 +53,7 @@ function daysAgo(then: Date): number {
 
 const TIME: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hour12: false };
 
-/** The day a clip belongs to, as a heading: "Tonight", "Yesterday", "Tuesday", "12 August". */
+/** The day a clip belongs to, as a heading: "Today", "Yesterday", "Tuesday", "12 August". */
 export function dayLabel(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return t("format.earlier");
@@ -53,14 +64,14 @@ export function dayLabel(iso: string): string {
   return d.toLocaleDateString(locale(), { day: "numeric", month: "long" });
 }
 
-/** "Tonight 01:12" — the day label plus the clock, which is how every clip is named. */
+/** "Today 01:12" — the day label plus the clock, which is how every clip is named. */
 export function fmtWhen(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return `${dayLabel(iso)} ${d.toLocaleTimeString(locale(), TIME)}`;
 }
 
-/** The same, with a comma, for the metadata grid: "Tonight, 01:12". */
+/** The same, with a comma, for the metadata grid: "Today, 01:12". */
 export function fmtWhenLong(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;

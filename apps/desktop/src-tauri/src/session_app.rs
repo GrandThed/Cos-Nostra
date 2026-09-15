@@ -28,6 +28,9 @@ use crate::{emit_clips_changed, on_blocking_thread, queue_or_err, AppState};
 
 /// Shortest clip that can be taken out of a match.
 const MIN_CLIP_MS: i64 = 1_000;
+/// How long each part of a background recording of another game runs. Short enough that the
+/// footage budget frees space a part at a time, long enough that a moment rarely straddles two.
+const OTHER_GAME_PART: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Footage kept either side of a clip taken from a match, so the editor can still widen it.
 const CLIP_MARGIN_MS: i64 = 3_000;
 
@@ -75,16 +78,36 @@ impl Host for AppHost {
         self.app.state::<AppState>().settings.lock().unwrap().record_sessions
     }
 
+    fn other_games_enabled(&self) -> bool {
+        self.app.state::<AppState>().settings.lock().unwrap().record_other_games
+    }
+
+    fn hooked_executable(&self) -> Option<String> {
+        let hooked = self.app.state::<AppState>().hooked_game.lock().unwrap().clone()?;
+        // A fullscreen program that is not a game (a browser, a video player the game table
+        // knows) is not recorded in the background.
+        crate::games::name_for(&hooked.executable, &hooked.title).map(|_| hooked.executable)
+    }
+
+    fn split_every(&self, game: SessionGame) -> Option<std::time::Duration> {
+        (game == SessionGame::Other).then_some(OTHER_GAME_PART)
+    }
+
+    fn part_finished(&self, _session_id: i64) {
+        let app = self.app.clone();
+        std::thread::spawn(move || enforce_other_games_footage(&app));
+    }
+
     fn recording_path(&self, session_id: i64, n: usize) -> PathBuf {
         // The match files are cut next to the recordings, so this decides their folder too.
         session_matches_dir(&self.app, session_id).join(format!("session-{session_id}-{n}.mp4"))
     }
 
-    fn start_recording(&self, path: &Path) -> anyhow::Result<()> {
+    fn start_recording(&self, path: &Path, split: Option<std::time::Duration>) -> anyhow::Result<()> {
         let state = self.app.state::<AppState>();
         let mut recorder = state.recorder.lock().unwrap();
         match recorder.as_mut() {
-            Some(r) => r.start_recording(path),
+            Some(r) => r.start_recording(path, split),
             None => bail!("the recorder is not running"),
         }
     }
@@ -111,6 +134,21 @@ impl Host for AppHost {
     }
 
     fn game_name(&self, s: &Sighting) -> String {
+        if s.game == SessionGame::Other {
+            // Named like a hotkey clip of the same game, so both land in one library folder.
+            let title = self
+                .app
+                .state::<AppState>()
+                .hooked_game
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|h| h.executable.eq_ignore_ascii_case(&s.executable))
+                .map(|h| h.title.clone())
+                .unwrap_or_default();
+            let stem = s.executable.rsplit_once('.').map_or(s.executable.as_str(), |(stem, _)| stem);
+            return crate::games::name_for(&s.executable, &title).unwrap_or_else(|| stem.to_string());
+        }
         crate::games::name_for(&s.executable, "").unwrap_or_else(|| s.game.id().to_string())
     }
 
@@ -166,8 +204,17 @@ pub fn start(app: &AppHandle) {
 
 fn on_session_ended(app: &AppHandle, id: i64) {
     emit_sessions_changed(app, id);
-    let open = app.state::<AppState>().settings.lock().unwrap().open_after_session;
-    if open {
+    let state = app.state::<AppState>();
+    let open = state.settings.lock().unwrap().open_after_session;
+    // The background recording of other games is meant to go unnoticed until it is wanted.
+    let background = state
+        .sessions
+        .lock()
+        .unwrap()
+        .clone()
+        .and_then(|store| store.session(id).ok().flatten())
+        .is_some_and(|s| s.game == SessionGame::Other.id());
+    if open && !background {
         crate::show_main_window(app);
         let _ = app.emit("session-ended", SessionChanged { id });
     }
@@ -230,8 +277,29 @@ fn process(app: &AppHandle, ids: Vec<i64>) {
             app.state::<AppState>().processing.lock().unwrap().remove(&id);
             emit_sessions_changed(&app, id);
         }
+        enforce_other_games_footage(&app);
         enforce_session_storage(&app, &store);
     });
+}
+
+/// Keeps other games' footage within `other_games_hours`, after a part of a recording finishes
+/// and after sessions are cut. Runs whatever the setting is now, so turning the background
+/// recording off does not leave its old footage beyond the budget either.
+fn enforce_other_games_footage(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let hours = state.settings.lock().unwrap().other_games_hours;
+    let Some(store) = state.sessions.lock().unwrap().clone() else {
+        return;
+    };
+    let busy = state.processing.lock().unwrap().clone();
+    let keep_ms = i64::from(hours) * 3_600_000;
+    match crate::storage::enforce_other_games_footage(&store, keep_ms, &busy) {
+        Ok(freed) if freed.clips > 0 => {
+            let _ = app.emit("sessions-changed", SessionChanged { id: 0 });
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("other games' footage budget could not be applied: {e:#}"),
+    }
 }
 
 /// Keeps `<clip folder>\Matches` under the configured limit, the same way the clip queue's
@@ -329,6 +397,25 @@ pub async fn delete_match(app: AppHandle, id: i64) -> Result<(), String> {
         Ok(())
     })
     .await
+}
+
+/// Moves every event on a match's timeline by `offset_ms` when shown, for matches whose events
+/// were recorded out of step with the video. Clamped to ten minutes either way. The match's
+/// `updated_at` does not change, so the player showing it is not reloaded.
+#[tauri::command]
+pub fn set_match_event_offset(app: AppHandle, match_id: i64, offset_ms: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let store = store_or_err(&state)?;
+    let session_id = store
+        .get_match(match_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("match {match_id} not found"))?
+        .session_id;
+    store
+        .set_match_event_offset(match_id, offset_ms)
+        .map_err(|e| format!("{e:#}"))?;
+    emit_sessions_changed(&app, session_id);
+    Ok(())
 }
 
 /// Tries to cut a session that failed again, from the recordings it kept.
@@ -531,3 +618,39 @@ pub fn match_thumbnail(state: State<AppState>, id: i64) -> Result<Option<String>
 
 /// Ids being cut right now, so a UI can say so for a session that just ended.
 pub type Processing = HashSet<i64>;
+
+/// The marker hotkey: a marker at this moment on the session being recorded, and a sound to
+/// say it landed. With nothing recording there is nothing to put it on, which a toast says.
+pub fn add_marker(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let at = Utc::now();
+    let (notify, sound, language) = {
+        let s = state.settings.lock().unwrap();
+        (s.notify_on_save, s.sound_on_save, s.language)
+    };
+    let live = state.live_session.lock().unwrap().clone();
+    let store = state.sessions.lock().unwrap().clone();
+    let (Some(live), Some(store)) = (live, store) else {
+        log::info!("marker hotkey pressed with no session recording");
+        if notify {
+            crate::show_toast(app, crate::i18n::marker_not_added(language), crate::i18n::marker_not_added_body(language));
+        }
+        return;
+    };
+    let event = crate::timeline::GameEvent { at, event: crate::timeline::Event::Marker };
+    match store.add_event(live.id, live.match_id, &event) {
+        Ok(_) => {
+            log::info!("marker added to session {} at {}", live.id, format_time(at));
+            emit_sessions_changed(app, live.id);
+            if sound {
+                crate::play_marker_sound();
+            }
+        }
+        Err(e) => {
+            log::error!("marker for session {} could not be stored: {e:#}", live.id);
+            if notify {
+                crate::show_toast(app, crate::i18n::marker_not_added(language), &format!("{e:#}"));
+            }
+        }
+    }
+}

@@ -3,7 +3,7 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { el, fill, h } from "./dom";
-import { onLanguage, t } from "./i18n";
+import { language, onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { data, loadSettings, loadStatus, on } from "./store";
 import type { Account, Status } from "./types";
@@ -63,8 +63,10 @@ export function initShell(): void {
   renderChrome();
 }
 
-/** The copy that lives in `index.html`: the tabs, the window buttons and the save button. */
+/** The copy that lives in `index.html`: the tabs, the window buttons, the status pill and the
+ *  save button. `index.html` is written in English, so everything in it is replaced here. */
 export function renderChrome(): void {
+  document.documentElement.lang = language();
   el("win-minimize").title = t("app.minimise");
   el("win-maximize").title = t("app.maximise");
   el("win-close").title = t("app.closeToTray");
@@ -76,6 +78,8 @@ export function renderChrome(): void {
   tabs?.setAttribute("aria-label", t("app.sections"));
   const save = el("save-clip");
   fill(save, `${t("app.saveClip")} `, h("span", { class: "key mono", id: "save-hotkey" }));
+  // Only until the first status lands; `renderToolbar` owns the pill after that.
+  if (!data.status) el("status-label").textContent = t("shell.starting");
 }
 
 function setPanel(open: boolean): void {
@@ -187,6 +191,13 @@ function alarms(s: Status | null): Alarm[] {
       tone: "warn",
       title: t("shell.alarm.hotkeyTaken"),
       detail: t("shell.alarm.hotkeyTakenDetail", { hotkey: s.hotkey }),
+    });
+  }
+  if (s.marker_hotkey_error) {
+    list.push({
+      tone: "warn",
+      title: t("shell.alarm.markerHotkeyTaken"),
+      detail: t("shell.alarm.hotkeyTakenDetail", { hotkey: s.marker_hotkey }),
     });
   }
   if (s.ffmpeg_error) {

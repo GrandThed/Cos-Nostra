@@ -111,6 +111,29 @@ settings). Screenshot every few keys and read the focus ring out of the `PrintWi
 instead of counting Tabs blind, because the panel scrolls and the account block changes shape
 once a device is linked.
 
+**UI Automation works better than both.** WebView2 exposes the page's accessibility tree, so
+buttons, tabs and checkboxes can be found by their visible name and pressed without focus or a
+cursor. Verified 2026-09-15 on the Settings tab, the Matches list, a timeline clip bar and the
+export dialog:
+
+```powershell
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$p = Get-Process cos-nostra-desktop | ? { $_.MainWindowHandle -ne 0 } | select -First 1
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$tab = $all | ? { $_.Current.Name -eq "Ajustes" } | select -First 1          # names are in the UI language
+$o = $null; if ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$o)) { $o.Invoke() }
+```
+
+`FindFirst` does not reach into the WebView; walk `FindAll` and filter. `ScrollItemPattern`
+scrolls an element into view, `ClassName` carries the element's CSS classes (`tl-clip ...`,
+`btn primary`). A native save dialog (`#32770`, `Guardar como`) is a separate top-level window of
+the app's process: `AppActivate("Guardar como")` then `SendKeys("{ENTER}")` accepts its default.
+
+The terminal the tool runs in takes the foreground back between commands. A fullscreen ffplay
+started in one command and hotkeys sent in the next finds nothing hooked, so run the whole
+scenario (start, `AppActivate`, wait, hotkeys, wait for exit) inside a single command.
+
 Injected keys arrive in the webview with an empty `KeyboardEvent.code`; the hotkey capture falls
 back to `key`, so `SendKeys("%{F9}")` binds Alt+F9 correctly. The global save hotkey is registered
 with the OS, so `SendKeys("%{F10}")` saves a clip no matter which window is active.

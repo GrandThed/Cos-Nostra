@@ -7,9 +7,13 @@ Windows clipper built with Tauri. Capture and encoding run on embedded libobs.
 - On first launch `libobs-bootstrapper` downloads the OBS runtime next to the executable and
   restarts the app.
 - `src-tauri/src/capture.rs` boots libobs with a scene of two layers: a monitor capture of the
-  primary display and a game capture of any fullscreen application on top. Desktop audio is
-  mixed in. A replay buffer output keeps the last N seconds encoded in memory with the first
-  available hardware H.264 encoder (NVENC, AMF, QSV) or x264 as fallback.
+  primary display and a game capture of any fullscreen application on top, scaled to the
+  resolution cap in Settings. A replay buffer output keeps the last N seconds encoded in memory
+  with the first available hardware H.264 encoder (NVENC, AMF, QSV) or x264 as fallback.
+- Sound is all desktop audio, the hooked game's own (application audio capture), or the game
+  plus chosen apps. With the microphone on, every recording has three audio tracks: the mix,
+  the mix without the mic, and the mic alone (`TRACK_MIX`, `TRACK_NO_MIC`, `TRACK_MIC`), so
+  publishing and exporting can leave the voice out. Players only ever play the first.
 - A global hotkey (default `Alt+F10`), the tray menu, or the window button flush the buffer to
   `%USERPROFILE%\Videos\Cos Nostra`.
 - Settings live in `%APPDATA%\Cos Nostra\settings.json`, clip metadata in `clips.db` beside it,
@@ -34,6 +38,16 @@ player leaves the game. The reasoning and what has been verified are in `docs/PL
 
 Recordings (`session-<id>-<n>.mp4`) and match files live in `<clip folder>\<Game>\Matches`;
 sessions recorded before per-game folders stay in `<clip folder>\Matches`.
+
+With "record any other game" on, a game none of those is gets a session of its own
+(`SessionGame::Other`) for as long as the hooked process runs. Its recording is split by the
+output itself every 15 minutes (`<stem>-<date>-<time>.mp4`, announced by OBS's `file_changed`
+signal), the parts are chained with `recordings.follows` so they are timed without a gap, and
+each becomes one part in the Matches tab. Only the newest `other_games_hours` of that footage is
+kept (`storage::enforce_other_games_footage`).
+
+The marker hotkey stores a `marker` event on the live session; it shows on whichever match file
+covers its moment.
 
 ## The clip folder
 
@@ -82,10 +96,13 @@ pushes, and nothing renders from an event payload directly.
 |---|---|
 | `shell.ts` | title bar, toolbar, alarm banners, the status panel behind the recording pill |
 | `library.ts` | game sidebar, filters, the clip grid that becomes rows under 840 px |
-| `matches.ts` | sessions and their matches, the match player with its round timeline and your clips drawn on it, in/out marks that become a clip |
+| `matches.ts` | sessions and their matches, the match player with its timeline (ruler, event markers, hover frame, your clips), event filters, in/out marks that become a clip, and the per-match sync offset |
+| `transport.ts` | what every video shares: YouTube keys, speed dial, volume, frame step, fullscreen (the window follows), the chip over the picture; no native `controls` |
+| `gameTerms.ts` | map, mode, objective and unit names the providers store in English, translated when drawn |
 | `player.ts` | the clip detail view, which is also the player, with the Publish button |
 | `editor.ts` | one range on the match: start and end handles, undo, and Apply |
-| `publish.ts` | the Publish dialog: title, game, servers; for a published clip, more servers, unpublish, delete |
+| `publish.ts` | the Publish dialog: title, game, servers, whether to keep the microphone; for a published clip, more servers, unpublish, delete |
+| `exporter.ts` | the Export dialog: as recorded, at most N MB, or codec, resolution, frame rate and quality; Rust asks where to save (`export.rs`) |
 | `circles.ts` | the status circle and the stack of server icons on a clip |
 | `storage.ts`, `settings.ts`, `firstrun.ts` | the other three screens |
 | `clips.ts` | what a clip row means: its badge, its meta line, where its video is |
@@ -132,6 +149,16 @@ published clip goes back to `saved` and re-uploads under the same clip id throug
 `POST /clips/:id/replace`. A clip with only its encoded copy left is never cut in place: the
 range is stream-copied out of that copy into a recording of its own. The encoder still accepts a
 multi-segment `cut` for rows written by older builds; the editor opens those on their outer span.
+
+## Export
+
+`export.rs` plans an export and `ffmpeg::export` runs it, always to an MP4 with one AAC track.
+"As recorded" stream-copies from the keyframe before the clip, so it can start a moment early.
+"At most N MB" spends the budget on audio first, then shrinks the picture (720p, then 30 fps,
+then smaller) until the video bitrate can carry it, and encodes once more at a proportionally
+lower bitrate if the file came out over. "Custom" is constant quality per encoder on that
+encoder's own scale. H.264 and AV1 follow the encode engine setting; H.265 needs a hardware
+encoder, probed the first time the dialog asks.
 
 ## ffmpeg
 

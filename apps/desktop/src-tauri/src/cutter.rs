@@ -125,7 +125,7 @@ fn measure(
     session: &SessionRow,
     problems: &mut Vec<String>,
 ) -> Result<Vec<Measured>> {
-    let mut out = Vec::new();
+    let mut probed: Vec<(RecordingRow, i64)> = Vec::new();
     for row in store.recordings(session.id)? {
         let path = Path::new(&row.path);
         if !path.is_file() {
@@ -133,32 +133,45 @@ fn measure(
             store.delete_recording(row.id)?;
             continue;
         }
-        let info = match ffmpeg::probe(bins, path) {
-            Ok(info) if info.duration_ms > 0 => info,
-            Ok(_) => {
-                problems.push(format!("{} has no footage", row.path));
-                continue;
-            }
-            Err(e) => {
-                problems.push(format!("{} could not be read: {e:#}", row.path));
-                continue;
+        match ffmpeg::probe(bins, path) {
+            Ok(info) if info.duration_ms > 0 => probed.push((row, info.duration_ms)),
+            Ok(_) => problems.push(format!("{} has no footage", row.path)),
+            Err(e) => problems.push(format!("{} could not be read: {e:#}", row.path)),
+        }
+    }
+
+    // Latest first, so a part split off without a gap finds when the part after it started:
+    // that is exactly where it ends. Only the last part of a chain needs its stop time.
+    let mut starts: std::collections::HashMap<i64, DateTime<Utc>> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (row, duration_ms) in probed.iter().rev() {
+        let duration = Duration::milliseconds(*duration_ms);
+        let next_start = probed
+            .iter()
+            .find(|(later, _)| later.follows == Some(row.id))
+            .and_then(|(later, _)| starts.get(&later.id))
+            .copied();
+        let start = match next_start {
+            Some(end) => end - duration,
+            None => {
+                let requested = parse_time(&row.requested_at)?;
+                // The file ends where the stop was asked for. Without a stop (a crash) or with a
+                // stop that cannot hold that much footage, count from the start request instead.
+                match row.stopped_at.as_deref().map(parse_time).transpose()? {
+                    Some(stopped) if stopped - duration >= requested - Duration::seconds(5) => stopped - duration,
+                    _ => requested,
+                }
             }
         };
-        let requested = parse_time(&row.requested_at)?;
-        let duration = Duration::milliseconds(info.duration_ms);
-        // The file ends where the stop was asked for. Without a stop (a crash) or with a stop
-        // that cannot hold that much footage, count from the start request instead.
-        let start = match row.stopped_at.as_deref().map(parse_time).transpose()? {
-            Some(stopped) if stopped - duration >= requested - Duration::seconds(5) => stopped - duration,
-            _ => requested,
-        };
-        store.set_recording_timing(row.id, start, info.duration_ms)?;
+        starts.insert(row.id, start);
+        store.set_recording_timing(row.id, start, *duration_ms)?;
         out.push(Measured {
             span: Span { start, end: start + duration },
-            duration_ms: info.duration_ms,
-            row,
+            duration_ms: *duration_ms,
+            row: row.clone(),
         });
     }
+    out.reverse();
     Ok(out)
 }
 
@@ -442,6 +455,38 @@ mod tests {
         assert!((start - t(15)).num_milliseconds().abs() <= 100, "file starts at {start}");
         assert_eq!(session.matches[1].status, MatchStatus::Missing);
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".piece")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Parts split without a gap are timed back from the stop of the last one, whatever the
+    /// split was noticed at, and each is kept whole for a game with no provider.
+    #[test]
+    fn parts_of_a_split_recording_are_timed_from_the_last_stop() {
+        let bins = bins();
+        let dir = dir("split-parts");
+        let store = SessionStore::open(&dir.join("sessions.db")).unwrap();
+        let id = store.create_session(SessionGame::Other, "Hades II", t(0)).unwrap();
+        let (a, b) = (dir.join("session-1-1.mp4"), dir.join("session-1-1-part.mp4"));
+        recording(&bins, &a, 6);
+        recording(&bins, &b, 4);
+        let ra = store.add_recording(id, &a, t(0)).unwrap();
+        // The split was noticed a second and a half late, and so was the stop of the first part.
+        store.stop_recording(ra, t(7) + Duration::milliseconds(500)).unwrap();
+        let rb = store.add_recording_after(id, &b, t(7) + Duration::milliseconds(500), Some(ra)).unwrap();
+        store.stop_recording(rb, t(10)).unwrap();
+        store.end_session(id, t(10)).unwrap();
+
+        assert_eq!(process(&store, &bins, id).unwrap(), Processed::Ready { matches: 2 });
+        let session = store.session(id).unwrap().unwrap();
+        let starts: Vec<DateTime<Utc>> = session
+            .matches
+            .iter()
+            .map(|m| parse_time(m.file_start_at.as_deref().unwrap()).unwrap())
+            .collect();
+        // The second part ends at the stop; the first ends exactly where the second begins.
+        assert!((starts[1] - t(6)).num_milliseconds().abs() <= 100, "second part starts at {}", starts[1]);
+        assert!((starts[0] - t(0)).num_milliseconds().abs() <= 150, "first part starts at {}", starts[0]);
+        assert!(session.matches.iter().all(|m| !m.detected && m.status == MatchStatus::Ready));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

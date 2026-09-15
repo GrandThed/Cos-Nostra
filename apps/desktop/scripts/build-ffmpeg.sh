@@ -184,7 +184,7 @@ if step ffmpeg "ffmpeg-$FFMPEG_VERSION.tar.xz"; then
         --enable-muxer=mp4,image2,null,framecrc \
         --enable-decoder=h264,hevc,libdav1d,aac,opus,wrapped_avframe,pcm_s16le \
         --enable-parser=h264,hevc,av1,aac,opus \
-        --enable-encoder=libsvtav1,libx264,av1_amf,h264_amf,av1_nvenc,h264_nvenc,av1_qsv,h264_qsv,libopus,aac,mjpeg,wrapped_avframe,pcm_s16le \
+        --enable-encoder=libsvtav1,libx264,av1_amf,h264_amf,hevc_amf,av1_nvenc,h264_nvenc,hevc_nvenc,av1_qsv,h264_qsv,hevc_qsv,libopus,aac,mjpeg,wrapped_avframe,pcm_s16le \
         --enable-bsf=aac_adtstoasc,extract_extradata,h264_mp4toannexb,hevc_mp4toannexb,av1_frame_merge,av1_frame_split,setts,null \
         --enable-filter=trim,atrim,setpts,asetpts,concat,scale,format,aformat,aresample,null,anull,crop,transpose,hflip,vflip,testsrc2,sine
     make -j"$JOBS"
@@ -195,7 +195,7 @@ EXE=$BUILD/ffmpeg/ffmpeg.exe
 
 # Every hardware and software encoder the app can pick has to be in there.
 encoders=$("$EXE" -hide_banner -encoders)
-for want in libsvtav1 libx264 av1_amf h264_amf av1_nvenc h264_nvenc av1_qsv h264_qsv libopus aac mjpeg; do
+for want in libsvtav1 libx264 av1_amf h264_amf hevc_amf av1_nvenc h264_nvenc hevc_nvenc av1_qsv h264_qsv hevc_qsv libopus aac mjpeg; do
     grep -q " $want " <<<"$encoders" || { echo "build-ffmpeg: encoder $want is missing from the build" >&2; exit 1; }
 done
 # The encoder probe's shape: lavfi in, encode, null out. It needs decoders for what lavfi emits

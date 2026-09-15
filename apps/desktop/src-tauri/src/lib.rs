@@ -2,6 +2,7 @@ mod api;
 mod cutter;
 mod capture;
 mod edit;
+mod export;
 mod settings;
 mod storage;
 mod ffmpeg;
@@ -70,6 +71,8 @@ struct AppState {
     last_error: Mutex<Option<String>>,
     /// Set when the saved hotkey could not be registered at startup; cleared by save_settings.
     hotkey_error: Mutex<Option<String>>,
+    /// The same for the marker hotkey.
+    marker_hotkey_error: Mutex<Option<String>>,
     /// Set from the libobs hook callback; read by get_status. Never held across anything slow.
     hooked_game: Mutex<Option<HookedGame>>,
     /// Bumped on every (re)start so a slow start that got superseded discards its result.
@@ -98,6 +101,8 @@ struct AppState {
     /// Held while the posts cache is refreshed, so the timers after an upload and the periodic
     /// refresh never write over each other with answers of different ages.
     posts_refresh: Mutex<()>,
+    /// The hardware H.265 encoder exports use, once probed: `Some(None)` means there is none.
+    hevc: Mutex<Option<Option<String>>>,
 }
 
 /// A running device login: the poll thread stops when `cancelled` is set.
@@ -150,6 +155,9 @@ struct Status {
     buffer_seconds: i64,
     error: Option<String>,
     hotkey_error: Option<String>,
+    /// Empty when markers are off.
+    marker_hotkey: String,
+    marker_hotkey_error: Option<String>,
     hooked_game: Option<HookedGame>,
     conflict: Option<CaptureConflict>,
     encoders: Option<Encoders>,
@@ -258,6 +266,8 @@ fn get_status(state: State<AppState>) -> Status {
         buffer_seconds: settings.buffer_seconds,
         error: state.last_error.lock().unwrap().clone(),
         hotkey_error: state.hotkey_error.lock().unwrap().clone(),
+        marker_hotkey: settings.marker_hotkey.clone(),
+        marker_hotkey_error: state.marker_hotkey_error.lock().unwrap().clone(),
         hooked_game,
         conflict,
         encoders: settings.encoders.clone(),
@@ -308,6 +318,44 @@ async fn pick_clip_dir(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 fn retry_recorder(app: AppHandle) {
     restart_recorder(&app);
+}
+
+/// The microphones Settings offers. COM, so off the main thread.
+#[tauri::command]
+async fn list_microphones() -> Result<Vec<win::AudioDevice>, String> {
+    on_blocking_thread(|| win::microphones().map_err(|e| format!("{e:#}"))).await
+}
+
+/// Apps with sound right now, to pick the ones recorded next to the game.
+#[tauri::command]
+async fn list_audio_apps() -> Result<Vec<String>, String> {
+    on_blocking_thread(|| win::apps_with_audio().map_err(|e| format!("{e:#}"))).await
+}
+
+/// What a clip's recording has for sound, so the publish and export dialogs only offer to
+/// leave the microphone out when it is on a track of its own.
+#[derive(Serialize, Clone)]
+struct ClipAudio {
+    tracks: usize,
+    mic_track: bool,
+}
+
+#[tauri::command]
+async fn clip_audio(app: AppHandle, id: i64) -> Result<ClipAudio, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let bins = ffmpeg_or_err(&state)?;
+        let row = queue_or_err(&state)?
+            .get(id)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("clip {id} not found"))?;
+        let Some((path, _)) = edit::edit_source_path(&row) else {
+            return Ok(ClipAudio { tracks: 0, mic_track: false });
+        };
+        let info = ffmpeg::probe(&bins, Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        Ok(ClipAudio { tracks: info.audio_tracks, mic_track: info.has_mic_track() })
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +880,121 @@ async fn apply_range(
 }
 
 // ---------------------------------------------------------------------------
+// Exporting
+
+/// The codecs the export dialog can offer. H.265 needs a hardware encoder, found by a short
+/// test encode the first time anyone asks.
+#[derive(Serialize, Clone)]
+struct ExportCodecs {
+    h264: bool,
+    hevc: bool,
+    av1: bool,
+}
+
+fn hevc_encoder(state: &AppState, bins: &Binaries) -> Option<String> {
+    if let Some(known) = state.hevc.lock().unwrap().clone() {
+        return known;
+    }
+    let found = ffmpeg::probe_hevc(bins);
+    log::info!("H.265 export encoder: {}", found.as_deref().unwrap_or("none"));
+    *state.hevc.lock().unwrap() = Some(found.clone());
+    found
+}
+
+#[tauri::command]
+async fn export_codecs(app: AppHandle) -> Result<ExportCodecs, String> {
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let bins = ffmpeg_or_err(&state)?;
+        Ok(ExportCodecs { h264: true, hevc: hevc_encoder(&state, &bins).is_some(), av1: true })
+    })
+    .await
+}
+
+#[derive(Serialize, Clone)]
+struct ExportProgress {
+    id: i64,
+    percent: u8,
+}
+
+/// Asks where to save, then exports the clip there. `None` when the save dialog was cancelled.
+/// Progress arrives as `export-progress` events.
+#[tauri::command]
+async fn export_clip(app: AppHandle, id: i64, options: export::Options) -> Result<Option<export::Exported>, String> {
+    options.validate().map_err(|e| format!("{e:#}"))?;
+    let state = app.state::<AppState>();
+    let row = queue_or_err(&state)?
+        .get(id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("clip {id} not found"))?;
+    let (source, original) = edit::edit_source_path(&row).ok_or_else(|| "this clip has no video on this PC".to_string())?;
+    let clip_dir = state.settings.lock().unwrap().clip_dir.clone();
+    let when = chrono::DateTime::parse_from_rfc3339(&row.recorded_at)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H-%M-%S").to_string())
+        .unwrap_or_else(|_| "clip".into());
+    let name = format!("{} {when}.mp4", folders::folder_name(row.game.as_deref()));
+    let picked = app
+        .dialog()
+        .file()
+        .set_directory(&clip_dir)
+        .set_file_name(&name)
+        .add_filter("MP4", &["mp4"])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let mut dst = picked.into_path().map_err(|e| format!("{e:#}"))?;
+    if dst.extension().is_none_or(|e| !e.eq_ignore_ascii_case("mp4")) {
+        dst.set_extension("mp4");
+    }
+
+    on_blocking_thread(move || {
+        let state = app.state::<AppState>();
+        let bins = ffmpeg_or_err(&state)?;
+        let owned = [Some(&row.source_path), row.av1_path.as_ref(), row.h264_path.as_ref()];
+        if owned.into_iter().flatten().any(|p| Path::new(p.as_str()) == dst.as_path()) {
+            return Err("pick another name: that is the clip's own file".to_string());
+        }
+        let (probed, engine) = {
+            let s = state.settings.lock().unwrap();
+            (s.encoders.clone(), s.encode_engine)
+        };
+        let probed = probed.ok_or_else(|| "encoders have not been probed yet".to_string())?;
+        let hevc = if options.codec == export::Codec::Hevc { hevc_encoder(&state, &bins) } else { None };
+        let info = ffmpeg::probe(&bins, Path::new(&source)).map_err(|e| format!("{e:#}"))?;
+        let job = export::Source {
+            path: Path::new(&source),
+            info: &info,
+            range: export::range_of(row.cut.as_deref(), original),
+            encoders: &probed,
+            engine,
+            hevc: hevc.as_deref(),
+        };
+        let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+        let on_progress = |done: f32| {
+            let percent = (done * 100.0).clamp(0.0, 100.0) as u8;
+            if last.swap(percent, Ordering::Relaxed) != percent {
+                let _ = app.emit("export-progress", ExportProgress { id, percent });
+            }
+        };
+        log::info!("clip {id}: exporting to {} ({options:?})", dst.display());
+        export::run(&bins, &job, &options, &dst, &on_progress).map(Some).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// Shows an exported file in Explorer. Only a path the export just wrote comes here, but it is
+/// still checked to be an MP4 that exists before it reaches the shell.
+#[tauri::command]
+fn reveal_export(app: AppHandle, path: String) -> Result<(), String> {
+    let file = Path::new(&path);
+    if !file.is_file() || file.extension().is_none_or(|e| !e.eq_ignore_ascii_case("mp4")) {
+        return Err(format!("{path} is not an exported clip"));
+    }
+    app.opener().reveal_item_in_dir(file).map_err(|e| format!("{e:#}"))
+}
+
+// ---------------------------------------------------------------------------
 // Publishing
 
 /// A server the publish dialog offers.
@@ -919,6 +1082,7 @@ async fn publish_clip(
     title: Option<String>,
     game: Option<String>,
     guild_ids: Vec<String>,
+    include_mic: bool,
 ) -> Result<(), String> {
     on_blocking_thread(move || {
         let state = app.state::<AppState>();
@@ -941,7 +1105,7 @@ async fn publish_clip(
             }
         }
         queue
-            .publish(id, title.as_deref(), game.as_deref(), &guilds)
+            .publish(id, title.as_deref(), game.as_deref(), &guilds, include_mic)
             .map_err(|e| format!("{e:#}"))?;
         {
             let mut s = state.settings.lock().unwrap();
@@ -1278,7 +1442,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
         source,
         &av1,
         &cut,
-        info.has_audio,
+        info.audio_stream(row.include_mic),
         Some(&ffmpeg::Progress {
             duration_ms: kept_ms,
             on: &on_av1,
@@ -1302,7 +1466,7 @@ fn process_clip(app: &AppHandle, row: &ClipRow) -> anyhow::Result<Outputs> {
         source,
         &h264,
         &cut,
-        info.has_audio,
+        info.audio_stream(row.include_mic),
         Some(&ffmpeg::Progress {
             duration_ms: kept_ms,
             on: &on_h264,
@@ -1882,10 +2046,18 @@ fn show_toast(app: &AppHandle, title: &str, body: &str) {
 
 /// Plays the system "Asterisk" event sound without blocking. No asset needed.
 fn play_save_sound() {
-    use windows::core::w;
-    use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC};
+    play_system_sound(windows::core::w!("SystemAsterisk"));
+}
+
+/// A different sound from a save, so a marker is never mistaken for a clip.
+pub(crate) fn play_marker_sound() {
+    play_system_sound(windows::core::w!("Notification.Default"));
+}
+
+fn play_system_sound(alias: windows::core::PCWSTR) {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
     // SAFETY: the alias is a static wide string and SND_ASYNC returns immediately.
-    let ok = unsafe { PlaySoundW(w!("SystemAsterisk"), None, SND_ALIAS | SND_ASYNC) };
+    let ok = unsafe { PlaySoundW(alias, None, SND_ALIAS | SND_ASYNC | SND_NODEFAULT) };
     if !ok.as_bool() {
         log::debug!("PlaySoundW returned false");
     }
@@ -2112,6 +2284,23 @@ fn register_hotkey(app: &AppHandle, hotkey: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Registers the marker hotkey. Nothing to do when it is empty, which is how it is turned off.
+fn register_marker_hotkey(app: &AppHandle, hotkey: &str) -> anyhow::Result<()> {
+    if hotkey.trim().is_empty() {
+        return Ok(());
+    }
+    let shortcut = parse_hotkey(hotkey)?;
+    app.global_shortcut()
+        .on_shortcut(shortcut, |app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                // A database write and a sound; off the hotkey thread all the same.
+                let app = app.clone();
+                std::thread::spawn(move || session_app::add_marker(&app));
+            }
+        })?;
+    Ok(())
+}
+
 fn unregister_hotkey(app: &AppHandle, hotkey: &str) {
     if let Ok(shortcut) = hotkey.parse::<Shortcut>() {
         if let Err(e) = app.global_shortcut().unregister(shortcut) {
@@ -2122,28 +2311,66 @@ fn unregister_hotkey(app: &AppHandle, hotkey: &str) {
 
 fn save_settings_inner(app: &AppHandle, mut new: Settings) -> anyhow::Result<()> {
     new.hotkey = new.hotkey.trim().to_string();
+    new.marker_hotkey = new.marker_hotkey.trim().to_string();
     new.validate()?;
     // Checked here rather than in `validate` because it touches the disk: a settings file
     // whose folder has since been unplugged still has to load at startup, it just cannot be
     // saved again until the folder is back. The folder picker always returns one that exists.
     settings::validate_clip_dir(&new.clip_dir)?;
     parse_hotkey(&new.hotkey)?;
+    if !new.marker_hotkey.is_empty() {
+        parse_hotkey(&new.marker_hotkey)?;
+    }
 
     let state = app.state::<AppState>();
     let old = state.settings.lock().unwrap().clone();
 
-    // Hotkey: swap, and roll back to the old binding if the new one cannot be registered.
-    // If the saved one never registered (startup failure) we always try again.
-    let hotkey_broken = state.hotkey_error.lock().unwrap().is_some();
-    if new.hotkey != old.hotkey || hotkey_broken {
-        unregister_hotkey(app, &old.hotkey);
-        if let Err(e) = register_hotkey(app, &new.hotkey) {
-            if let Err(re) = register_hotkey(app, &old.hotkey) {
-                log::error!("could not restore hotkey {:?}: {re:#}", old.hotkey);
-            }
-            return Err(e).with_context(|| format!("registering hotkey {:?}", new.hotkey));
+    // Hotkeys: swap, and roll back to the old bindings if a new one cannot be registered. If a
+    // saved one never registered (startup failure) it is always tried again. Both old keys come
+    // off before either new one goes on, so the two can trade places.
+    let save_changed = new.hotkey != old.hotkey || state.hotkey_error.lock().unwrap().is_some();
+    let marker_changed =
+        new.marker_hotkey != old.marker_hotkey || state.marker_hotkey_error.lock().unwrap().is_some();
+    if save_changed || marker_changed {
+        if save_changed {
+            unregister_hotkey(app, &old.hotkey);
         }
-        *state.hotkey_error.lock().unwrap() = None;
+        if marker_changed {
+            unregister_hotkey(app, &old.marker_hotkey);
+        }
+        let swapped = (|| -> anyhow::Result<()> {
+            if save_changed {
+                register_hotkey(app, &new.hotkey).with_context(|| format!("registering hotkey {:?}", new.hotkey))?;
+            }
+            if marker_changed {
+                if let Err(e) = register_marker_hotkey(app, &new.marker_hotkey) {
+                    if save_changed {
+                        unregister_hotkey(app, &new.hotkey);
+                    }
+                    return Err(e).with_context(|| format!("registering marker hotkey {:?}", new.marker_hotkey));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = swapped {
+            if save_changed {
+                if let Err(re) = register_hotkey(app, &old.hotkey) {
+                    log::error!("could not restore hotkey {:?}: {re:#}", old.hotkey);
+                }
+            }
+            if marker_changed {
+                if let Err(re) = register_marker_hotkey(app, &old.marker_hotkey) {
+                    log::error!("could not restore marker hotkey {:?}: {re:#}", old.marker_hotkey);
+                }
+            }
+            return Err(e);
+        }
+        if save_changed {
+            *state.hotkey_error.lock().unwrap() = None;
+        }
+        if marker_changed {
+            *state.marker_hotkey_error.lock().unwrap() = None;
+        }
     }
 
     // The UI never edits the login; keep whatever the account flow stored meanwhile.
@@ -2337,6 +2564,7 @@ pub fn run() {
             recorder: Mutex::new(None),
             last_error: Mutex::new(None),
             hotkey_error: Mutex::new(None),
+            marker_hotkey_error: Mutex::new(None),
             hooked_game: Mutex::new(None),
             generation: AtomicU64::new(0),
             ffmpeg: Mutex::new(None),
@@ -2350,6 +2578,7 @@ pub fn run() {
             live_session: Mutex::new(None),
             processing: Mutex::new(session_app::Processing::new()),
             posts_refresh: Mutex::new(()),
+            hevc: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -2358,6 +2587,9 @@ pub fn run() {
             save_settings,
             pick_clip_dir,
             retry_recorder,
+            list_microphones,
+            list_audio_apps,
+            clip_audio,
             list_clips,
             delete_clip,
             set_clip_game,
@@ -2373,6 +2605,9 @@ pub fn run() {
             reprobe_encoders,
             edit_source,
             apply_range,
+            export_codecs,
+            export_clip,
+            reveal_export,
             list_publish_guilds,
             publish_clip,
             add_clip_posts,
@@ -2390,6 +2625,7 @@ pub fn run() {
             session_app::live_session,
             session_app::delete_session,
             session_app::delete_match,
+            session_app::set_match_event_offset,
             session_app::retry_session,
             session_app::clip_from_match,
             session_app::open_match_folder,
@@ -2411,6 +2647,11 @@ pub fn run() {
                 let msg = format!("hotkey {:?} could not be registered: {e:#}", settings.hotkey);
                 log::error!("{msg}");
                 *handle.state::<AppState>().hotkey_error.lock().unwrap() = Some(msg);
+            }
+            if let Err(e) = register_marker_hotkey(&handle, &settings.marker_hotkey) {
+                let msg = format!("marker hotkey {:?} could not be registered: {e:#}", settings.marker_hotkey);
+                log::error!("{msg}");
+                *handle.state::<AppState>().marker_hotkey_error.lock().unwrap() = Some(msg);
             }
             // Keep the autostart entry in sync with the saved preference (e.g. after a reinstall).
             if let Err(e) = apply_autostart(&handle, settings.start_with_windows) {

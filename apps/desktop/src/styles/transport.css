@@ -1,0 +1,116 @@
+/* What every player shares (transport.ts): the chip over the picture after a key, the speed
+   dial and its list, and fullscreen. The rest of the transport row is in player.css. */
+
+.video .osd {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  translate: -50% -50%;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: var(--overVideo);
+  color: var(--overVideoInk);
+  font-family: var(--mono);
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.video .osd.show {
+  animation: osd 650ms ease-out forwards;
+}
+
+@keyframes osd {
+  0% {
+    opacity: 0;
+    scale: 0.9;
+  }
+  12% {
+    opacity: 1;
+    scale: 1;
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.controls .speed-dial {
+  position: relative;
+  display: flex;
+}
+
+.controls .speed {
+  min-width: 42px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* Anything but normal speed is worth noticing at a glance. */
+.controls .speed.changed {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+.controls .speed-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  display: flex;
+  flex-direction: column;
+  min-width: 96px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--lift);
+  z-index: 10;
+}
+
+.controls .speed-menu button {
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: left;
+}
+
+.controls .speed-menu button:hover {
+  background: var(--panel2);
+}
+
+.controls .speed-menu button[aria-checked="true"] {
+  color: var(--acc);
+  font-weight: 700;
+}
+
+.controls .fullscreen {
+  font-size: 15px;
+}
+
+/* A fullscreen stage in the clip player and the editor: the picture takes what the transport
+   leaves. The match player's own fullscreen layout is in matches.css. */
+.stage:fullscreen {
+  padding: 14px 18px 12px;
+  background: var(--bg);
+}
+
+.stage:fullscreen .video {
+  flex: 1;
+  min-height: 0;
+  aspect-ratio: auto;
+  border-radius: 0;
+}
+
+.stage:fullscreen .keys,
+.stage:fullscreen .trim-slot {
+  display: none;
+}

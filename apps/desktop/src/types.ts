@@ -31,6 +31,9 @@ export interface Status {
   buffer_seconds: number;
   error: string | null;
   hotkey_error: string | null;
+  /** Empty when markers are off. */
+  marker_hotkey: string;
+  marker_hotkey_error: string | null;
   hooked_game: HookedGame | null;
   conflict: CaptureConflict | null;
   encoders: Encoders | null;
@@ -43,13 +46,28 @@ export interface Status {
 export type Quality = "small" | "balanced" | "high";
 export type EncodeEngine = "cpu" | "gpu";
 export type Language = "en" | "es";
+/** Which sound besides the microphone is recorded. `settings::AudioSource`. */
+export type AudioSource = "system" | "game" | "game_and_apps";
 
 export interface Settings {
   hotkey: string;
+  /** Puts a marker on the session being recorded. Empty turns it off. */
+  marker_hotkey: string;
   buffer_seconds: number;
   buffer_max_mb: number;
   video_bitrate_kbps: number;
   fps: number;
+  /** Height the recording is scaled down to; 0 records at the screen's own. */
+  record_height: number;
+  audio_source: AudioSource;
+  /** Executable names recorded next to the game with `game_and_apps`. */
+  audio_apps: string[];
+  mic_enabled: boolean;
+  /** WASAPI endpoint id, or "default". */
+  mic_device: string;
+  /** Percent, 0–200. */
+  mic_volume: number;
+  mic_noise_suppression: boolean;
   clip_dir: string;
   start_with_windows: boolean;
   notify_on_save: boolean;
@@ -73,6 +91,9 @@ export interface Settings {
   /** Same idea as `storage_limit_gb`, but for `<clip folder>\Matches`: 0 for no limit. */
   session_storage_limit_gb: number;
   record_sessions: boolean;
+  /** Record every other game in the background, keeping `other_games_hours` of footage. */
+  record_other_games: boolean;
+  other_games_hours: number;
   open_after_session: boolean;
   first_run_done: boolean;
   tray_hint_shown: boolean;
@@ -190,6 +211,53 @@ export interface ClipRow {
   captured_at: string | null;
   /** Live Discord posts, as the backend last reported them. */
   posts: ClipPost[];
+  /** Whether the published copies keep the microphone, when the recording has it on its own track. */
+  include_mic: boolean;
+}
+
+/** How a clip is exported. `export::Mode`, `Codec`, `Level` and `Options`. */
+export type ExportMode = "original" | "size" | "custom";
+export type ExportCodec = "h264" | "hevc" | "av1";
+export type ExportLevel = "low" | "medium" | "high" | "ultra";
+
+export interface ExportOptions {
+  mode: ExportMode;
+  codec: ExportCodec;
+  /** One of 2160, 1440, 1080, 720, 480; null keeps the recording's. */
+  height: number | null;
+  /** 60 or 30; null keeps the recording's. */
+  fps: number | null;
+  level: ExportLevel;
+  /** MiB, for `size`. */
+  target_mb: number | null;
+  include_mic: boolean;
+}
+
+/** What an export wrote. `export::Exported`. */
+export interface Exported {
+  path: string;
+  size: number;
+  duration_ms: number;
+}
+
+/** The codecs this PC can export. `lib.rs` `ExportCodecs`. */
+export interface ExportCodecs {
+  h264: boolean;
+  hevc: boolean;
+  av1: boolean;
+}
+
+/** A microphone Settings can pick. `win::AudioDevice`. */
+export interface AudioDevice {
+  id: string;
+  name: string;
+}
+
+/** What a clip's recording has for sound. `lib.rs` `ClipAudio`. */
+export interface ClipAudio {
+  tracks: number;
+  /** The microphone is on a track of its own, so it can be left out. */
+  mic_track: boolean;
 }
 
 /** Which picture of a game: a square-ish icon for lists, or box art for the game header. Rust
@@ -268,7 +336,8 @@ export interface CleanResult {
 // ---------------------------------------------------------------------------
 // Sessions and matches. Keep in step with `sessions.rs`, `timeline.rs` and `session_watch.rs`.
 
-export type SessionGame = "valorant" | "league" | "counter_strike" | "teamfight_tactics";
+/** `other` is any other game, recorded in the background in parts. */
+export type SessionGame = "valorant" | "league" | "counter_strike" | "teamfight_tactics" | "other";
 
 /** The session the watch is recording right now. */
 export interface LiveSession {
@@ -305,6 +374,8 @@ export interface MatchRow {
   status: MatchStatus;
   error: string | null;
   updated_at: string;
+  /** Added to every event's time on this match, for timelines that were recorded out of step with the video. */
+  event_offset_ms: number;
 }
 
 export interface SessionRow {
@@ -338,4 +409,6 @@ export type TimelineEvent = { id: number; match_id: number | null; at: string } 
   | { kind: "multikill"; count: number }
   /** `ours`: the player's team got it (true), the other team did (false), or unknown. */
   | { kind: "objective"; name: string; ours: boolean | null }
+  /** The player pressed the marker hotkey here. */
+  | { kind: "marker" }
 );

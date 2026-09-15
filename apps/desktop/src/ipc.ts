@@ -4,7 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   ArtKind,
+  AudioDevice,
   Bootstrap,
+  ClipAudio,
   CleanResult,
   CleanTarget,
   ClipMatch,
@@ -13,6 +15,9 @@ import type {
   ClipRow,
   EditSource,
   Encoders,
+  ExportCodecs,
+  Exported,
+  ExportOptions,
   GameArtImage,
   LoginStarted,
   MatchClip,
@@ -32,6 +37,10 @@ export const retryRecorder = () => invoke<void>("retry_recorder");
 export const getSettings = () => invoke<Settings>("get_settings");
 export const saveSettings = (settings: Settings) => invoke<void>("save_settings", { settings });
 export const pickClipDir = () => invoke<string | null>("pick_clip_dir");
+export const listMicrophones = () => invoke<AudioDevice[]>("list_microphones");
+/** Executable names of the apps with an audio session right now. */
+export const listAudioApps = () => invoke<string[]>("list_audio_apps");
+export const clipAudio = (id: number) => invoke<ClipAudio>("clip_audio", { id });
 
 export const listClips = () => invoke<ClipRow[]>("list_clips");
 export const deleteClip = (id: number) => invoke<void>("delete_clip", { id });
@@ -53,6 +62,13 @@ export const chooseGameArt = (game: string) => invoke<boolean>("choose_game_art"
 /** Drops the picture the user chose and looks the game up again. */
 export const resetGameArt = (game: string) => invoke<void>("reset_game_art", { game });
 
+export const exportCodecs = () => invoke<ExportCodecs>("export_codecs");
+/** Opens a save dialog, then exports there; null when the dialog was cancelled. Progress comes
+ *  as `export-progress` events. */
+export const exportClip = (id: number, options: ExportOptions) =>
+  invoke<Exported | null>("export_clip", { id, options });
+export const revealExport = (path: string) => invoke<void>("reveal_export", { path });
+
 export const editSource = (id: number) => invoke<EditSource>("edit_source", { id });
 /** One kept range, measured in the file `source` names (the match, or the clip's own). */
 export const applyRange = (id: number, source: SourceKind, startMs: number, endMs: number) =>
@@ -60,8 +76,13 @@ export const applyRange = (id: number, source: SourceKind, startMs: number, endM
 
 /** Rejects with `not_logged_in` or `bot_unavailable`, which the dialog words itself. */
 export const listPublishGuilds = () => invoke<PublishGuild[]>("list_publish_guilds");
-export const publishClip = (id: number, title: string | null, game: string | null, guildIds: string[]) =>
-  invoke<void>("publish_clip", { id, title, game, guildIds });
+export const publishClip = (
+  id: number,
+  title: string | null,
+  game: string | null,
+  guildIds: string[],
+  includeMic: boolean,
+) => invoke<void>("publish_clip", { id, title, game, guildIds, includeMic });
 /** Resolves with the server ids the backend actually queued. */
 export const addClipPosts = (id: number, guildIds: string[]) =>
   invoke<string[]>("add_clip_posts", { id, guildIds });
@@ -85,6 +106,10 @@ export const listSessions = () => invoke<SessionRow[]>("list_sessions");
 export const matchEvents = (id: number) => invoke<TimelineEvent[]>("match_events", { id });
 export const deleteSession = (id: number) => invoke<void>("delete_session", { id });
 export const deleteMatch = (id: number) => invoke<void>("delete_match", { id });
+/** Clamped to ten minutes either way. Leaves the match's `updated_at` alone, so its video does not reload. */
+export function setMatchEventOffset(matchId: number, offsetMs: number): Promise<void> {
+  return invoke<void>("set_match_event_offset", { matchId, offsetMs });
+}
 export const retrySession = (id: number) => invoke<void>("retry_session", { id });
 /** Puts `startMs..endMs` of a match file in the clip queue and returns the new clip's id. */
 export const clipFromMatch = (id: number, startMs: number, endMs: number) =>

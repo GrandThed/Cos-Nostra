@@ -2,6 +2,10 @@
 //! when a supported game starts, keeps a recording running while the player is in the game,
 //! feeds the game's provider into the timeline, and ends the session once the player has left.
 //!
+//! With the background recording on, any other game the capture hooks gets a session too
+//! (`SessionGame::Other`), which lasts while its process runs and records in parts the recorder
+//! splits off without a gap. A supported game starting meanwhile ends it and takes over.
+//!
 //! Everything app-specific (the recorder, settings, the window) sits behind [`Host`], so the
 //! state machine here runs in tests against a fake one.
 
@@ -33,9 +37,26 @@ pub trait Host: Send + Sync {
     fn running_executables(&self) -> Vec<String>;
     /// The "record whole sessions" setting.
     fn enabled(&self) -> bool;
+    /// The "record other games" setting.
+    fn other_games_enabled(&self) -> bool {
+        false
+    }
+    /// The executable the game capture has hooked right now, if any.
+    fn hooked_executable(&self) -> Option<String> {
+        None
+    }
+    /// How long each part of a recording of `game` runs before the recorder splits the file;
+    /// `None` records one file for as long as the recording lasts.
+    fn split_every(&self, _game: SessionGame) -> Option<std::time::Duration> {
+        None
+    }
+    /// A part of a split recording was finished.
+    fn part_finished(&self, _session_id: i64) {}
     /// Where recording number `n` of a session goes.
     fn recording_path(&self, session_id: i64, n: usize) -> PathBuf;
-    fn start_recording(&self, path: &Path) -> Result<()>;
+    /// Starts writing `path`, split into parts of `split` when given; the recorder names the
+    /// parts after the first itself, and `current_recording` says which one it is on.
+    fn start_recording(&self, path: &Path, split: Option<std::time::Duration>) -> Result<()>;
     /// Stops the recording and returns when the stop was asked for, which is where the file
     /// ends and so what its start is measured back from.
     fn stop_recording(&self) -> Result<DateTime<Utc>>;
@@ -55,6 +76,10 @@ struct Live {
     id: i64,
     game: SessionGame,
     game_name: String,
+    /// The process the session follows; for `Other`, the only way to tell the game still runs.
+    executable: String,
+    /// The recorder splits this session's recordings into parts.
+    split: Option<std::time::Duration>,
     provider: Option<Box<dyn Provider>>,
     reached: bool,
     /// The recording row and file being written.
@@ -103,9 +128,15 @@ impl Watch {
         let running = self.host.running_executables();
         let sighting = timeline::sight(&running);
         let enabled = self.host.enabled();
+        let other_enabled = self.host.other_games_enabled();
 
         let Some(mut live) = self.live.take() else {
-            if let Some(s) = sighting.filter(|s| s.in_game && enabled) {
+            let found = sighting.filter(|s| s.in_game && enabled).or_else(|| {
+                other_enabled
+                    .then(|| timeline::sight_other(&running, self.host.hooked_executable().as_deref()))
+                    .flatten()
+            });
+            if let Some(s) = found {
                 match self.begin(&s, now) {
                     Ok(live) => self.live = Some(live),
                     Err(e) => log::error!("could not open a session for {}: {e:#}", s.game.id()),
@@ -114,16 +145,26 @@ impl Watch {
             return;
         };
 
-        let same = sighting.filter(|s| s.game == live.game);
-        let in_game = same.as_ref().is_some_and(|s| s.in_game);
+        let (in_game, client_open, on) = if live.game == SessionGame::Other {
+            let runs = running.iter().any(|r| r.eq_ignore_ascii_case(&live.executable));
+            // A supported game has a provider and a session of its own; it takes over.
+            let supported = sighting.as_ref().is_some_and(|s| s.in_game && enabled);
+            if supported {
+                log::info!("session {}: a supported game started, ending the background recording", live.id);
+            }
+            (runs, false, other_enabled && !supported)
+        } else {
+            let same = sighting.filter(|s| s.game == live.game);
+            (same.as_ref().is_some_and(|s| s.in_game), same.is_some(), enabled)
+        };
         if in_game {
             live.last_in_game = now;
         }
-        let grace = if same.is_some() { CLIENT_GRACE } else { EXIT_GRACE };
+        let grace = if client_open { CLIENT_GRACE } else { EXIT_GRACE };
         let left = !in_game && now - live.last_in_game >= grace;
 
-        if !enabled || left {
-            let end = if enabled { live.last_in_game } else { now };
+        if !on || left {
+            let end = if on { live.last_in_game } else { now };
             self.finish(live, end);
             return;
         }
@@ -145,6 +186,8 @@ impl Watch {
             id,
             game: s.game,
             game_name: name,
+            executable: s.executable.clone(),
+            split: self.host.split_every(s.game),
             provider: self.host.provider(s.game),
             reached: false,
             recording: None,
@@ -161,7 +204,28 @@ impl Watch {
 
     fn ensure_recording(&self, live: &mut Live, now: DateTime<Utc>) {
         if let Some((row, path)) = &live.recording {
-            if self.host.current_recording().as_deref() == Some(path.as_path()) {
+            let current = self.host.current_recording();
+            if current.as_deref() == Some(path.as_path()) {
+                return;
+            }
+            // Only the recorder moves to another file by itself: that is a split, and the part
+            // so far is finished. The next carries on from its last frame.
+            if let (Some(next), Some(_)) = (current, live.split) {
+                let row = *row;
+                if let Err(e) = self.store.stop_recording(row, now) {
+                    log::warn!("session {}: {e:#}", live.id);
+                }
+                match self.store.add_recording_after(live.id, &next, now, Some(row)) {
+                    Ok(next_row) => {
+                        log::info!("session {}: recording carries on in {}", live.id, next.display());
+                        live.recording = Some((next_row, next));
+                        live.recordings_made += 1;
+                        self.host.session_changed(live.id);
+                        self.host.part_finished(live.id);
+                    }
+                    // The recorder keeps writing; the next tick tries the row again.
+                    Err(e) => log::error!("session {}: {e:#}", live.id),
+                }
                 return;
             }
             // The recorder restarted or the output died. The file so far is still good.
@@ -186,7 +250,7 @@ impl Watch {
                 return;
             }
         };
-        match self.host.start_recording(&path) {
+        match self.host.start_recording(&path, live.split) {
             Ok(()) => {
                 live.recording = Some((row, path));
                 live.recordings_made = n;
@@ -291,7 +355,8 @@ impl Watch {
             | Event::Death { .. }
             | Event::Assist { .. }
             | Event::Multikill { .. }
-            | Event::Objective { .. } => {
+            | Event::Objective { .. }
+            | Event::Marker => {
                 self.store.add_event(live.id, live.open_match, e)?;
             }
         }
@@ -369,6 +434,9 @@ mod tests {
         /// Events the fake provider hands out on its next polls, one batch per poll.
         script: VecDeque<Vec<GameEvent>>,
         provider_reached: bool,
+        other_enabled: bool,
+        hooked: Option<String>,
+        parts_finished: usize,
     }
 
     struct FakeHost(Arc<Mutex<World>>);
@@ -391,10 +459,22 @@ mod tests {
         fn enabled(&self) -> bool {
             self.0.lock().unwrap().enabled
         }
+        fn other_games_enabled(&self) -> bool {
+            self.0.lock().unwrap().other_enabled
+        }
+        fn hooked_executable(&self) -> Option<String> {
+            self.0.lock().unwrap().hooked.clone()
+        }
+        fn split_every(&self, game: SessionGame) -> Option<std::time::Duration> {
+            (game == SessionGame::Other).then(|| std::time::Duration::from_secs(900))
+        }
+        fn part_finished(&self, _session_id: i64) {
+            self.0.lock().unwrap().parts_finished += 1;
+        }
         fn recording_path(&self, session_id: i64, n: usize) -> PathBuf {
             PathBuf::from(format!("C:/rec/session-{session_id}-{n}.mp4"))
         }
-        fn start_recording(&self, path: &Path) -> Result<()> {
+        fn start_recording(&self, path: &Path, _split: Option<std::time::Duration>) -> Result<()> {
             let mut w = self.0.lock().unwrap();
             if !w.recorder_up {
                 anyhow::bail!("recorder is not running");
@@ -416,7 +496,7 @@ mod tests {
             (game == SessionGame::Valorant).then(|| Box::new(FakeProvider(self.0.clone())) as Box<dyn Provider>)
         }
         fn game_name(&self, s: &Sighting) -> String {
-            crate::games::name_for(&s.executable, "").unwrap_or_default()
+            crate::games::name_for(&s.executable, "").unwrap_or_else(|| s.executable.clone())
         }
         fn session_changed(&self, _session_id: i64) {}
         fn session_ended(&self, session_id: i64) {
@@ -634,6 +714,68 @@ mod tests {
             events.last().unwrap().event,
             Event::MatchEnd { reason: EndReason::SessionEnded, .. }
         ));
+    }
+
+    #[test]
+    fn another_game_is_recorded_in_parts_while_it_runs() {
+        let mut rig = Rig::new();
+        rig.run(&["explorer.exe", "Hades2.exe"]);
+        rig.world.lock().unwrap().hooked = Some("Hades2.exe".into());
+        rig.tick(0);
+        assert!(rig.watch.live().is_none(), "off unless the player asked for it");
+
+        rig.world.lock().unwrap().other_enabled = true;
+        rig.tick(1);
+        let live = rig.watch.live().unwrap();
+        assert_eq!(live.game, SessionGame::Other);
+        assert!(live.recording);
+
+        // The recorder split the file by itself: the part so far ends, the next follows it.
+        rig.world.lock().unwrap().recording = Some(PathBuf::from("C:/rec/session-1-1-20260915-213000.mp4"));
+        rig.tick(900);
+        rig.tick(901);
+        let recs = rig.store.recordings(live.id).unwrap();
+        assert_eq!(recs.len(), 2, "a split is not an interruption");
+        assert_eq!(recs[0].stopped_at.as_deref(), Some(crate::sessions::format_time(rig.at(900)).as_str()));
+        assert_eq!(recs[1].follows, Some(recs[0].id));
+        assert_eq!(rig.world.lock().unwrap().parts_finished, 1);
+
+        // The hook moves on (alt-tab to a browser) but the game still runs: nothing ends.
+        rig.world.lock().unwrap().hooked = None;
+        rig.tick(1000);
+        assert!(rig.watch.live().is_some());
+
+        rig.run(&["explorer.exe"]);
+        rig.tick(1100);
+        rig.tick(1111);
+        assert!(rig.watch.live().is_none());
+        assert_eq!(rig.world.lock().unwrap().ended, vec![live.id]);
+        assert_eq!(rig.store.session(live.id).unwrap().unwrap().game, "other");
+    }
+
+    #[test]
+    fn a_supported_game_takes_over_from_the_background_recording() {
+        let mut rig = Rig::new();
+        {
+            let mut w = rig.world.lock().unwrap();
+            w.other_enabled = true;
+            w.hooked = Some("SomeLauncherGame.exe".into());
+        }
+        rig.run(&["SomeLauncherGame.exe"]);
+        rig.tick(0);
+        let other = rig.watch.live().unwrap();
+        assert_eq!(other.game, SessionGame::Other);
+
+        rig.run(&["SomeLauncherGame.exe", "cs2.exe"]);
+        rig.tick(5);
+        assert!(rig.watch.live().is_none(), "the background session ends at once");
+        rig.tick(6);
+        let cs = rig.watch.live().unwrap();
+        assert_eq!(cs.game, SessionGame::CounterStrike);
+        assert_ne!(cs.id, other.id);
+
+        // A supported game's own exe is never taken for another game.
+        assert!(timeline::sight_other(&["cs2.exe".to_string()], Some("cs2.exe")).is_none());
     }
 
     #[test]

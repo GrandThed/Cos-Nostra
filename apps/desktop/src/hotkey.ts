@@ -1,8 +1,9 @@
-/** The save-clip hotkey picker.
+/** The hotkey picker, for saving clips and for markers.
  *
  *  Builds a Tauri shortcut string such as "Alt+F10" or "Ctrl+Shift+F9" from
  *  `KeyboardEvent.code`, which the global-hotkey parser accepts verbatim (KeyA, Digit1, F10).
- *  Keyboard-first: the control takes focus, Enter starts listening, Esc cancels. */
+ *  Keyboard-first: the control takes focus, Enter starts listening, Esc cancels. An optional
+ *  hotkey also has a way to turn it off, which is the empty string. */
 
 import { h } from "./dom";
 import { t } from "./i18n";
@@ -54,11 +55,37 @@ export interface HotkeyControl {
   set(hotkey: string): void;
 }
 
-export function hotkeyControl(initial: string, onChange?: (hotkey: string) => void): HotkeyControl {
+export interface HotkeyOptions {
+  name: string;
+  note: string;
+  /** Offer a way to turn the hotkey off. */
+  optional?: boolean;
+}
+
+export function hotkeyControl(
+  initial: string,
+  onChange?: (hotkey: string) => void,
+  options: HotkeyOptions = { name: t("hotkey.name"), note: t("hotkey.note") },
+): HotkeyControl {
   let value = initial;
   let listening = false;
 
-  const box = h("button", { type: "button", class: "hotkey mono", text: value });
+  const shown = () => value || t("hotkey.off");
+  const box = h("button", { type: "button", class: "hotkey mono", text: shown() });
+  const off = options.optional
+    ? (h("button", {
+        type: "button",
+        class: "btn small",
+        text: t("hotkey.turnOff"),
+        hidden: !value,
+        onclick: () => {
+          value = "";
+          stop();
+          paint();
+          onChange?.(value);
+        },
+      }) as HTMLButtonElement)
+    : null;
   const cancel = h("button", {
     type: "button",
     class: "btn small",
@@ -73,8 +100,10 @@ export function hotkeyControl(initial: string, onChange?: (hotkey: string) => vo
 
   const paint = () => {
     box.classList.toggle("listening", listening);
+    box.classList.toggle("off", !value && !listening);
     cancel.hidden = !listening;
-    if (!listening) box.textContent = value;
+    if (off) off.hidden = listening || !value;
+    if (!listening) box.textContent = shown();
   };
 
   const showHeld = (mods: string[]) => {
@@ -138,11 +167,12 @@ export function hotkeyControl(initial: string, onChange?: (hotkey: string) => vo
   const node = h(
     "div",
     { class: "hotkey-block" },
-    h("span", { class: "name", text: t("hotkey.name") }),
-    h("div", { class: "hotkey-row" }, box, cancel),
+    h("span", { class: "name", text: options.name }),
+    h("div", { class: "hotkey-row" }, box, cancel, off),
     warn,
-    h("span", { class: "note", text: t("hotkey.note") }),
+    h("span", { class: "note", text: options.note }),
   );
+  paint();
 
   return {
     node,

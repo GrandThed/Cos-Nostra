@@ -308,3 +308,113 @@ fn bitmap_bgra(
     }
     Ok(pixels)
 }
+
+/// An audio endpoint as the Settings screen lists it. `id` is the endpoint id OBS's WASAPI
+/// sources take as `device_id`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// COM for the calling thread for as long as it lives. A thread that already has COM in
+/// another mode keeps it, and is then not uninitialised here either.
+struct Com(bool);
+
+impl Com {
+    fn init() -> Com {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        // Safety: paired with CoUninitialize in Drop only when this call succeeded.
+        Com(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok())
+    }
+}
+
+impl Drop for Com {
+    fn drop(&mut self) {
+        if self.0 {
+            // Safety: balances the successful CoInitializeEx above, on the same thread.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+fn device_enumerator() -> Result<windows::Win32::Media::Audio::IMMDeviceEnumerator> {
+    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    // Safety: a documented COM class, created on a thread with COM initialised.
+    unsafe { CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+        .context("creating the audio device enumerator")
+}
+
+/// The microphones (active capture endpoints) Windows knows, in its own order. Runs COM on the
+/// calling thread, so call it off the UI thread.
+pub fn microphones() -> Result<Vec<AudioDevice>> {
+    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::Media::Audio::{eCapture, DEVICE_STATE_ACTIVE};
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+
+    let _com = Com::init();
+    let enumerator = device_enumerator()?;
+    let mut out = Vec::new();
+    // Safety: every interface comes from the enumerator and is released when dropped; the id
+    // string is freed with CoTaskMemFree as GetId requires.
+    unsafe {
+        let devices = enumerator
+            .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+            .context("listing capture devices")?;
+        for i in 0..devices.GetCount().context("counting capture devices")? {
+            let Ok(device) = devices.Item(i) else { continue };
+            let Ok(raw_id) = device.GetId() else { continue };
+            let id = raw_id.to_string();
+            CoTaskMemFree(Some(raw_id.0 as *const core::ffi::c_void));
+            let Ok(id) = id else { continue };
+            let name = device
+                .OpenPropertyStore(STGM_READ)
+                .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let name = if name.is_empty() { id.clone() } else { name };
+            out.push(AudioDevice { id, name });
+        }
+    }
+    Ok(out)
+}
+
+/// Executable names of the apps that have an audio session on the default output device right
+/// now: whatever is playing, or has played, sound. That is the useful list to pick from when
+/// choosing apps to record next to the game. This process is left out.
+pub fn apps_with_audio() -> Result<Vec<String>> {
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::{eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2};
+    use windows::Win32::System::Com::CLSCTX_ALL;
+
+    let _com = Com::init();
+    let enumerator = device_enumerator()?;
+    let mut names: Vec<String> = Vec::new();
+    // Safety: every interface is obtained from the one before it and released when dropped.
+    unsafe {
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .context("finding the default output device")?;
+        let manager: IAudioSessionManager2 = device
+            .Activate(CLSCTX_ALL, None)
+            .context("opening the audio sessions")?;
+        let sessions = manager.GetSessionEnumerator().context("listing audio sessions")?;
+        for i in 0..sessions.GetCount().context("counting audio sessions")? {
+            let Ok(session) = sessions.GetSession(i) else { continue };
+            let Ok(control) = session.cast::<IAudioSessionControl2>() else { continue };
+            let Ok(pid) = control.GetProcessId() else { continue };
+            // Pid 0 is the system sounds session.
+            if pid == 0 || pid == std::process::id() {
+                continue;
+            }
+            let Ok(path) = process_image_path(pid) else { continue };
+            let Some(exe) = path.rsplit(['\\', '/']).next().map(str::to_string) else { continue };
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&exe)) {
+                names.push(exe);
+            }
+        }
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    Ok(names)
+}

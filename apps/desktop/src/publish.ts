@@ -31,6 +31,10 @@ interface Dialog {
   picked: Set<string> | null;
   title: string;
   game: string;
+  /** Whether the published copies keep the microphone. Offered only when `micTrack`. */
+  includeMic: boolean;
+  /** The recording has the microphone on its own track; `null` until probed. */
+  micTrack: boolean | null;
   busy: boolean;
   message: { text: string; error: boolean } | null;
   loginCode: string | null;
@@ -88,6 +92,8 @@ export function openPublishDialog(id: number): void {
     picked: null,
     title: clip.publish_title ?? clip.game ?? "",
     game: clip.game ?? "",
+    includeMic: clip.include_mic,
+    micTrack: null,
     busy: false,
     message: null,
     loginCode: null,
@@ -97,6 +103,17 @@ export function openPublishDialog(id: number): void {
   document.body.append(scrim);
   redraw();
   box.focus();
+  if (!clip.remote_id) {
+    const d = dialog;
+    void ipc
+      .clipAudio(id)
+      .then((audio) => {
+        if (dialog !== d) return;
+        d.micTrack = audio.mic_track;
+        redraw();
+      })
+      .catch((e) => console.warn("clip audio", id, e));
+  }
   if (data.status?.account) {
     void loadGuilds(dialog);
     // The cache is minutes old at worst, but this is where someone checks where a clip went.
@@ -178,6 +195,7 @@ function redraw(): void {
     d.busy,
     d.message,
     d.loginCode,
+    d.micTrack,
   ]);
   if (key === d.key) return;
   d.key = key;
@@ -302,11 +320,32 @@ function newView(d: Dialog, clip: ClipRow): [HTMLElement[], HTMLElement[]] {
       game,
       h("datalist", { id: "publish-games" }, ...games.map((g) => h("option", { value: g }))),
     ),
+    d.micTrack ? micCheck(d) : null,
     h("span", { class: "section-label", text: t("publish.servers") }),
     guildList(d, clip, []),
     note,
-  ];
+  ].filter((n): n is HTMLElement => n !== null);
   return [body, [cancelButton(d), publish]];
+}
+
+/** Keep or drop the microphone track. The player plays the mix, so what is heard there is the
+ *  ticked state. */
+function micCheck(d: Dialog): HTMLElement {
+  const input = h("input", { type: "checkbox", checked: d.includeMic, disabled: d.busy }) as HTMLInputElement;
+  input.addEventListener("change", () => {
+    d.includeMic = input.checked;
+  });
+  return h(
+    "label",
+    { class: "guild-row mic-row" },
+    h("span", { class: "check" }, input, h("span", { class: "box" })),
+    h(
+      "span",
+      { class: "name" },
+      t("publish.includeMic"),
+      h("small", { class: "note", text: t("publish.includeMicNote") }),
+    ),
+  );
 }
 
 function publishingView(d: Dialog, clip: ClipRow): [HTMLElement[], HTMLElement[]] {
@@ -518,7 +557,7 @@ async function doPublish(d: Dialog, id: number): Promise<void> {
   const title = d.title.trim() || null;
   const game = d.game.trim() || null;
   await run(d, t("publish.publishing"), async () => {
-    await ipc.publishClip(id, title, game, [...(d.picked ?? [])]);
+    await ipc.publishClip(id, title, game, [...(d.picked ?? [])], d.includeMic);
     await Promise.all([loadClips(), loadSettings()]);
     closePublish();
     return null;

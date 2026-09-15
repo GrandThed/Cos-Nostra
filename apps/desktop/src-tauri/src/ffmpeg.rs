@@ -44,6 +44,30 @@ pub struct MediaInfo {
     /// The multi-part cut builds a filter graph per stream, so it has to know whether there
     /// is an audio stream to trim at all.
     pub has_audio: bool,
+    /// How many audio streams the file has. A recording made with the microphone on has three
+    /// (`capture::TRACK_MIX` and the two after it); everything else has one or none.
+    pub audio_tracks: usize,
+}
+
+impl MediaInfo {
+    /// True when the file keeps the microphone on a track of its own, so an encode can leave it
+    /// out.
+    pub fn has_mic_track(&self) -> bool {
+        self.audio_tracks > crate::capture::TRACK_MIC
+    }
+
+    /// The audio stream an encode of this file uses: the mix, or the mix without the
+    /// microphone when `include_mic` is off and the file has that track. `None` for a silent
+    /// file.
+    pub fn audio_stream(&self, include_mic: bool) -> Option<usize> {
+        if self.audio_tracks == 0 {
+            None
+        } else if !include_mic && self.has_mic_track() {
+            Some(crate::capture::TRACK_NO_MIC)
+        } else {
+            Some(crate::capture::TRACK_MIX)
+        }
+    }
 }
 
 /// One kept range of the source, in milliseconds. Serialised as-is into the clip database
@@ -165,13 +189,13 @@ struct Job<'a> {
     src: &'a Path,
     dst: &'a Path,
     cut: &'a Cut,
-    /// Whether `src` has an audio stream; see `MediaInfo::has_audio`.
-    audio: bool,
+    /// Which audio stream of `src` to keep, `None` for none; see `MediaInfo::audio_stream`.
+    audio: Option<usize>,
     progress: Option<&'a Progress<'a>>,
 }
 
-const SOFTWARE_AV1: &str = "libsvtav1";
-const SOFTWARE_H264: &str = "libx264";
+pub const SOFTWARE_AV1: &str = "libsvtav1";
+pub const SOFTWARE_H264: &str = "libx264";
 
 /// BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW. A game in the foreground keeps its frame
 /// rate and no console flashes up while encoding.
@@ -524,6 +548,7 @@ pub fn probe(bins: &Binaries, src: &Path) -> Result<MediaInfo> {
         fps: video.fps,
         size: fs::metadata(src).map(|m| m.len()).unwrap_or(0),
         has_audio: dump.streams.iter().any(|s| s.kind == "Audio"),
+        audio_tracks: dump.streams.iter().filter(|s| s.kind == "Audio").count(),
     })
 }
 
@@ -539,14 +564,19 @@ fn seconds(ms: i64) -> String {
 /// end, then a filter graph trims each kept part out of that span and concatenates them, so
 /// the middles disappear in the same pass that encodes. The trim times are relative to the
 /// seek point because that is where the decoded timestamps now start.
-fn input_args(cmd: &mut Command, src: &Path, cut: &Cut, audio: bool) {
+///
+/// The streams are always mapped by hand: a recording with the microphone on has three audio
+/// tracks, and ffmpeg's own pick would be whichever it likes best rather than the one asked for.
+fn input_args(cmd: &mut Command, src: &Path, cut: &Cut, audio: Option<usize>) {
     match cut.segments.as_slice() {
         [] => {
             cmd.arg("-i").arg(src);
+            map_streams(cmd, audio);
         }
         [one] => {
             cmd.args(["-ss", &seconds(one.start_ms), "-to", &seconds(one.end_ms)]);
             cmd.arg("-i").arg(src);
+            map_streams(cmd, audio);
         }
         many => {
             let base = many[0].start_ms;
@@ -555,34 +585,41 @@ fn input_args(cmd: &mut Command, src: &Path, cut: &Cut, audio: bool) {
             cmd.arg("-i").arg(src);
             cmd.args(["-filter_complex", &concat_graph(many, base, audio)]);
             cmd.args(["-map", "[v]"]);
-            if audio {
+            if audio.is_some() {
                 cmd.args(["-map", "[a]"]);
             }
         }
     }
 }
 
+fn map_streams(cmd: &mut Command, audio: Option<usize>) {
+    cmd.args(["-map", "0:v:0"]);
+    if let Some(track) = audio {
+        cmd.args(["-map", &format!("0:a:{track}")]);
+    }
+}
+
 /// `trim`/`atrim` each part out of the decoded span, restart its timestamps, and `concat`
 /// them in order. Without an audio stream the graph only carries video: naming `[0:a]` on a
 /// silent file is a hard error, not an empty stream.
-fn concat_graph(segments: &[Segment], base_ms: i64, audio: bool) -> String {
+fn concat_graph(segments: &[Segment], base_ms: i64, audio: Option<usize>) -> String {
     let mut graph = String::new();
     let mut inputs = String::new();
     for (i, s) in segments.iter().enumerate() {
         let (a, b) = (seconds(s.start_ms - base_ms), seconds(s.end_ms - base_ms));
-        graph.push_str(&format!("[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}];"));
+        graph.push_str(&format!("[0:v:0]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}];"));
         inputs.push_str(&format!("[v{i}]"));
-        if audio {
-            graph.push_str(&format!("[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}];"));
+        if let Some(track) = audio {
+            graph.push_str(&format!("[0:a:{track}]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}];"));
             inputs.push_str(&format!("[a{i}]"));
         }
     }
     graph.push_str(&format!(
         "{inputs}concat=n={}:v=1:a={}[v]",
         segments.len(),
-        u8::from(audio)
+        u8::from(audio.is_some())
     ));
-    if audio {
+    if audio.is_some() {
         graph.push_str("[a]");
     }
     graph
@@ -750,8 +787,8 @@ fn part_path(dst: &Path) -> PathBuf {
 }
 
 /// AV1 in MP4 with Opus audio, at the user's chosen quality. Keyframe every two seconds.
-/// `audio` says whether `src` has an audio stream (`MediaInfo::has_audio`); a multi-part
-/// `cut` needs it to build its filter graph.
+/// `audio` is the audio stream of `src` to keep, `None` for a silent file
+/// (`MediaInfo::audio_stream`).
 pub fn encode_av1(
     bins: &Binaries,
     encoder: &str,
@@ -759,7 +796,7 @@ pub fn encode_av1(
     src: &Path,
     dst: &Path,
     cut: &Cut,
-    audio: bool,
+    audio: Option<usize>,
     progress: Option<&Progress<'_>>,
 ) -> Result<()> {
     encode(
@@ -781,7 +818,7 @@ pub fn encode_h264(
     src: &Path,
     dst: &Path,
     cut: &Cut,
-    audio: bool,
+    audio: Option<usize>,
     progress: Option<&Progress<'_>>,
 ) -> Result<()> {
     encode(
@@ -918,6 +955,120 @@ pub fn copy_range(bins: &Binaries, src: &Path, from_ms: i64, to_ms: i64, dst: &P
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// What an export writes for its picture.
+#[derive(Debug, Clone)]
+pub enum ExportVideo {
+    /// The recorded stream as it is. The range must start on a keyframe
+    /// (`keyframe_at_or_before`), since a copy cannot start anywhere else.
+    Copy,
+    Encode {
+        encoder: String,
+        /// Rate control, from `export::quality_args` or `export::bitrate_args`.
+        args: Vec<String>,
+        /// Scale to this height, keeping the shape; `None` keeps the source's.
+        height: Option<u32>,
+        /// Frames per second; `None` keeps the source's.
+        fps: Option<u32>,
+        /// The source's rate, for the keyframe interval.
+        source_fps: f64,
+    },
+}
+
+/// One export of a clip into a file the user picked.
+#[derive(Debug, Clone)]
+pub struct Export<'a> {
+    pub src: &'a Path,
+    pub dst: &'a Path,
+    /// The part of `src` to write; `None` is all of it.
+    pub range: Option<Segment>,
+    /// Which audio stream to carry, `None` for none (`MediaInfo::audio_stream`).
+    pub audio: Option<usize>,
+    pub audio_kbps: u32,
+    pub video: ExportVideo,
+}
+
+/// Writes an export through `<dst>.part`, like every encode, as an MP4 with AAC audio that
+/// plays anywhere: H.264 and H.265 are tagged the way Apple players want, and the index goes
+/// at the front so a browser or Discord can start playing before it has the whole file.
+pub fn export(bins: &Binaries, job: &Export<'_>, progress: Option<&Progress<'_>>) -> Result<()> {
+    let part = part_path(job.dst);
+    let _ = fs::remove_file(&part);
+    if let Some(parent) = job.dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut cmd = ffmpeg_command(bins);
+    cmd.args(["-v", "error"]);
+    match (&job.video, job.range) {
+        (ExportVideo::Copy, Some(range)) => {
+            // As in `copy_range`: a millisecond past the keyframe still lands on it.
+            cmd.args(["-ss", &seconds(range.start_ms + 1)]).arg("-i").arg(job.src);
+            cmd.args(["-t", &seconds(range.end_ms - range.start_ms)]);
+        }
+        (ExportVideo::Encode { encoder, .. }, Some(range)) => {
+            if is_software(encoder) {
+                cmd.args(["-threads", &threads()]);
+            }
+            cmd.args(["-ss", &seconds(range.start_ms), "-to", &seconds(range.end_ms)]).arg("-i").arg(job.src);
+        }
+        (video, None) => {
+            if let ExportVideo::Encode { encoder, .. } = video {
+                if is_software(encoder) {
+                    cmd.args(["-threads", &threads()]);
+                }
+            }
+            cmd.arg("-i").arg(job.src);
+        }
+    }
+    map_streams(&mut cmd, job.audio);
+    match &job.video {
+        ExportVideo::Copy => {
+            cmd.args(["-c:v", "copy", "-avoid_negative_ts", "make_zero"]);
+        }
+        ExportVideo::Encode { encoder, args, height, fps, source_fps } => {
+            cmd.args(["-c:v", encoder]).args(args);
+            if let Some(h) = height {
+                // Even width, as every 4:2:0 encoder needs.
+                cmd.args(["-vf", &format!("scale=-2:{h}:flags=lanczos")]);
+            }
+            if let Some(f) = fps {
+                cmd.args(["-r", &f.to_string()]);
+            }
+            let rate = fps.map(f64::from).unwrap_or(*source_fps).max(1.0);
+            cmd.args(["-g", &((rate * 2.0).round() as u32).to_string()]);
+            if is_software(encoder) {
+                cmd.args(["-pix_fmt", "yuv420p"]);
+            }
+            if encoder.starts_with("hevc") {
+                cmd.args(["-tag:v", "hvc1"]);
+            }
+        }
+    }
+    if job.audio.is_some() {
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", job.audio_kbps)]);
+    }
+    cmd.args(["-movflags", "+faststart", "-f", "mp4"]).arg(&part);
+
+    let started = Instant::now();
+    let what = format!("export {}", job.src.display());
+    let result = match progress {
+        Some(p) => run_progress(cmd, &what, p),
+        None => run(cmd, &what).map(drop),
+    };
+    if let Err(e) = result {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    fs::rename(&part, job.dst).with_context(|| format!("rename {} to {}", part.display(), job.dst.display()))?;
+    log::info!("exported {} in {:.1} s", job.dst.display(), started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// The first hardware H.265 encoder that works on this machine, if any. There is no software
+/// fallback: x265 is not in the shipped ffmpeg.
+pub fn probe_hevc(bins: &Binaries) -> Option<String> {
+    first_working(bins, &["hevc_nvenc", "hevc_amf", "hevc_qsv"]).map(str::to_string)
 }
 
 /// Joins files that share codecs and settings end to end, without re-encoding.
@@ -1094,18 +1245,75 @@ mod tests {
         assert_eq!(Cut::whole().source_time_at(0.25, 30_000), 7_500);
 
         // The graph names one chain per part and only touches audio when there is some.
-        let graph = concat_graph(&cut.segments, 10_000, true);
+        let graph = concat_graph(&cut.segments, 10_000, Some(0));
         assert_eq!(
             graph,
-            "[0:v]trim=start=0.000:end=2.000,setpts=PTS-STARTPTS[v0];\
-             [0:a]atrim=start=0.000:end=2.000,asetpts=PTS-STARTPTS[a0];\
-             [0:v]trim=start=10.000:end=16.000,setpts=PTS-STARTPTS[v1];\
-             [0:a]atrim=start=10.000:end=16.000,asetpts=PTS-STARTPTS[a1];\
+            "[0:v:0]trim=start=0.000:end=2.000,setpts=PTS-STARTPTS[v0];\
+             [0:a:0]atrim=start=0.000:end=2.000,asetpts=PTS-STARTPTS[a0];\
+             [0:v:0]trim=start=10.000:end=16.000,setpts=PTS-STARTPTS[v1];\
+             [0:a:0]atrim=start=10.000:end=16.000,asetpts=PTS-STARTPTS[a1];\
              [v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
         );
-        let silent = concat_graph(&cut.segments, 10_000, false);
-        assert!(!silent.contains("[0:a]"));
+        let silent = concat_graph(&cut.segments, 10_000, None);
+        assert!(!silent.contains("[0:a"));
         assert!(silent.ends_with("[v0][v1]concat=n=2:v=1:a=0[v]"));
+        // The voiceless track of a recording made with the microphone on.
+        assert!(concat_graph(&cut.segments, 10_000, Some(1)).contains("[0:a:1]atrim"));
+    }
+
+    #[test]
+    fn picks_the_audio_track() {
+        let info = |audio_tracks| MediaInfo {
+            duration_ms: 1,
+            width: 1,
+            height: 1,
+            fps: 60.0,
+            size: 1,
+            has_audio: audio_tracks > 0,
+            audio_tracks,
+        };
+        assert_eq!(info(0).audio_stream(true), None);
+        assert_eq!(info(0).audio_stream(false), None);
+        // A recording from before the microphone, or one made with it off: only the mix.
+        assert_eq!(info(1).audio_stream(false), Some(0));
+        assert!(!info(1).has_mic_track());
+        // Mix, mix without the microphone, microphone.
+        assert!(info(3).has_mic_track());
+        assert_eq!(info(3).audio_stream(true), Some(0));
+        assert_eq!(info(3).audio_stream(false), Some(1));
+    }
+
+    /// A recording made with the microphone on: three audio tracks, the mix first. Leaving the
+    /// microphone out encodes the second; a stream copy keeps all three.
+    #[test]
+    fn leaves_the_microphone_out_of_an_encode() {
+        let bins = bins();
+        let dir = std::env::temp_dir().join(format!("cos-nostra-mic-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("three-tracks.mp4");
+        let mut cmd = ffmpeg_command(&bins);
+        cmd.args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000"])
+            .args(["-t", "3", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30"])
+            .args(["-c:a", "aac", "-b:a", "64k"])
+            .arg(&src);
+        run(cmd, "three-track sample").unwrap();
+        let info = probe(&bins, &src).unwrap();
+        assert_eq!(info.audio_tracks, 3);
+
+        let out = dir.join("no-mic.mp4");
+        let cut = Cut { segments: vec![seg(500, 2500)] };
+        encode_h264(&bins, SOFTWARE_H264, Quality::Small, &src, &out, &cut, info.audio_stream(false), None).unwrap();
+        let encoded = probe(&bins, &out).unwrap();
+        assert_eq!(encoded.audio_tracks, 1, "an encode carries one track");
+
+        let copy = dir.join("copy.mp4");
+        copy_range(&bins, &src, 0, 2_000, &copy).unwrap();
+        assert_eq!(probe(&bins, &copy).unwrap().audio_tracks, 3, "a copy keeps every track");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1134,7 +1342,7 @@ mod tests {
 
         let av1 = dir.join("out_av1.mp4");
         let started = Instant::now();
-        encode_av1(&bins, &encoders.av1, Quality::Balanced, &src, &av1, &trim, true, None).unwrap();
+        encode_av1(&bins, &encoders.av1, Quality::Balanced, &src, &av1, &trim, Some(0), None).unwrap();
         let av1_info = probe(&bins, &av1).unwrap();
         println!(
             "av1 ({}): {:.1} s, {} bytes, {:?}",
@@ -1156,7 +1364,7 @@ mod tests {
             duration_ms: 2000,
             on: &|p| seen.borrow_mut().push(p),
         };
-        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &h264, &trim, true, Some(&watch)).unwrap();
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &h264, &trim, Some(0), Some(&watch)).unwrap();
         let seen = seen.into_inner();
         assert!(seen.len() > 1, "ffmpeg reported no progress: {seen:?}");
         assert!(seen.windows(2).all(|w| w[0] <= w[1]), "progress went backwards: {seen:?}");
@@ -1192,7 +1400,7 @@ mod tests {
             on: &|p| seen.borrow_mut().push(p),
         };
         let started = Instant::now();
-        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &joined, &cut, true, Some(&watch)).unwrap();
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &src, &joined, &cut, Some(0), Some(&watch)).unwrap();
         let joined_info = probe(&bins, &joined).unwrap();
         println!(
             "cut ({}): {:.1} s, {} bytes, {:?}",
@@ -1218,7 +1426,7 @@ mod tests {
         let silent_info = probe(&bins, &silent_src).unwrap();
         assert!(!silent_info.has_audio);
         let silent_out = dir.join("out_silent_cut.mp4");
-        encode_h264(&bins, &encoders.h264, Quality::Balanced, &silent_src, &silent_out, &cut, false, None).unwrap();
+        encode_h264(&bins, &encoders.h264, Quality::Balanced, &silent_src, &silent_out, &cut, None, None).unwrap();
         let silent_out_info = probe(&bins, &silent_out).unwrap();
         assert!((silent_out_info.duration_ms - 2000).abs() <= 100, "silent cut duration {}", silent_out_info.duration_ms);
         assert!(!silent_out_info.has_audio);
@@ -1238,7 +1446,7 @@ mod tests {
             &src,
             &bad,
             &Cut::whole(),
-            true,
+            Some(0),
             Some(&watch),
         )
         .unwrap_err();

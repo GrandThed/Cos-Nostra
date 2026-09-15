@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(f.apply(SourceKind::Match, 12_000, 18_000).unwrap(), Applied::Unchanged);
 
         // Mid-job, nothing is touched.
-        f.queue.publish(f.clip_id, None, None, &[]).unwrap();
+        f.queue.publish(f.clip_id, None, None, &[], true).unwrap();
         f.queue.mark_uploading(f.clip_id).unwrap();
         assert!(f.apply(SourceKind::Match, 11_000, 18_000).is_err(), "refused mid-job");
         assert_eq!(f.row().cut, Some(vec![Segment { start_ms: 2_000, end_ms: 8_000 }]));
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn a_published_clip_goes_back_through_the_encoder_under_the_same_id() {
         let f = fixture("published");
-        f.queue.publish(f.clip_id, Some("ace"), None, &[]).unwrap();
+        f.queue.publish(f.clip_id, Some("ace"), None, &[], true).unwrap();
         f.queue.mark_done(f.clip_id, "r1", "https://x/c/r1").unwrap();
 
         assert_eq!(f.apply(SourceKind::Match, 11_000, 19_000).unwrap(), Applied::Cut);

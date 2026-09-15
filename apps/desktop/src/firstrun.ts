@@ -84,13 +84,15 @@ function runtimeStep(): HTMLElement {
     }),
     h("span", { class: "blurb", text: t("firstrun.runtimeBlurb") }),
     h("div", { class: "progress" }, h("span", { style: `width:${Math.round(progress * 100)}%` })),
+    // The bootstrapper's own `message` ("Downloading OBS", "Extracting obs.dll") is English and
+    // says no more than the heading, so the counter is the percentage alone.
     h("span", {
       class: "counter",
       text:
         b.phase === "restarting"
           ? t("firstrun.restarting")
           : b.phase === "downloading" || b.phase === "extracting"
-            ? (b.message || `${Math.round(progress * 100)}%`)
+            ? `${Math.round(progress * 100)}%`
             : t("firstrun.starting"),
     }),
     stepOf(1),

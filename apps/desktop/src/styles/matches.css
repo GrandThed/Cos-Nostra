@@ -260,106 +260,217 @@
   padding: 16px 18px;
 }
 
-.match-stage .video {
+/* The picture, the timeline, the transport and the clip controls: what fullscreen shows. */
+.match-player {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: none;
+}
+
+.match-player .video {
   --hue: 30;
   flex: none;
 }
 
-.match-stage .video video {
+.match-player .video video {
   display: block;
+  cursor: pointer;
+}
+
+.match-player:fullscreen {
+  padding: 14px 18px 12px;
+  background: var(--bg);
+}
+
+.match-player:fullscreen .video {
+  flex: 1;
+  min-height: 0;
+  aspect-ratio: auto;
+  border-radius: 0;
+}
+
+.match-player .controls .event-steps {
+  display: flex;
+  gap: 10px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+/* --- Marks: one shape and colour per kind of event, on the timeline and in the list --- */
+
+.mk {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--mut);
+}
+
+.mk.kill {
+  background: var(--acc);
+}
+
+/* A multikill sits on top of the kills it caps, so it is drawn bigger and ringed. */
+.mk.multikill {
+  width: 11px;
+  height: 11px;
+  background: var(--acc);
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px var(--acc);
+}
+
+/* A death is a diamond, so it reads apart from a kill without its colour. */
+.mk.death {
+  border-radius: 1.5px;
+  transform: rotate(45deg) scale(0.9);
+  background: var(--err);
+}
+
+.mk.assist {
+  width: 7px;
+  height: 7px;
+  background: var(--info);
+}
+
+.mk.objective {
+  border-radius: 2.5px;
+}
+
+.mk.objective.ours,
+.mk.round.won {
+  background: var(--ok);
+}
+
+.mk.objective.theirs,
+.mk.round.lost {
+  background: var(--err);
+}
+
+.mk.edge {
+  width: 3px;
+  height: 11px;
+  border-radius: 2px;
+}
+
+/* A marker the player dropped with the hotkey: a flag pointing down at the moment. */
+.mk.marker {
+  width: 11px;
+  height: 11px;
+  border-radius: 0;
+  background: var(--warn);
+  clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
 }
 
 /* --- Timeline ------------------------------------------------------------ */
 
-.tl {
+.tl-wrap {
   position: relative;
   flex: none;
-  height: 44px;
+}
+
+/* Lanes, top to bottom: the ruler (0–16), markers (16–50: objectives above, the player's own
+   moments below), the progress line (52–58) and the clips already taken (62–71). The pointer
+   snaps to markers above 50 px (LANE_BOTTOM_PX in matches.ts). */
+.tl {
+  position: relative;
+  height: 76px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
   cursor: crosshair;
   touch-action: none;
-  overflow: hidden;
+  user-select: none;
 }
 
-.tl-bar {
+.tl-ruler {
   position: absolute;
   inset: 0;
   pointer-events: none;
 }
 
-/* The top lane carries the rounds and what happened in them; the bottom lane the clips. */
+.tl-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.tl-tick i {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-style: normal;
+  color: var(--mut);
+  white-space: nowrap;
+}
+
+.tl-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 16px;
+  height: 34px;
+  pointer-events: none;
+}
+
+.tl-bar .mk {
+  position: absolute;
+  top: 24px;
+  translate: -50% -50%;
+}
+
+.tl-bar .mk.objective,
+.tl-bar .mk.marker {
+  top: 9px;
+}
+
+.tl-bar .mk.edge {
+  top: 17px;
+  height: 30px;
+  width: 2px;
+}
+
+.tl-bar .mk.dim,
+.tl-round.dim {
+  opacity: 0.22;
+}
+
+/* Rounds, for the games that have them: a band behind the markers, won or lost. */
 .tl-round {
   position: absolute;
-  top: 6px;
-  bottom: 16px;
+  top: 2px;
+  bottom: 2px;
   border-right: 1px solid var(--panel);
   background: var(--panel2);
 }
 
 .tl-round.won {
-  background: color-mix(in srgb, var(--ok) 38%, var(--panel));
+  background: color-mix(in srgb, var(--ok) 30%, var(--panel));
 }
 
 .tl-round.lost {
-  background: color-mix(in srgb, var(--err) 32%, var(--panel));
+  background: color-mix(in srgb, var(--err) 26%, var(--panel));
 }
 
-.tl-edge {
+.tl-track {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  margin-left: -1px;
-  background: var(--mut);
+  left: 0;
+  right: 0;
+  top: 52px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel2);
+  overflow: hidden;
+  pointer-events: none;
 }
 
-.tl-dot {
-  position: absolute;
-  top: 17px;
-  width: 8px;
-  height: 8px;
-  margin: -4px 0 0 -4px;
-  border-radius: 50%;
-  background: var(--ink);
-  box-shadow: 0 0 0 2px var(--panel);
-}
-
-.tl-dot.kill {
-  background: var(--acc);
-}
-
-.tl-dot.death {
-  background: var(--err);
-}
-
-.tl-dot.assist {
-  background: var(--info);
-}
-
-/* A multikill sits on top of the kills it caps, so it is drawn bigger and on top. */
-.tl-dot.multikill {
-  width: 12px;
-  height: 12px;
-  margin: -6px 0 0 -6px;
-  background: var(--acc);
-  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--acc);
-  z-index: 1;
-}
-
-.tl-dot.objective {
-  top: 11px;
-  border-radius: 2px;
-  background: var(--mut);
-}
-
-.tl-dot.objective.ours {
-  background: var(--ok);
-}
-
-.tl-dot.objective.theirs {
-  background: var(--err);
+.tl-played {
+  display: block;
+  height: 100%;
+  background: color-mix(in srgb, var(--acc) 60%, var(--panel2));
 }
 
 /* Clips already taken from the match: flat bars in the bottom lane, in the colours of the
@@ -369,7 +480,7 @@
   left: 0;
   right: 0;
   bottom: 4px;
-  height: 8px;
+  height: 9px;
   pointer-events: none;
 }
 
@@ -377,17 +488,17 @@
   position: absolute;
   top: 0;
   bottom: 0;
-  min-width: 6px;
+  min-width: 10px;
   padding: 0;
   border: 0;
-  border-radius: 4px;
+  border-radius: 3px;
   background: var(--mut);
   cursor: pointer;
   pointer-events: auto;
 }
 
 .tl-clip.local {
-  background: var(--panel);
+  background: color-mix(in srgb, var(--mut) 28%, var(--panel));
   box-shadow: inset 0 0 0 1.5px var(--mut);
 }
 
@@ -416,15 +527,53 @@
   outline-offset: 1px;
 }
 
+/* The range being chosen, with a grip at either edge; before the out mark only its start. */
 .tl-sel {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: -1px;
+  bottom: -1px;
   min-width: 2px;
   border-left: 2px solid var(--acc);
   border-right: 2px solid var(--acc);
-  background: color-mix(in srgb, var(--acc) 22%, transparent);
+  background: color-mix(in srgb, var(--acc) 16%, transparent);
   pointer-events: none;
+}
+
+.tl-grip {
+  position: absolute;
+  top: 26px;
+  width: 8px;
+  height: 22px;
+  border-radius: 3px;
+  background: var(--acc);
+  box-shadow: 0 0 0 1.5px var(--panel);
+}
+
+.tl-grip.in {
+  left: -5px;
+}
+
+.tl-grip.out {
+  right: -5px;
+}
+
+.tl-len {
+  position: absolute;
+  left: 50%;
+  top: -9px;
+  translate: -50% 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--acc);
+  color: var(--accInk);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.tl-len:empty,
+.tl-sel.open .tl-grip {
+  display: none;
 }
 
 .tl-sel.open {
@@ -432,22 +581,89 @@
   background: none;
 }
 
+.tl-hover {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--mut);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
 .tl-head {
   position: absolute;
-  top: -1px;
-  bottom: -1px;
+  top: -3px;
+  bottom: -3px;
   width: 2px;
   margin-left: -1px;
   background: var(--ink);
   pointer-events: none;
+  z-index: 1;
 }
 
-.tl-scale {
+.tl-head .knob {
+  position: absolute;
+  top: 52px;
+  left: -5px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--acc);
+  box-shadow: 0 0 0 2px var(--panel);
+}
+
+/* Over the bottom of the picture while hovering: the frame there, its time, what happened. */
+.tl-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  width: 184px;
+  translate: -50% 0;
   display: flex;
-  justify-content: space-between;
-  margin-top: -6px;
-  color: var(--mut);
-  font-size: 10.5px;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: var(--lift);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.tl-tip video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: #000;
+}
+
+.tl-tip .at {
+  padding: 3px 8px 0;
+  font-size: 11px;
+  text-align: center;
+}
+
+.tl-tip .what {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 8px 5px;
+  font-size: 11.5px;
+}
+
+.tl-tip .what:empty {
+  padding-bottom: 3px;
+}
+
+.tl-tip .what span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tl-tip .what .mk {
+  flex: none;
 }
 
 .clip-row {
@@ -493,18 +709,81 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 16px;
+  padding: 14px 12px 16px;
   background: var(--panel);
   border-left: 1px solid var(--line);
+}
+
+.match-rail .rail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.match-rail .sync-link {
+  font-size: 11.5px;
+  text-align: right;
+}
+
+.match-rail .filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.match-rail .filters:empty {
+  display: none;
+}
+
+.match-rail .filters .chip {
+  padding: 2px 9px;
+  font-size: 11.5px;
+}
+
+.match-rail .filters .count {
+  margin-left: 5px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mut);
+}
+
+.sync-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--acc);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.sync-panel .help {
+  font-size: 12px;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.sync-panel .sync-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sync-panel .offset {
+  min-width: 58px;
+  text-align: center;
+  font-size: 12px;
 }
 
 .event-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .event-list > .muted {
+  padding: 0 4px;
   font-size: 12.5px;
   line-height: 1.45;
 }
@@ -512,63 +791,90 @@
 .event {
   display: flex;
   align-items: center;
-  gap: 6px;
-  border-left: 3px solid var(--line);
-  padding-left: 4px;
+  gap: 4px;
+  padding-right: 4px;
+  border-radius: 7px;
 }
 
-.event.won {
-  border-left-color: var(--ok);
+.event:hover {
+  background: color-mix(in srgb, var(--panel2) 55%, transparent);
 }
 
-.event.lost {
-  border-left-color: var(--err);
-}
-
-.event.match_start,
-.event.match_end {
-  border-left-color: var(--mut);
+.event[aria-current="true"] {
+  background: var(--panel2);
 }
 
 .event .jump {
   flex: 1;
   min-width: 0;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   padding: 5px 4px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 7px;
   background: none;
   color: inherit;
   text-align: left;
 }
 
-.event .jump:hover {
-  background: var(--panel2);
-}
-
 .event .at {
   flex: none;
-  width: 38px;
+  width: 36px;
   color: var(--mut);
   font-size: 11px;
+  text-align: right;
+}
+
+.event .mk {
+  flex: none;
+  margin: 0 1px;
 }
 
 .event .what {
   min-width: 0;
   font-size: 12.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.event .what .detail {
+  margin-left: 6px;
+  color: var(--mut);
 }
 
 .event.match_start .what,
-.event.match_end .what {
+.event.match_end .what,
+.event.multikill .what {
   font-weight: 600;
 }
 
-.event .btn.small {
+.event .pick {
+  flex: none;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--mut);
+  font-size: 12px;
+  opacity: 0.55;
+}
+
+.event:hover .pick,
+.event[aria-current="true"] .pick,
+.event .pick:focus-visible {
+  opacity: 1;
+}
+
+.event .pick:hover {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+.event .btn.small.here {
+  flex: none;
   padding: 2px 8px;
   font-size: 11px;
 }

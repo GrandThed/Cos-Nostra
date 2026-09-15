@@ -99,6 +99,75 @@
   display: none;
 }
 
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.field-row.indent {
+  padding-left: 42px;
+}
+
+/* --- Audio --------------------------------------------------------------- */
+
+.cards.wrap {
+  flex-wrap: wrap;
+}
+
+.cards.wrap .radio-card {
+  flex: 1 1 130px;
+}
+
+.cards.wrap.four .radio-card {
+  flex-basis: 80px;
+}
+
+.audio-apps,
+.mic-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+}
+
+.audio-apps .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip.app {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+  font-family: var(--mono);
+}
+
+.chip.app .remove {
+  border: none;
+  background: transparent;
+  color: var(--mut);
+  font-size: 10px;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.chip.app .remove:hover {
+  color: var(--err);
+}
+
+.field-row .hint.warn {
+  color: var(--warn);
+}
+
+.field-row .hint.warn:empty {
+  display: none;
+}
+
 /* --- Advanced ------------------------------------------------------------ */
 
 .advanced {

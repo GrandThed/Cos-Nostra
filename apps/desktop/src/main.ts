@@ -6,8 +6,9 @@ import "./styles/index.css";
 import { listen } from "@tauri-apps/api/event";
 import { el } from "./dom";
 import { mountEditor, unmountEditor } from "./editor";
+import { initExporter } from "./exporter";
 import { initFirstRun, loginFailed, syncFirstRun } from "./firstrun";
-import { t } from "./i18n";
+import { t, type Key } from "./i18n";
 import { initLibrary, mountLibrary, unmountLibrary } from "./library";
 import { initMatches, mountMatches, unmountMatches } from "./matches";
 import { initPlayer, mountPlayer, unmountPlayer } from "./player";
@@ -43,6 +44,7 @@ initSettings();
 initFirstRun();
 initUpdater();
 initPublish();
+initExporter();
 
 for (const tab of TABS) {
   el(`tab-${tab}`).addEventListener("click", () => go({ view: tab }));
@@ -128,10 +130,21 @@ void listen<Account | null>("account-changed", (e) => {
   void loadSettings().then(syncFirstRun);
 });
 
+/** The ways a device login ends without a link that are nobody's fault, which `poll_login` in
+ *  `lib.rs` words in English. Matched on its exact text; anything else is a real error and is
+ *  shown as it came. */
+const LOGIN_FAILURES = new Map<string, Key>([
+  ["login timed out; try again", "settings.loginTimedOut"],
+  ["login code expired; try again", "settings.loginExpired"],
+  ["the backend rejected this login; try again", "settings.loginRejected"],
+]);
+
 void listen<string>("login-failed", (e) => {
-  onLoginStateChanged(null, e.payload);
-  loginFailed(e.payload);
-  publishLoginFailed(e.payload);
+  const key = LOGIN_FAILURES.get(e.payload);
+  const message = key ? t(key) : e.payload;
+  onLoginStateChanged(null, message);
+  loginFailed(message);
+  publishLoginFailed(message);
 });
 
 // ---------------------------------------------------------------------------

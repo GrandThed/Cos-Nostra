@@ -48,6 +48,19 @@ pub fn clip_updated(l: Language) -> &'static str {
     pick(l, "Published clip updated", "Clip publicado actualizado")
 }
 
+/// The marker hotkey was pressed with no session recording to put it on.
+pub fn marker_not_added(l: Language) -> &'static str {
+    pick(l, "No marker added", "No se añadió la marca")
+}
+
+pub fn marker_not_added_body(l: Language) -> &'static str {
+    pick(
+        l,
+        "Markers go on the timeline of a game being recorded, and nothing is being recorded right now.",
+        "Las marcas van en la línea de tiempo de un juego que se está grabando, y ahora mismo no se graba nada.",
+    )
+}
+
 pub fn tray_hint_title(l: Language) -> &'static str {
     pick(l, "Still recording in the tray", "Sigue grabando en la bandeja")
 }
@@ -76,6 +89,8 @@ mod tests {
             (clip_updated(Language::En), clip_updated(Language::Es)),
             (tray_hint_title(Language::En), tray_hint_title(Language::Es)),
             (tray_hint_body(Language::En), tray_hint_body(Language::Es)),
+            (marker_not_added(Language::En), marker_not_added(Language::Es)),
+            (marker_not_added_body(Language::En), marker_not_added_body(Language::Es)),
         ] {
             assert!(!en.is_empty());
             assert!(!es.is_empty());

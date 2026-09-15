@@ -2,19 +2,40 @@
  *  reported, and the place to take clips out of them after playing.
  *
  *  Times on the timeline come from Rust as wall-clock instants. A match file knows when its
- *  first frame was (`file_start_at`), so an event sits at `at - file_start_at` into the video.
+ *  first frame was (`file_start_at`), so an event sits at `at - file_start_at` into the video,
+ *  plus the match's `event_offset_ms` when the user re-aligned a timeline recorded out of step
+ *  with the footage (League matches from before the loading-screen fix are ~20 s early).
  *  The selection and the in/out marks survive a data refresh as long as the match itself did
- *  not change, so a session ending in the background does not reset the video being watched. */
+ *  not change, so a session ending in the background does not reset the video being watched.
+ *
+ *  The player is the shared transport (`transport.ts`) under a timeline of its own: a ruler,
+ *  a lane of markers, the playhead on a progress line, and the clips already taken. Dragging
+ *  selects a range, a click jumps, the range's edges and the playhead can be grabbed, and
+ *  hovering shows the frame and whatever happened there. */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { badgeFor } from "./clips";
 import { confirming, fill, h } from "./dom";
-import { dayLabel, fmtBytes, fmtDuration, fmtTimeOnly, fmtWhenLong, hueFor } from "./format";
+import { dayLabel, fmtBytes, fmtClock, fmtDecimal, fmtDuration, fmtTimeOnly, fmtWhenLong, hueFor } from "./format";
 import { artTile } from "./gameArt";
+import { mapLabel, modeLabel, objectiveLabel, unitLabel } from "./gameTerms";
 import { onLanguage, t } from "./i18n";
 import * as ipc from "./ipc";
 import { go } from "./router";
 import { data, loadClips, loadSessions, on } from "./store";
+import {
+  clickToPlay,
+  flasher,
+  frameStep,
+  fullscreenButton,
+  leaveFullscreen,
+  speedControl,
+  togglePlay,
+  type Transport,
+  transportKey,
+  typing,
+  volume,
+} from "./transport";
 import type { MatchClip, MatchRow, SessionRow, TimelineEvent } from "./types";
 
 /** Kept after the moment a round is decided when clipping it, for the kill and the reaction. */
@@ -24,11 +45,30 @@ const MOMENT_BEFORE_MS = 12_000;
 /** A multikill is stamped at its last kill, so the lead-up is longer. */
 const MULTIKILL_BEFORE_MS = 20_000;
 const MOMENT_AFTER_MS = 4_000;
+/** A marker is pressed once whatever was worth it has happened: mostly before, a little after. */
+const MARKER_BEFORE_MS = 25_000;
+const MARKER_AFTER_MS = 5_000;
+/** Jumping to a moment lands this much before it, so pressing play shows it happen. */
+const JUMP_LEAD_MS = 2000;
+/** Ctrl+← while this close after a moment goes to the one before, like chapters do. */
+const PREV_SLACK_MS = 1500;
 const MIN_CLIP_MS = 1000;
 /** A pointer that moves less than this on the timeline is a click (seek), not a drag (select). */
 const DRAG_PX = 4;
+/** How near the pointer has to be to a marker, a range edge or the playhead to take it. */
+const GRAB_PX = 6;
+/** The part of the timeline, from its top, where the pointer snaps to markers (`matches.css`). */
+const LANE_BOTTOM_PX = 50;
+/** Ruler ticks are at least this far apart. */
+const TICK_MIN_PX = 70;
+const TICK_STEPS_S = [15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+/** The sync panel's nudge, and how far the offset may go (`sessions.rs` clamps the same). */
+const NUDGE_MS = 1000;
+const MAX_OFFSET_MS = 600_000;
 
 type Selection = { kind: "match"; id: number } | { kind: "session"; id: number } | null;
+type Filter = "all" | "marker" | "kill" | "death" | "assist" | "objective" | "round";
+const FILTERS: Filter[] = ["all", "marker", "kill", "death", "assist", "objective", "round"];
 
 let selection: Selection = null;
 let parts: { list: HTMLElement; main: HTMLElement } | null = null;
@@ -48,22 +88,59 @@ interface Round {
 interface View {
   key: string;
   match: MatchRow;
-  video: HTMLVideoElement | null;
-  bar: HTMLElement | null;
-  head: HTMLElement | null;
-  sel: HTMLElement | null;
-  range: HTMLElement | null;
-  clipButton: HTMLButtonElement | null;
-  note: HTMLElement | null;
+  note: HTMLElement;
+  /** Null while the match has no file to play (live, pending, missing, failed). */
+  p: Player | null;
+}
+
+interface Player {
+  session: SessionRow;
+  match: MatchRow;
+  video: HTMLVideoElement;
+  /** A second decoder that follows the pointer over the timeline, for the hover frame. */
+  preview: HTMLVideoElement;
+  previewWant: number;
+  tr: Transport;
+  /** What fullscreen shows: the picture, the timeline and the clip controls. */
+  root: HTMLElement;
+  timeline: HTMLElement;
+  ruler: HTMLElement;
+  bar: HTMLElement;
+  played: HTMLElement;
+  head: HTMLElement;
+  hover: HTMLElement;
+  tip: HTMLElement;
+  tipAt: HTMLElement;
+  tipWhat: HTMLElement;
+  sel: HTMLElement;
+  selLen: HTMLElement;
+  clipLayer: HTMLElement;
+  time: HTMLElement;
+  playButton: HTMLElement;
+  range: HTMLElement;
+  clipButton: HTMLButtonElement;
+  rail: HTMLElement;
+  filters: HTMLElement;
+  syncLink: HTMLButtonElement;
+  syncPanel: HTMLElement;
+  eventList: HTMLElement;
   events: TimelineEvent[];
+  eventsLoaded: boolean;
   rounds: Round[];
   /** Clips taken during this match, as ranges of its file. */
   clips: MatchClip[];
-  clipLayer: HTMLElement | null;
   inMs: number | null;
   outMs: number | null;
+  offsetMs: number;
+  filter: Filter;
+  syncing: boolean;
+  /** The rows the list shows, in time order, with where each jumps to. */
+  rows: { ms: number; jump: number; el: HTMLElement }[];
+  current: HTMLElement | null;
+  lastPainted: number;
   frame: number;
   onKey: (e: KeyboardEvent) => void;
+  resize: ResizeObserver;
 }
 
 let view: View | null = null;
@@ -76,9 +153,11 @@ export function initMatches(): void {
   });
   // A clip saved, published or re-ranged moves its bar; a percentage only recolours it.
   on("clips", () => {
-    if (view?.clipLayer) void loadMatchClips(view);
+    if (view?.p) void loadMatchClips(view.p);
   });
-  on("progress", () => paintClips());
+  on("progress", () => {
+    if (view?.p) paintClips(view.p);
+  });
   onLanguage(() => {
     if (!parts) return;
     // The match on screen is keyed on its data, which the language does not touch.
@@ -266,11 +345,14 @@ function sessionNote(s: SessionRow): string {
 
 function matchTitle(m: MatchRow, index: number, s: SessionRow): string {
   if (!m.detected) {
+    // A background recording comes in parts, and the oldest go first, so a part is named by
+    // when it starts rather than by a number that shifts.
+    if (s.game === "other") return t("matches.partFrom", { time: fmtTimeOnly(m.started_at) });
     return s.matches.length > 1
       ? t("matches.recordingN", { n: index + 1 })
       : t("matches.wholeSession");
   }
-  const parts = [m.map, m.mode].filter(Boolean);
+  const parts = [mapLabel(m.map), modeLabel(m.mode)].filter(Boolean);
   return parts.length ? parts.join(" · ") : t("matches.matchN", { n: index + 1 });
 }
 
@@ -344,12 +426,19 @@ function renderMain(): void {
 
 function teardown(): void {
   if (!view) return;
-  cancelAnimationFrame(view.frame);
-  document.removeEventListener("keydown", view.onKey);
-  view.video?.pause();
-  view.video?.removeAttribute("src");
-  view.video?.load();
+  const p = view.p;
   view = null;
+  if (!p) return;
+  cancelAnimationFrame(p.frame);
+  document.removeEventListener("keydown", p.onKey);
+  p.resize.disconnect();
+  if (document.fullscreenElement && p.root.contains(document.fullscreenElement)) leaveFullscreen();
+  // Both are decoders holding a multi-gigabyte file open.
+  for (const video of [p.video, p.preview]) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
 }
 
 function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: string): void {
@@ -410,76 +499,15 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
   );
 
   const note = h("div", { class: "match-msg" });
-  const onKey = (e: KeyboardEvent) => handleKey(e);
 
   if (match.status !== "ready" || !match.path) {
-    view = {
-      key,
-      match,
-      video: null,
-      bar: null,
-      head: null,
-      sel: null,
-      range: null,
-      clipButton: null,
-      note,
-      events: [],
-      rounds: [],
-      clips: [],
-      clipLayer: null,
-      inMs: null,
-      outMs: null,
-      frame: 0,
-      onKey,
-    };
+    view = { key, match, note, p: null };
     fill(main, header, h("div", { class: "match-body scroll" }, statusPanel(session, match)));
     return;
   }
 
-  const video = h("video", {
-    controls: true,
-    preload: "metadata",
-    src: convertFileSrc(match.path),
-  }) as HTMLVideoElement;
-  const bar = h("div", { class: "tl-bar" });
-  // Its own lane along the bottom, so a clip never sits on top of a kill it contains.
-  const clipLayer = h("div", { class: "tl-clips" });
-  const sel = h("div", { class: "tl-sel", hidden: true });
-  const playhead = h("div", { class: "tl-head" });
-  const timeline = h("div", { class: "tl" }, bar, clipLayer, sel, playhead);
-  const range = h("span", { class: "range mono" });
-  const clipButton = h("button", {
-    type: "button",
-    class: "btn primary",
-    text: t("matches.makeClip"),
-    disabled: true,
-    onclick: () => void makeClip(),
-  }) as HTMLButtonElement;
-  const eventList = h("div", { class: "event-list" });
-
-  view = {
-    key,
-    match,
-    video,
-    bar,
-    head: playhead,
-    sel,
-    range,
-    clipButton,
-    note,
-    events: [],
-    rounds: [],
-    clips: [],
-    clipLayer,
-    inMs: null,
-    outMs: null,
-    frame: 0,
-    onKey,
-  };
-
-  wireTimeline(timeline);
-  void loadMatchClips(view);
-  document.addEventListener("keydown", onKey);
+  const p = buildPlayer(session, match, match.path, note);
+  view = { key, match, note, p };
 
   fill(
     main,
@@ -490,66 +518,233 @@ function build(main: HTMLElement, session: SessionRow, match: MatchRow, key: str
       h(
         "div",
         { class: "match-stage scroll" },
-        h("div", { class: "video" }, video),
-        timeline,
-        h("div", { class: "tl-scale mono" }, h("span", { text: "0:00" }), h("span", { text: fmtDuration(match.duration_ms ?? 0) })),
+        p.root,
         h(
           "div",
-          { class: "clip-row" },
-          h(
-            "button",
-            { type: "button", class: "btn small", onclick: () => setIn(), title: "I" },
-            t("matches.setIn"),
-            h("span", { class: "key mono", text: "I" }),
+          { class: "keys" },
+          ...(["play", "seek", "frame", "speed", "marks", "events", "fullscreen"] as const).map((k) =>
+            h("span", { text: t(`matches.keys.${k}`) }),
           ),
-          h(
-            "button",
-            { type: "button", class: "btn small", onclick: () => setOut(), title: "O" },
-            t("matches.setOut"),
-            h("span", { class: "key mono", text: "O" }),
-          ),
-          range,
-          h("span", { class: "grow" }),
-          h("button", {
-            type: "button",
-            class: "btn small",
-            text: t("matches.clear"),
-            onclick: () => setRange(null, null),
-          }),
-          clipButton,
         ),
-        note,
         h("span", { class: "hint", text: t("matches.hint") }),
       ),
-      h(
-        "aside",
-        { class: "match-rail scroll" },
-        h("span", { class: "section-label", text: t("matches.timeline") }),
-        eventList,
-      ),
+      p.rail,
     ),
   );
 
-  paintRange();
+  wireTimeline(p);
+  void loadMatchClips(p);
+  document.addEventListener("keydown", p.onKey);
+  p.resize.observe(p.timeline);
+  paintRange(p);
+  paintRuler(p);
+  paintSync(p);
   const tick = () => {
-    if (!view) return;
-    paintPlayhead();
-    view.frame = requestAnimationFrame(tick);
+    if (view?.p !== p) return;
+    paintPlayhead(p, false);
+    p.frame = requestAnimationFrame(tick);
   };
-  view.frame = requestAnimationFrame(tick);
+  p.frame = requestAnimationFrame(tick);
 
+  fill(p.eventList, h("span", { class: "muted", text: t("matches.readingTimeline") }));
   void ipc
     .matchEvents(match.id)
     .then((events) => {
-      if (view?.match.id !== match.id) return;
-      view.events = events;
-      view.rounds = roundsOf(events, match);
-      paintBar();
-      fill(eventList, ...eventRows(session, match));
+      if (view?.p !== p) return;
+      p.events = events;
+      p.eventsLoaded = true;
+      paintEvents(p);
     })
-    .catch((e) => fill(eventList, h("span", { class: "muted", text: ipc.errorText(e) })));
-  paintBar();
-  fill(eventList, h("span", { class: "muted", text: t("matches.readingTimeline") }));
+    .catch((e) => fill(p.eventList, h("span", { class: "muted", text: ipc.errorText(e) })));
+}
+
+function buildPlayer(session: SessionRow, match: MatchRow, path: string, note: HTMLElement): Player {
+  const src = convertFileSrc(path);
+  const video = h("video", { preload: "metadata", playsinline: true, src }) as HTMLVideoElement;
+  const preview = h("video", { preload: "metadata", muted: true, src }) as HTMLVideoElement;
+  const box = h("div", { class: "video" }, video);
+
+  const ruler = h("div", { class: "tl-ruler" });
+  const bar = h("div", { class: "tl-bar" });
+  const played = h("span", { class: "tl-played" });
+  // Its own lane along the bottom, so a clip never sits on top of a kill it contains.
+  const clipLayer = h("div", { class: "tl-clips" });
+  const selLen = h("span", { class: "tl-len mono" });
+  const sel = h(
+    "div",
+    { class: "tl-sel", hidden: true },
+    h("span", { class: "tl-grip in" }),
+    selLen,
+    h("span", { class: "tl-grip out" }),
+  );
+  const hover = h("div", { class: "tl-hover", hidden: true });
+  const head = h("div", { class: "tl-head" }, h("span", { class: "knob" }));
+  const timeline = h(
+    "div",
+    { class: "tl" },
+    ruler,
+    bar,
+    h("div", { class: "tl-track" }, played),
+    clipLayer,
+    sel,
+    hover,
+    head,
+  );
+  const tipAt = h("span", { class: "at mono" });
+  const tipWhat = h("span", { class: "what" });
+  const tip = h("div", { class: "tl-tip", hidden: true }, preview, tipAt, tipWhat);
+
+  const playButton = h("button", { type: "button", class: "play", text: "▶", title: t("transport.play") });
+  const time = h("span", { class: "time" });
+  const range = h("span", { class: "range mono" });
+  const clipButton = h("button", {
+    type: "button",
+    class: "btn primary",
+    text: t("matches.makeClip"),
+    disabled: true,
+    onclick: () => void makeClip(),
+  }) as HTMLButtonElement;
+
+  const root = h("div", { class: "match-player" });
+  const flash = flasher(box);
+  const syncLink = h("button", {
+    type: "button",
+    class: "link sync-link",
+    onclick: () => {
+      if (view?.p) setSyncing(view.p, !view.p.syncing);
+    },
+  }) as HTMLButtonElement;
+  const filters = h("div", { class: "filters" });
+  const syncPanel = h("div", { class: "sync-panel", hidden: true });
+  const eventList = h("div", { class: "event-list" });
+  const rail = h(
+    "aside",
+    { class: "match-rail scroll" },
+    h(
+      "div",
+      { class: "rail-head" },
+      h("span", { class: "section-label", text: t("matches.timeline") }),
+      h("span", { class: "grow" }),
+      syncLink,
+    ),
+    syncPanel,
+    filters,
+    eventList,
+  );
+
+  const p: Player = {
+    session,
+    match,
+    video,
+    preview,
+    previewWant: -1,
+    tr: { video, fps: null, flash, fullscreen: root, seek: (s) => seek(p, s * 1000) },
+    root,
+    timeline,
+    ruler,
+    bar,
+    played,
+    head,
+    hover,
+    tip,
+    tipAt,
+    tipWhat,
+    sel,
+    selLen,
+    clipLayer,
+    time,
+    playButton,
+    range,
+    clipButton,
+    rail,
+    filters,
+    syncLink,
+    syncPanel,
+    eventList,
+    events: [],
+    eventsLoaded: false,
+    rounds: [],
+    clips: [],
+    inMs: null,
+    outMs: null,
+    offsetMs: match.event_offset_ms ?? 0,
+    filter: "all",
+    syncing: false,
+    rows: [],
+    current: null,
+    lastPainted: -1,
+    frame: 0,
+    onKey: (e) => handleKey(e),
+    resize: new ResizeObserver(() => {
+      if (view?.p === p) paintRuler(p);
+    }),
+  };
+
+  clickToPlay(video, p.tr);
+  playButton.addEventListener("click", () => togglePlay(video));
+  video.addEventListener("error", () => {
+    if (!box.querySelector(".trouble")) box.append(h("div", { class: "trouble", text: t("player.errorLocal") }));
+  });
+  for (const event of ["play", "pause", "seeked", "durationchange"]) {
+    video.addEventListener(event, () => paintPlayhead(p, true));
+  }
+  // The hover frame seeks one position at a time; a pointer that moved on meanwhile is caught
+  // up when the seek lands, instead of queueing every position it passed.
+  const catchUp = () => {
+    if (p.previewWant >= 0 && Math.abs(preview.currentTime - p.previewWant) > 0.25) preview.currentTime = p.previewWant;
+  };
+  preview.addEventListener("seeked", catchUp);
+  preview.addEventListener("loadedmetadata", catchUp);
+
+  fill(
+    root,
+    box,
+    h("div", { class: "tl-wrap" }, timeline, tip),
+    h(
+      "div",
+      { class: "controls" },
+      playButton,
+      time,
+      frameStep(video, null),
+      h(
+        "span",
+        { class: "event-steps" },
+        h("button", { type: "button", text: "⏮", title: t("matches.prevEvent"), onclick: () => stepEvent(p, -1) }),
+        h("button", { type: "button", text: "⏭", title: t("matches.nextEvent"), onclick: () => stepEvent(p, 1) }),
+      ),
+      h("span", { class: "grow" }),
+      volume(video),
+      speedControl(video),
+      fullscreenButton(root),
+    ),
+    h(
+      "div",
+      { class: "clip-row" },
+      h(
+        "button",
+        { type: "button", class: "btn small", onclick: () => setIn(p), title: "I" },
+        t("matches.setIn"),
+        h("span", { class: "key mono", text: "I" }),
+      ),
+      h(
+        "button",
+        { type: "button", class: "btn small", onclick: () => setOut(p), title: "O" },
+        t("matches.setOut"),
+        h("span", { class: "key mono", text: "O" }),
+      ),
+      range,
+      h("span", { class: "grow" }),
+      h("button", {
+        type: "button",
+        class: "btn small",
+        text: t("matches.clear"),
+        onclick: () => setRange(p, null, null),
+      }),
+      clipButton,
+    ),
+    note,
+  );
+  return p;
 }
 
 function statusPanel(session: SessionRow, match: MatchRow): HTMLElement {
@@ -576,56 +771,144 @@ function statusPanel(session: SessionRow, match: MatchRow): HTMLElement {
 // ---------------------------------------------------------------------------
 // Timeline
 
-function offset(match: MatchRow, at: string): number {
-  if (!match.file_start_at) return 0;
-  return Date.parse(at) - Date.parse(match.file_start_at);
+/** Where an event is in the match file, in milliseconds. */
+function eventMs(p: Player, at: string): number {
+  if (!p.match.file_start_at) return p.offsetMs;
+  return Date.parse(at) - Date.parse(p.match.file_start_at) + p.offsetMs;
 }
 
-function roundsOf(events: TimelineEvent[], match: MatchRow): Round[] {
+function roundsOf(p: Player): Round[] {
   const rounds: Round[] = [];
-  const begin = events.find((e) => e.kind === "match_start");
-  let start = begin ? offset(match, begin.at) : 0;
-  for (const e of events) {
+  const begin = p.events.find((e) => e.kind === "match_start");
+  let start = begin ? eventMs(p, begin.at) : 0;
+  for (const e of p.events) {
     if (e.kind !== "round_end") continue;
-    const end = offset(match, e.at);
+    const end = eventMs(p, e.at);
     rounds.push({ n: e.round, start, end, won: e.won, ally: e.ally, enemy: e.enemy });
     start = end;
   }
   return rounds;
 }
 
-function duration(): number {
-  return Math.max(1, view?.match.duration_ms ?? 1);
+function duration(p: Player): number {
+  const fromFile = Number.isFinite(p.video.duration) ? p.video.duration * 1000 : 0;
+  return Math.max(1, p.match.duration_ms ?? fromFile);
 }
 
-function pct(ms: number): string {
-  return `${(Math.min(Math.max(ms / duration(), 0), 1) * 100).toFixed(3)}%`;
+function pct(p: Player, ms: number): string {
+  return `${(Math.min(Math.max(ms / duration(p), 0), 1) * 100).toFixed(3)}%`;
 }
 
-function paintBar(): void {
-  if (!view?.bar) return;
-  const nodes: HTMLElement[] = view.rounds.map((r) =>
+function filterOf(e: TimelineEvent): Filter | null {
+  switch (e.kind) {
+    case "kill":
+    case "multikill":
+      return "kill";
+    case "death":
+    case "assist":
+    case "objective":
+    case "marker":
+      return e.kind;
+    case "round_end":
+      return "round";
+    default:
+      return null;
+  }
+}
+
+function shown(p: Player, e: TimelineEvent): boolean {
+  const f = filterOf(e);
+  return p.filter === "all" || f === null || f === p.filter;
+}
+
+/** The marker class an event draws with, on the timeline and beside its row alike. */
+function markOf(e: TimelineEvent): string {
+  switch (e.kind) {
+    case "objective":
+      return `objective${e.ours === true ? " ours" : e.ours === false ? " theirs" : ""}`;
+    case "round_end":
+      return `round${e.won === true ? " won" : e.won === false ? " lost" : ""}`;
+    case "match_start":
+    case "match_end":
+      return "edge";
+    default:
+      return e.kind;
+  }
+}
+
+/** Where selecting an event jumps to. */
+function jumpOf(p: Player, e: TimelineEvent): number {
+  if (e.kind === "round_end") {
+    const round = p.rounds.find((r) => r.n === e.round);
+    if (round) return round.start;
+  }
+  const at = eventMs(p, e.at);
+  return e.kind === "match_start" || e.kind === "match_end" ? at : at - JUMP_LEAD_MS;
+}
+
+/** Everything the offset moves: the rounds, the markers, the list. */
+function paintEvents(p: Player): void {
+  p.rounds = roundsOf(p);
+  paintBar(p);
+  paintFilters(p);
+  paintList(p);
+  paintSync(p);
+}
+
+function paintBar(p: Player): void {
+  const nodes: HTMLElement[] = p.rounds.map((r) =>
     h("span", {
-      class: `tl-round ${r.won === true ? "won" : r.won === false ? "lost" : ""}`,
-      style: `left:${pct(r.start)};width:calc(${pct(r.end)} - ${pct(r.start)})`,
-      title: t("matches.roundTitle", { n: r.n, ally: r.ally, enemy: r.enemy }),
+      class: `tl-round ${r.won === true ? "won" : r.won === false ? "lost" : ""}${p.filter === "all" || p.filter === "round" ? "" : " dim"}`,
+      style: `left:${pct(p, r.start)};width:calc(${pct(p, r.end)} - ${pct(p, r.start)})`,
     }),
   );
-  for (const e of view.events) {
-    const at = offset(view.match, e.at);
-    if (e.kind === "match_start" || e.kind === "match_end") {
-      nodes.push(h("span", { class: "tl-edge", style: `left:${pct(at)}`, title: eventLabel(e) }));
-    } else if (e.kind !== "round_end") {
-      const side = e.kind === "objective" ? (e.ours === true ? " ours" : e.ours === false ? " theirs" : "") : "";
-      nodes.push(h("span", { class: `tl-dot ${e.kind}${side}`, style: `left:${pct(at)}`, title: eventLabel(e) }));
-    }
+  for (const e of p.events) {
+    if (e.kind === "round_end") continue;
+    const dim = shown(p, e) ? "" : " dim";
+    nodes.push(h("span", { class: `mk ${markOf(e)}${dim}`, style: `left:${pct(p, eventMs(p, e.at))}` }));
   }
-  fill(view.bar, ...nodes);
+  fill(p.bar, ...nodes);
 }
 
-function paintPlayhead(): void {
-  if (!view?.video || !view.head) return;
-  view.head.style.left = pct(view.video.currentTime * 1000);
+function paintRuler(p: Player): void {
+  const width = p.timeline.clientWidth;
+  const secs = duration(p) / 1000;
+  if (!width || secs <= 1) return;
+  const step = TICK_STEPS_S.find((s) => (s / secs) * width >= TICK_MIN_PX) ?? TICK_STEPS_S[TICK_STEPS_S.length - 1];
+  const nodes: HTMLElement[] = [];
+  // The last label stays off the right edge, where it would be cut in half.
+  for (let s = step; s < secs - step * 0.4; s += step) {
+    nodes.push(h("span", { class: "tl-tick", style: `left:${pct(p, s * 1000)}` }, h("i", { text: fmtClock(s) })));
+  }
+  fill(p.ruler, ...nodes);
+}
+
+function paintPlayhead(p: Player, force: boolean): void {
+  const ms = Math.round(p.video.currentTime * 1000);
+  if (!force && ms === p.lastPainted) return;
+  p.lastPainted = ms;
+  const at = pct(p, ms);
+  p.head.style.left = at;
+  p.played.style.width = at;
+  fill(p.time, fmtClock(p.video.currentTime), h("span", { class: "total", text: ` / ${fmtDuration(duration(p))}` }));
+  p.playButton.textContent = p.video.paused ? "▶" : "❚❚";
+  p.playButton.title = p.video.paused ? t("transport.play") : t("transport.pause");
+  paintCurrent(p, ms);
+}
+
+/** Marks the row of the last moment the playhead passed, and keeps it in view while playing
+ *  unless the pointer is over the list. */
+function paintCurrent(p: Player, ms: number): void {
+  let pick: HTMLElement | null = null;
+  for (const row of p.rows) {
+    if (row.ms > ms + 250) break;
+    pick = row.el;
+  }
+  if (pick === p.current) return;
+  p.current?.removeAttribute("aria-current");
+  pick?.setAttribute("aria-current", "true");
+  p.current = pick;
+  if (pick && !p.video.paused && !p.rail.matches(":hover")) pick.scrollIntoView({ block: "nearest" });
 }
 
 /** Loads the clips taken during the match on screen. A burst of clip changes collapses into
@@ -633,39 +916,38 @@ function paintPlayhead(): void {
 let clipsLoading = false;
 let clipsAgain = false;
 
-async function loadMatchClips(v: View): Promise<void> {
+async function loadMatchClips(p: Player): Promise<void> {
   if (clipsLoading) {
     clipsAgain = true;
     return;
   }
   clipsLoading = true;
   try {
-    const clips = await ipc.clipsForMatch(v.match.id);
-    if (view !== v) return;
-    v.clips = clips;
-    paintClips();
+    const clips = await ipc.clipsForMatch(p.match.id);
+    if (view?.p !== p) return;
+    p.clips = clips;
+    paintClips(p);
     if (pendingClip !== null && clips.some((c) => c.clip_id === pendingClip)) {
-      selectClip(pendingClip);
+      selectClip(p, pendingClip);
       pendingClip = null;
     }
   } catch (e) {
-    console.warn("clips for match", v.match.id, e);
+    console.warn("clips for match", p.match.id, e);
   } finally {
     clipsLoading = false;
-    if (clipsAgain && view) {
+    if (clipsAgain && view?.p) {
       clipsAgain = false;
-      void loadMatchClips(view);
+      void loadMatchClips(view.p);
     }
   }
 }
 
 /** Each clip as a bar in the bottom lane, coloured like its status circle in the library. */
-function paintClips(): void {
-  if (!view?.clipLayer) return;
+function paintClips(p: Player): void {
   const byId = new Map(data.clips.map((c) => [c.id, c]));
   fill(
-    view.clipLayer,
-    ...view.clips.map((mc) => {
+    p.clipLayer,
+    ...p.clips.map((mc) => {
       const row = byId.get(mc.clip_id);
       const badge = row ? badgeFor(row, data.progress.get(row.id), data.status, data.settings) : null;
       const kind = badge?.circle ?? (mc.published ? "published" : "local");
@@ -673,27 +955,28 @@ function paintClips(): void {
         type: "button",
         class: `tl-clip ${kind}`,
         "data-clip": mc.clip_id,
-        style: `left:${pct(mc.start_ms)};width:calc(${pct(mc.end_ms)} - ${pct(mc.start_ms)})`,
+        style: `left:${pct(p, mc.start_ms)};width:calc(${pct(p, mc.end_ms)} - ${pct(p, mc.start_ms)})`,
         title: t("matches.clipTitle", {
           status: badge?.label ?? "",
           in: fmtPrecise(mc.start_ms),
           out: fmtPrecise(mc.end_ms),
         }),
-        onclick: () => selectClip(mc.clip_id),
+        onclick: () => selectClip(p, mc.clip_id),
       });
     }),
   );
 }
 
 /** Selects a clip's range, puts the playhead at its start and offers the clip itself. */
-function selectClip(clipId: number): void {
-  const mc = view?.clips.find((c) => c.clip_id === clipId);
-  if (!view || !mc || !view.note) return;
-  setRange(mc.start_ms, mc.end_ms);
-  seek(mc.start_ms);
-  view.note.className = "match-msg ok";
+function selectClip(p: Player, clipId: number): void {
+  const mc = p.clips.find((c) => c.clip_id === clipId);
+  const note = view?.note;
+  if (!mc || !note) return;
+  setRange(p, mc.start_ms, mc.end_ms);
+  seek(p, mc.start_ms);
+  note.className = "match-msg ok";
   fill(
-    view.note,
+    note,
     t("matches.clipSelected", { length: fmtLength(mc.end_ms - mc.start_ms) }),
     h("button", {
       type: "button",
@@ -704,176 +987,336 @@ function selectClip(clipId: number): void {
   );
 }
 
-function wireTimeline(timeline: HTMLElement): void {
-  const msAt = (e: PointerEvent) => {
+/** The markers within grabbing distance of a pointer, nearest first. */
+function eventsNear(p: Player, clientX: number): TimelineEvent[] {
+  const box = p.timeline.getBoundingClientRect();
+  if (!box.width) return [];
+  const x = clientX - box.left;
+  const px = (e: TimelineEvent) => (eventMs(p, e.at) / duration(p)) * box.width;
+  return p.events
+    .filter((e) => e.kind !== "round_end" && shown(p, e) && Math.abs(px(e) - x) <= GRAB_PX)
+    .sort((a, b) => Math.abs(px(a) - x) - Math.abs(px(b) - x));
+}
+
+type Grab = "in" | "out" | "head" | null;
+
+/** What a press at `clientX` takes hold of: a range edge, the playhead, or nothing. */
+function grabAt(p: Player, clientX: number): Grab {
+  const box = p.timeline.getBoundingClientRect();
+  if (!box.width) return null;
+  const x = clientX - box.left;
+  const near = (ms: number | null) => ms !== null && Math.abs((ms / duration(p)) * box.width - x) <= GRAB_PX;
+  if (p.inMs !== null && p.outMs !== null) {
+    if (near(p.outMs)) return "out";
+    if (near(p.inMs)) return "in";
+  }
+  return near(p.video.currentTime * 1000) ? "head" : null;
+}
+
+function wireTimeline(p: Player): void {
+  const { timeline } = p;
+  const msAt = (clientX: number) => {
     const box = timeline.getBoundingClientRect();
-    return Math.round(Math.min(Math.max((e.clientX - box.left) / box.width, 0), 1) * duration());
+    return Math.round(Math.min(Math.max((clientX - box.left) / box.width, 0), 1) * duration(p));
   };
+  const inLane = (clientY: number) => clientY - timeline.getBoundingClientRect().top < LANE_BOTTOM_PX;
+  let pressed = false;
+
+  timeline.addEventListener("pointermove", (e) => {
+    showHover(p, e.clientX, !pressed && inLane(e.clientY));
+    if (pressed) return;
+    const grab = grabAt(p, e.clientX);
+    timeline.style.cursor =
+      grab === "in" || grab === "out"
+        ? "ew-resize"
+        : grab === "head"
+          ? "grab"
+          : inLane(e.clientY) && eventsNear(p, e.clientX).length
+            ? "pointer"
+            : "";
+  });
+  timeline.addEventListener("pointerleave", () => {
+    if (!pressed) hideHover(p);
+  });
+
   timeline.addEventListener("pointerdown", (down) => {
-    if (!view?.video) return;
+    if (down.button !== 0) return;
     // A clip bar is a button of its own; its click selects it.
     if ((down.target as HTMLElement).closest(".tl-clip")) return;
     down.preventDefault();
     timeline.setPointerCapture(down.pointerId);
+    pressed = true;
+    const grab = grabAt(p, down.clientX);
     const startX = down.clientX;
-    const anchor = msAt(down);
+    const anchor = msAt(down.clientX);
     let dragging = false;
     const move = (e: PointerEvent) => {
       if (!dragging && Math.abs(e.clientX - startX) < DRAG_PX) return;
       dragging = true;
-      const at = msAt(e);
-      setRange(Math.min(anchor, at), Math.max(anchor, at));
+      const at = msAt(e.clientX);
+      if (grab === "head") {
+        seek(p, at);
+      } else if (grab === "in" && p.outMs !== null) {
+        const edge = Math.min(at, p.outMs - MIN_CLIP_MS);
+        setRange(p, Math.max(0, edge), p.outMs);
+        seek(p, edge);
+      } else if (grab === "out" && p.inMs !== null) {
+        const edge = Math.max(at, p.inMs + MIN_CLIP_MS);
+        setRange(p, p.inMs, Math.min(duration(p), edge));
+        seek(p, edge);
+      } else {
+        setRange(p, Math.min(anchor, at), Math.max(anchor, at));
+      }
     };
     const up = (e: PointerEvent) => {
       timeline.removeEventListener("pointermove", move);
       timeline.removeEventListener("pointerup", up);
-      if (!dragging) seek(msAt(e));
+      timeline.removeEventListener("pointercancel", up);
+      pressed = false;
+      if (dragging || e.type === "pointercancel") return;
+      const near = inLane(e.clientY) ? eventsNear(p, e.clientX)[0] : undefined;
+      seek(p, near ? jumpOf(p, near) : msAt(e.clientX));
     };
     timeline.addEventListener("pointermove", move);
     timeline.addEventListener("pointerup", up);
+    timeline.addEventListener("pointercancel", up);
   });
 }
 
-function seek(ms: number): void {
-  if (!view?.video) return;
-  view.video.currentTime = Math.min(Math.max(ms, 0), duration()) / 1000;
-  paintPlayhead();
+/** The hover line and the tip above it: the frame there, its time, and what happened. */
+function showHover(p: Player, clientX: number, snap: boolean): void {
+  const box = p.timeline.getBoundingClientRect();
+  if (!box.width) return;
+  const near = snap ? eventsNear(p, clientX) : [];
+  const ms = near.length
+    ? eventMs(p, near[0].at)
+    : Math.round(Math.min(Math.max((clientX - box.left) / box.width, 0), 1) * duration(p));
+  p.hover.hidden = false;
+  p.hover.style.left = pct(p, ms);
+  p.tip.hidden = false;
+  // Kept inside the timeline's width so it never runs off the stage.
+  const half = p.tip.offsetWidth / 2;
+  const x = (ms / duration(p)) * box.width;
+  p.tip.style.left = `${Math.min(Math.max(x, half), box.width - half)}px`;
+  p.tipAt.textContent = fmtPrecise(ms);
+  fill(
+    p.tipWhat,
+    ...near.slice(0, 3).map((e) => h("span", null, h("i", { class: `mk ${markOf(e)}` }), eventLabel(e))),
+  );
+  p.previewWant = ms / 1000;
+  if (!p.preview.seeking && p.preview.readyState >= 1 && Math.abs(p.preview.currentTime - p.previewWant) > 0.25) {
+    p.preview.currentTime = p.previewWant;
+  }
 }
 
-function nowMs(): number {
-  return Math.round((view?.video?.currentTime ?? 0) * 1000);
+function hideHover(p: Player): void {
+  p.hover.hidden = true;
+  p.tip.hidden = true;
+  p.timeline.style.cursor = "";
 }
 
-function setIn(): void {
-  if (!view) return;
-  const at = nowMs();
-  setRange(at, view.outMs !== null && view.outMs > at ? view.outMs : null);
+function seek(p: Player, ms: number): void {
+  p.video.currentTime = Math.min(Math.max(ms, 0), duration(p)) / 1000;
+  paintPlayhead(p, true);
 }
 
-function setOut(): void {
-  if (!view) return;
-  const at = nowMs();
-  setRange(view.inMs !== null && view.inMs < at ? view.inMs : 0, at);
+function nowMs(p: Player): number {
+  return Math.round(p.video.currentTime * 1000);
 }
 
-function setRange(inMs: number | null, outMs: number | null): void {
-  if (!view) return;
-  view.inMs = inMs;
-  view.outMs = outMs;
-  paintRange();
+/** Jumps to the next or previous moment the list shows. */
+function stepEvent(p: Player, direction: 1 | -1): void {
+  const now = nowMs(p);
+  const jumps = p.rows.map((r) => r.jump).sort((a, b) => a - b);
+  const target =
+    direction > 0
+      ? jumps.find((j) => j > now + 100)
+      : [...jumps].reverse().find((j) => j < now - PREV_SLACK_MS);
+  if (target === undefined) return;
+  seek(p, target);
 }
 
-function paintRange(): void {
-  if (!view?.sel || !view.range || !view.clipButton) return;
-  const { inMs, outMs } = view;
+function setIn(p: Player): void {
+  const at = nowMs(p);
+  setRange(p, at, p.outMs !== null && p.outMs > at ? p.outMs : null);
+}
+
+function setOut(p: Player): void {
+  const at = nowMs(p);
+  setRange(p, p.inMs !== null && p.inMs < at ? p.inMs : 0, at);
+}
+
+function setRange(p: Player, inMs: number | null, outMs: number | null): void {
+  p.inMs = inMs;
+  p.outMs = outMs;
+  paintRange(p);
+}
+
+function paintRange(p: Player): void {
+  const { inMs, outMs } = p;
   const complete = inMs !== null && outMs !== null;
-  view.sel.hidden = !complete && inMs === null;
+  p.sel.hidden = inMs === null;
   if (inMs !== null) {
     const end = outMs ?? inMs;
-    view.sel.style.left = pct(inMs);
-    view.sel.style.width = `calc(${pct(end)} - ${pct(inMs)})`;
-    view.sel.classList.toggle("open", outMs === null);
+    p.sel.style.left = pct(p, inMs);
+    p.sel.style.width = `calc(${pct(p, end)} - ${pct(p, inMs)})`;
+    p.sel.classList.toggle("open", outMs === null);
+    p.selLen.textContent = complete ? fmtLength(outMs - inMs) : "";
   }
-  view.range.textContent = complete
+  p.range.textContent = complete
     ? `${fmtPrecise(inMs)} → ${fmtPrecise(outMs)} · ${fmtLength(outMs - inMs)}`
     : inMs !== null
       ? t("matches.rangeOpen", { in: fmtPrecise(inMs) })
       : t("matches.rangeNone");
-  view.clipButton.disabled = !complete || outMs - inMs < MIN_CLIP_MS;
+  p.clipButton.disabled = !complete || outMs - inMs < MIN_CLIP_MS;
 }
 
 function handleKey(e: KeyboardEvent): void {
-  const target = e.target as HTMLElement | null;
-  if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
-  if (e.ctrlKey || e.altKey || e.metaKey) return;
-  const key = e.key.toLowerCase();
-  if (key === "i") {
+  const p = view?.p;
+  if (!p || typing(e)) return;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
     e.preventDefault();
-    setIn();
-  } else if (key === "o") {
-    e.preventDefault();
-    setOut();
+    stepEvent(p, e.key === "ArrowRight" ? 1 : -1);
+    return;
   }
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  switch (e.key) {
+    case "i":
+    case "I":
+      setIn(p);
+      break;
+    case "o":
+    case "O":
+      setOut(p);
+      break;
+    case "Escape":
+      // Fullscreen is the webview's to leave.
+      if (document.fullscreenElement) return;
+      if (p.syncing) setSyncing(p, false);
+      else if (p.inMs !== null) setRange(p, null, null);
+      else return;
+      break;
+    default:
+      transportKey(e, p.tr);
+      return;
+  }
+  e.preventDefault();
 }
 
 // ---------------------------------------------------------------------------
 // Event list
 
-function eventRows(session: SessionRow, match: MatchRow): HTMLElement[] {
-  if (!view) return [];
-  if (!view.events.length) {
-    return [
+function paintFilters(p: Player): void {
+  const counts = new Map<Filter, number>();
+  for (const e of p.events) {
+    const f = filterOf(e);
+    if (f) counts.set(f, (counts.get(f) ?? 0) + 1);
+  }
+  // One kind of event needs no filter.
+  if (counts.size < 2) {
+    p.filter = "all";
+    fill(p.filters);
+    return;
+  }
+  if (p.filter !== "all" && !counts.has(p.filter)) p.filter = "all";
+  fill(
+    p.filters,
+    ...FILTERS.filter((f) => f === "all" || counts.has(f)).map((f) =>
+      h(
+        "button",
+        {
+          type: "button",
+          class: "chip",
+          "aria-pressed": String(p.filter === f),
+          onclick: () => {
+            p.filter = f;
+            paintBar(p);
+            paintFilters(p);
+            paintList(p);
+          },
+        },
+        t(`matches.filter.${f}`),
+        f === "all" ? null : h("span", { class: "count", text: String(counts.get(f) ?? 0) }),
+      ),
+    ),
+  );
+}
+
+function paintList(p: Player): void {
+  p.rows = [];
+  p.current = null;
+  if (!p.events.length) {
+    fill(
+      p.eventList,
       h("span", {
         class: "muted",
-        text: match.detected
+        text: p.match.detected
           ? t("matches.nothingElse")
-          : t("matches.undetected", { reason: undetectedReason(session) }),
+          : t("matches.undetected", { reason: undetectedReason(p.session) }),
       }),
-    ];
+    );
+    return;
   }
-  const rounds = new Map(view.rounds.map((r) => [r.n, r]));
-  return view.events.map((e) => {
-    const at = offset(match, e.at);
+  const rounds = new Map(p.rounds.map((r) => [r.n, r]));
+  const nodes: HTMLElement[] = [];
+  for (const e of p.events) {
+    if (!shown(p, e)) continue;
+    const at = eventMs(p, e.at);
     const round = e.kind === "round_end" ? rounds.get(e.round) : undefined;
-    const tone = toneOf(e);
     // A round selects itself; a moment selects the fight around it.
     const range: [number, number] | null = round
       ? [round.start, round.end + ROUND_TAIL_MS]
       : e.kind === "match_start" || e.kind === "match_end"
         ? null
-        : [at - (e.kind === "multikill" ? MULTIKILL_BEFORE_MS : MOMENT_BEFORE_MS), at + MOMENT_AFTER_MS];
-    return h(
+        : e.kind === "marker"
+          ? [at - MARKER_BEFORE_MS, at + MARKER_AFTER_MS]
+          : [at - (e.kind === "multikill" ? MULTIKILL_BEFORE_MS : MOMENT_BEFORE_MS), at + MOMENT_AFTER_MS];
+    const jump = jumpOf(p, e);
+    const [what, detail] = eventParts(e);
+    let action: HTMLElement | null = null;
+    if (p.syncing) {
+      action = h("button", {
+        type: "button",
+        class: "btn small here",
+        text: t("matches.sync.here"),
+        title: t("matches.sync.hereTitle"),
+        onclick: () => void setOffset(p, p.offsetMs + nowMs(p) - at),
+      });
+    } else if (range) {
+      action = h("button", {
+        type: "button",
+        class: "pick",
+        text: "✂",
+        title: round ? t("matches.selectRound") : t("matches.selectMoment"),
+        onclick: () => {
+          const from = Math.max(0, range[0]);
+          setRange(p, from, Math.min(duration(p), range[1]));
+          seek(p, from);
+        },
+      });
+    }
+    const row = h(
       "div",
-      { class: `event ${e.kind} ${tone}`.trim() },
+      { class: `event ${e.kind}` },
       h(
         "button",
-        {
-          type: "button",
-          class: "jump",
-          title: t("matches.jumpHere"),
-          onclick: () => seek(round ? round.start : at),
-        },
+        { type: "button", class: "jump", title: t("matches.jumpHere"), onclick: () => seek(p, jump) },
         h("span", { class: "at mono", text: fmtDuration(Math.max(0, at)) }),
-        h("span", { class: "what", text: eventLabel(e) }),
+        h("span", { class: `mk ${markOf(e)}` }),
+        h("span", { class: "what" }, what, detail ? h("span", { class: "detail", text: detail }) : null),
       ),
-      range
-        ? h("button", {
-            type: "button",
-            class: "btn small",
-            text: t("matches.select"),
-            title: round ? t("matches.selectRound") : t("matches.selectMoment"),
-            onclick: () => {
-              const from = Math.max(0, range[0]);
-              setRange(from, Math.min(duration(), range[1]));
-              seek(from);
-            },
-          })
-        : null,
+      action,
     );
-  });
-}
-
-/** The edge colour of a row: green for what went the player's way, red for what did not. */
-function toneOf(e: TimelineEvent): "won" | "lost" | "" {
-  const good = (yes: boolean | null) => (yes === true ? "won" : yes === false ? "lost" : "");
-  switch (e.kind) {
-    case "round_end":
-      return good(e.won);
-    case "match_end":
-      return good(e.result === "win" ? true : e.result === "loss" ? false : null);
-    case "objective":
-      return good(e.ours);
-    case "kill":
-    case "multikill":
-      return "won";
-    case "death":
-      return "lost";
-    default:
-      return "";
+    nodes.push(row);
+    p.rows.push({ ms: round ? round.start : at, jump, el: row });
   }
+  p.rows.sort((a, b) => a.ms - b.ms);
+  fill(p.eventList, ...(nodes.length ? nodes : [h("span", { class: "muted", text: t("matches.filter.none") })]));
+  paintPlayhead(p, true);
 }
 
-/** Why a recording carries no matches. Valorant and League have providers (`providers/mod.rs`). */
+/** Why a recording carries no matches. Valorant, League and Counter-Strike have providers
+ *  (`providers/mod.rs`). */
 function undetectedReason(session: SessionRow): string {
   if (session.game === "valorant") {
     return session.provider_reached ? t("matches.noMatchReported") : t("matches.statusUnreadable");
@@ -881,13 +1324,25 @@ function undetectedReason(session: SessionRow): string {
   if (session.game === "league") {
     return session.provider_reached ? t("matches.leagueNoMatchReported") : t("matches.leagueUnavailable");
   }
+  if (session.game === "counter_strike") {
+    return session.provider_reached ? t("matches.csNoMatchReported") : t("matches.csUnavailable");
+  }
+  if (session.game === "other") {
+    return t("matches.backgroundRecording", { hours: data.settings?.other_games_hours ?? 2 });
+  }
   return t("matches.noDetection", { game: session.game_name });
 }
 
 function eventLabel(e: TimelineEvent): string {
+  return eventParts(e).filter(Boolean).join(" · ");
+}
+
+/** What happened, and the detail that goes after it in quieter type: who, which side, how. */
+function eventParts(e: TimelineEvent): [string, string | null] {
+  const rest = (...bits: (string | null | undefined | false)[]) => bits.filter(Boolean).join(" · ") || null;
   switch (e.kind) {
     case "match_start":
-      return [t("matches.event.matchStart"), e.map, e.mode].filter(Boolean).join(" · ");
+      return [t("matches.event.matchStart"), rest(mapLabel(e.map), modeLabel(e.mode))];
     case "round_end": {
       const verdict =
         e.won === true
@@ -895,12 +1350,7 @@ function eventLabel(e: TimelineEvent): string {
           : e.won === false
             ? t("matches.event.lost")
             : t("matches.event.decided");
-      return t("matches.event.round", {
-        n: e.round,
-        verdict,
-        ally: e.ally,
-        enemy: e.enemy,
-      });
+      return [t("matches.event.round", { n: e.round, verdict, ally: e.ally, enemy: e.enemy }), null];
     }
     case "match_end": {
       const result = e.result ? t(`matches.result.${e.result}`) : null;
@@ -913,25 +1363,23 @@ function eventLabel(e: TimelineEvent): string {
               ? t("matches.event.reasonSuperseded")
               : null;
       const scoreText = e.ally !== null && e.enemy !== null ? `${e.ally}–${e.enemy}` : null;
-      return [t("matches.event.matchEnd"), result, scoreText, why].filter(Boolean).join(" · ");
+      return [t("matches.event.matchEnd"), rest(result, scoreText, why)];
     }
     case "kill":
-      return [t("matches.event.kill"), e.victim, e.weapon, e.headshot ? t("matches.event.headshot") : null]
-        .filter(Boolean)
-        .join(" · ");
+      return [t("matches.event.kill"), rest(unitLabel(e.victim), e.weapon, e.headshot && t("matches.event.headshot"))];
     case "death":
-      return [t("matches.event.death"), e.killer, e.weapon].filter(Boolean).join(" · ");
+      return [t("matches.event.death"), rest(unitLabel(e.killer), e.weapon)];
     case "assist":
-      return [t("matches.event.assist"), e.victim].filter(Boolean).join(" · ");
+      return [t("matches.event.assist"), rest(unitLabel(e.victim))];
     case "multikill":
-      return multikillLabel(e.count);
+      return [multikillLabel(e.count), null];
     case "objective":
       return [
-        e.name,
-        e.ours === true ? t("matches.event.yourTeam") : e.ours === false ? t("matches.event.enemyTeam") : null,
-      ]
-        .filter(Boolean)
-        .join(" · ");
+        objectiveLabel(e.name),
+        rest(e.ours === true ? t("matches.event.yourTeam") : e.ours === false ? t("matches.event.enemyTeam") : null),
+      ];
+    case "marker":
+      return [t("matches.event.marker"), null];
   }
 }
 
@@ -951,11 +1399,80 @@ function multikillLabel(count: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Sync: moving every event on a match by the same amount
+
+function setSyncing(p: Player, on: boolean): void {
+  p.syncing = on;
+  paintSync(p);
+  paintList(p);
+}
+
+function paintSync(p: Player): void {
+  const offset = p.offsetMs ? t("matches.sync.shifted", { offset: fmtOffset(p.offsetMs) }) : null;
+  p.syncLink.hidden = !p.eventsLoaded || !p.events.length || !p.match.file_start_at;
+  p.syncLink.textContent = p.syncing ? t("matches.sync.done") : offset ? `${offset} · ${t("matches.sync.open")}` : t("matches.sync.open");
+  p.syncPanel.hidden = !p.syncing;
+  if (!p.syncing) return;
+  const nudge = (by: number) =>
+    h("button", {
+      type: "button",
+      class: "btn small",
+      text: `${by < 0 ? "−" : "+"}${Math.abs(by) / 1000} s`,
+      onclick: () => void setOffset(p, p.offsetMs + by),
+    });
+  fill(
+    p.syncPanel,
+    h("span", { class: "help", text: t("matches.sync.help") }),
+    h(
+      "div",
+      { class: "sync-row" },
+      nudge(-NUDGE_MS),
+      h("span", { class: "offset mono", text: fmtOffset(p.offsetMs) }),
+      nudge(NUDGE_MS),
+      h("span", { class: "grow" }),
+      h("button", {
+        type: "button",
+        class: "btn small",
+        text: t("matches.sync.reset"),
+        disabled: p.offsetMs === 0,
+        onclick: () => void setOffset(p, 0),
+      }),
+    ),
+  );
+}
+
+async function setOffset(p: Player, ms: number): Promise<void> {
+  const next = Math.round(Math.min(Math.max(ms, -MAX_OFFSET_MS), MAX_OFFSET_MS));
+  const before = p.offsetMs;
+  if (next === before) return;
+  p.offsetMs = next;
+  paintEvents(p);
+  try {
+    // Rust announces the change, which reloads the sessions; the view is keyed so it stays.
+    await ipc.setMatchEventOffset(p.match.id, next);
+  } catch (e) {
+    if (view?.p !== p || p.offsetMs !== next) return;
+    p.offsetMs = before;
+    paintEvents(p);
+    if (view.note) {
+      view.note.className = "match-msg err";
+      fill(view.note, t("matches.sync.failed", { error: ipc.errorText(e) }));
+    }
+  }
+}
+
+function fmtOffset(ms: number): string {
+  return `${ms < 0 ? "−" : "+"}${fmtDecimal(Math.abs(ms) / 1000, 1)} s`;
+}
+
+// ---------------------------------------------------------------------------
 // Actions
 
 async function makeClip(): Promise<void> {
-  if (!view?.clipButton || !view.note) return;
-  const { inMs, outMs, match, note, clipButton } = view;
+  const p = view?.p;
+  const note = view?.note;
+  if (!p || !note) return;
+  const { inMs, outMs, match, clipButton } = p;
   if (inMs === null || outMs === null) return;
   clipButton.disabled = true;
   note.className = "match-msg";
@@ -980,7 +1497,7 @@ async function makeClip(): Promise<void> {
     note.className = "match-msg err";
     fill(note, ipc.errorText(e));
   } finally {
-    if (view?.note === note) paintRange();
+    if (view?.p === p) paintRange(p);
   }
 }
 
@@ -1021,5 +1538,5 @@ function fmtPrecise(ms: number): string {
 }
 
 function fmtLength(ms: number): string {
-  return ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : fmtDuration(ms);
+  return ms < 60_000 ? `${fmtDecimal(ms / 1000, 1)} s` : fmtDuration(ms);
 }

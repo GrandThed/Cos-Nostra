@@ -6,11 +6,21 @@
 //! towers, the end of the game). It is Riot's documented API for exactly this, needs no login,
 //! and answers only while a match is loaded, so reaching it at all means a match is on.
 //!
-//! Events carry `EventTime`, seconds on the game clock. The clock's zero in wall-clock time is
-//! `now - gameTime` at any poll; the smallest such value seen is the least delayed, and every
-//! event is placed at that zero plus its game time. That also works when the app starts in
-//! the middle of a match: the events so far arrive on the first poll at the times they
-//! happened.
+//! Events carry `EventTime`, seconds on the game clock, and every event is placed at the
+//! clock's zero in wall-clock time plus its game time. That zero is `now - gameTime` at a
+//! poll, but only while the clock runs. The API already answers on the loading screen, with
+//! `gameTime` standing still near zero until the game really starts (24 s later in one real
+//! match), so a zero read there puts every event that long before it happens in the video. A
+//! pause (practice tool, custom games) stops the clock too, and moves the real zero later by
+//! however long it lasted.
+//!
+//! So a poll counts only when the game time moved since the answer before it, and nothing is
+//! placed until one has. Among the polls that count, the smallest zero is the least delayed
+//! (`now` is taken once the answer is back, so latency only ever makes it later), and one more
+//! than [`PAUSE_SLACK`] later than the zero in use means the clock stood still in between: zero
+//! moves there, and what was already placed stays where it was. Starting the app in the middle
+//! of a match works the same way: the events so far arrive with the second answer, at the times
+//! they happened.
 //!
 //! Names in events are what the game shows, which since Riot IDs is the game name without the
 //! tag; the active player is known by Riot ID, game name and legacy summoner name. All of them
@@ -26,11 +36,16 @@ use crate::timeline::{EndReason, Event, GameEvent, Outcome, Provider};
 const URL: &str = "https://127.0.0.1:2999/liveclientdata/allgamedata";
 /// How long a match survives with the API gone (a crash, a reconnect) before it is written off.
 const LOST_AFTER: Duration = Duration::seconds(45);
-/// Between attempts while nothing answers: the client between games, a loading screen.
+/// Between attempts while nothing answers: the client between games, a game still starting.
 const RETRY_EVERY: Duration = Duration::seconds(2);
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 /// A game clock this far behind the last one seen is a new game, not jitter.
 const NEW_GAME_SLACK_SECONDS: f64 = 5.0;
+/// How much later than the zero in use a poll may put it before that counts as the clock
+/// having stood still in between (a pause) rather than a slow answer. Latency on loopback is
+/// milliseconds and `HTTP_TIMEOUT` caps it; a poll that caught the first moment of a pause is
+/// off by up to one watch tick, and the polls after the pause put zero right again anyway.
+const PAUSE_SLACK: Duration = Duration::milliseconds(1_500);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Player {
@@ -84,8 +99,8 @@ fn text(v: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `None` when the answer is not a running match (the API says so with an error body while
-/// the game loads or in spectator mode).
+/// `None` when the answer is not a match (the API says so with an error body, in spectator
+/// mode for one). A loading screen does parse, with its clock standing still.
 pub fn parse(root: &Value) -> Option<Snapshot> {
     let game = root.get("gameData")?;
     let game_time = game.get("gameTime")?.as_f64()?;
@@ -215,20 +230,29 @@ pub fn map_name(number: u32) -> Option<&'static str> {
 
 /// Turns successive snapshots into timeline events. Pure, so every transition is testable
 /// without a game running.
+///
+/// Nothing comes out, not even the match start, until a running clock has shown where zero is:
+/// the loading screen answers with a clock standing still, and taking its zero put a match's
+/// every event about 24 s early. Events are marked seen only as they are emitted, so the ones
+/// that arrived before zero was known come out with the first poll that knows it. A pause moves
+/// zero for what comes after it; what was emitted before keeps its time.
 #[derive(Debug, Default)]
 pub struct Tracker {
     in_match: bool,
     /// The game reported its end; its snapshots are ignored until a new game's clock starts.
     finished: bool,
-    /// Wall-clock time of game clock zero.
+    /// Wall-clock time of game clock zero, once a running clock has shown it.
     zero: Option<DateTime<Utc>>,
-    last_game_time: f64,
+    /// The game time of the last answer, `None` before the first. Tells a running clock from
+    /// one standing still, and a new game from the old one.
+    last_game_time: Option<f64>,
     last_event: Option<u64>,
     lost_since: Option<DateTime<Utc>>,
 }
 
 impl Tracker {
-    /// `snapshot` is `None` when the API did not answer with a match.
+    /// `snapshot` is `None` when the API did not answer with a match. `now` is when the answer
+    /// came back.
     pub fn observe(&mut self, now: DateTime<Utc>, snapshot: Option<&Snapshot>) -> Vec<GameEvent> {
         let mut out = Vec::new();
         let Some(s) = snapshot else {
@@ -244,9 +268,10 @@ impl Tracker {
         };
         self.lost_since = None;
 
-        if s.game_time + NEW_GAME_SLACK_SECONDS < self.last_game_time {
+        let previous = self.last_game_time.replace(s.game_time);
+        if let Some(last) = previous.filter(|last| s.game_time + NEW_GAME_SLACK_SECONDS < *last) {
             if self.in_match {
-                let at = self.at(self.last_game_time);
+                let at = self.at(last);
                 out.push(GameEvent { at, event: lost_end() });
             }
             self.in_match = false;
@@ -254,13 +279,29 @@ impl Tracker {
             self.zero = None;
             self.last_event = None;
         }
-        self.last_game_time = s.game_time;
         if self.finished {
             return out;
         }
 
-        let candidate = now - Duration::milliseconds((s.game_time * 1000.0) as i64);
-        let zero = *self.zero.insert(self.zero.map_or(candidate, |z| z.min(candidate)));
+        // A first answer, or a clock standing still (a loading screen, a pause), says nothing
+        // about where zero is. A new game's first answer is behind the last one, so it waits too.
+        if previous.is_some_and(|last| s.game_time > last) {
+            let candidate = now - Duration::milliseconds((s.game_time * 1000.0) as i64);
+            self.zero = Some(match self.zero {
+                Some(zero) if candidate - zero > PAUSE_SLACK => {
+                    log::info!(
+                        "league: the game clock stood still for {:.1}s (a pause), moving its zero",
+                        (candidate - zero).num_milliseconds() as f64 / 1000.0
+                    );
+                    candidate
+                }
+                Some(zero) => zero.min(candidate),
+                None => candidate,
+            });
+        }
+        let Some(zero) = self.zero else {
+            return out;
+        };
 
         if !self.in_match {
             self.in_match = true;
@@ -410,6 +451,11 @@ impl Provider for League {
             return self.tracker.observe(now, None);
         }
         let snapshot = self.fetch();
+        // The watch took `now` before its process list and any recorder start, and the game read
+        // its clock later than that. Zero is measured from when the answer is back, which is never
+        // before the clock was read, so a slow tick or a slow answer can only make it later and
+        // the smallest one stays the least delayed.
+        let now = Utc::now();
         match &snapshot {
             Some(_) => {
                 self.reached = true;
@@ -468,14 +514,17 @@ mod tests {
         assert!(!s.is_me("Mate"));
         assert_eq!(s.who("Rival"), "Zed");
         assert_eq!(s.who("Turret_T2_C_05_A"), "a tower");
-        // The loading screen and spectator mode answer with an error body.
+        // Spectator mode answers with an error body.
         assert!(parse(&json!({ "errorCode": "RESOURCE_NOT_FOUND", "httpStatus": 404 })).is_none());
     }
 
     #[test]
     fn an_aram_from_start_to_victory() {
         let mut tr = Tracker::default();
-        let start = tr.observe(t(5.0), Some(&snap(5.0, json!([{ "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 }]))));
+        let started = json!([{ "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 }]);
+        // One answer cannot tell a running clock from a stopped one.
+        assert!(tr.observe(t(4.0), Some(&snap(4.0, started.clone()))).is_empty());
+        let start = tr.observe(t(5.0), Some(&snap(5.0, started)));
         assert_eq!(start.len(), 1);
         assert_eq!(start[0].at, t(0.0), "the match starts at game clock zero");
         assert_eq!(
@@ -494,7 +543,7 @@ mod tests {
             { "EventID": 7, "EventName": "InhibKilled", "EventTime": 600.0, "KillerName": "Rival", "InhibKilled": "Barracks_T1_C1", "Assisters": [] },
             { "EventID": 8, "EventName": "Ace", "EventTime": 700.0, "Acer": "Benja", "AcingTeam": "ORDER" }
         ]);
-        // A poll a little later than the first gets the same zero back, not a later one.
+        // A slower answer puts zero a little later, which is latency, not a pause: it stays.
         let mid = tr.observe(t(700.9), Some(&snap(700.5, events.clone())));
         let kinds: Vec<_> = mid.iter().map(|e| e.event.kind()).collect();
         assert_eq!(kinds, vec!["kill", "multikill", "death", "assist", "objective", "objective", "objective"]);
@@ -523,7 +572,8 @@ mod tests {
 
         // The client between games, then the next game's clock starting from zero.
         assert!(tr.observe(t(1000.0), None).is_empty());
-        let next = tr.observe(t(1300.0), Some(&snap(3.0, json!([]))));
+        assert!(tr.observe(t(1300.0), Some(&snap(3.0, json!([])))).is_empty());
+        let next = tr.observe(t(1301.0), Some(&snap(4.0, json!([]))));
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].event.kind(), "match_start");
         assert_eq!(next[0].at, t(1297.0));
@@ -536,15 +586,80 @@ mod tests {
             { "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 },
             { "EventID": 1, "EventName": "DragonKill", "EventTime": 400.0, "KillerName": "Rival", "DragonType": "Elder", "Stolen": "True", "Assisters": [] }
         ]);
+        assert!(tr.observe(t(999.0), Some(&snap(599.0, events.clone()))).is_empty());
+        // The events held back by the first answer were not marked seen.
         let out = tr.observe(t(1000.0), Some(&snap(600.0, events)));
+        assert_eq!(out.len(), 2);
         assert_eq!(out[0].at, t(400.0), "match start at clock zero");
         assert_eq!(out[1].at, t(800.0));
         assert_eq!(out[1].event, Event::Objective { name: "Elder Dragon (stolen)".into(), ours: Some(false) });
     }
 
+    /// The API answers through the loading screen with the clock standing at zero. Zero is where
+    /// the clock starts running, not where the loading screen began.
+    #[test]
+    fn a_loading_screen_does_not_set_the_clock() {
+        let mut tr = Tracker::default();
+        for s in 0..=24 {
+            let s = f64::from(s);
+            assert!(tr.observe(t(s), Some(&snap(0.0, json!([])))).is_empty(), "loading at {s}s");
+        }
+        // The game starts at 24.4 s.
+        let start = tr.observe(t(25.0), Some(&snap(0.6, json!([{ "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 }]))));
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].event.kind(), "match_start");
+        assert_eq!(start[0].at, t(24.4));
+
+        let kill = json!([
+            { "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 },
+            { "EventID": 1, "EventName": "ChampionKill", "EventTime": 95.0, "KillerName": "Benja", "VictimName": "Rival", "Assisters": [] }
+        ]);
+        let out = tr.observe(t(124.4 + 0.05), Some(&snap(100.0, kill)));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].at, t(24.4 + 95.0));
+    }
+
+    /// A pause stops the clock; what happens after it is placed where it happened, and what came
+    /// before keeps its time.
+    #[test]
+    fn a_pause_moves_zero_for_what_comes_after() {
+        let mut tr = Tracker::default();
+        tr.observe(t(9.0), Some(&snap(9.0, json!([]))));
+        assert_eq!(tr.observe(t(10.0), Some(&snap(10.0, json!([]))))[0].at, t(0.0));
+
+        let mut events = vec![
+            json!({ "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 }),
+            json!({ "EventID": 1, "EventName": "ChampionKill", "EventTime": 30.0, "KillerName": "Benja", "VictimName": "Rival", "Assisters": [] }),
+        ];
+        let before = tr.observe(t(31.0), Some(&snap(31.0, Value::Array(events.clone()))));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].at, t(30.0));
+
+        // Paused at 50 s on the clock for a minute: the clock stands still, which moves nothing.
+        tr.observe(t(50.0), Some(&snap(50.0, Value::Array(events.clone()))));
+        for s in 51..=109 {
+            assert!(tr.observe(t(f64::from(s)), Some(&snap(50.2, Value::Array(events.clone())))).is_empty());
+        }
+        // Back at 110.2 s of wall time; a kill 0.5 s of game time later.
+        events.push(json!({ "EventID": 2, "EventName": "ChampionKill", "EventTime": 50.7, "KillerName": "Rival", "VictimName": "Benja", "Assisters": [] }));
+        let after = tr.observe(t(111.0), Some(&snap(51.0, Value::Array(events.clone()))));
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].event.kind(), "death");
+        assert_eq!(after[0].at, t(110.7));
+
+        // A slower answer after that is latency again, and a faster one still wins.
+        events.push(json!({ "EventID": 3, "EventName": "ChampionKill", "EventTime": 80.0, "KillerName": "Benja", "VictimName": "Rival", "Assisters": [] }));
+        let later = tr.observe(t(141.3), Some(&snap(80.5, Value::Array(events.clone()))));
+        assert_eq!(later[0].at, t(140.0));
+        events.push(json!({ "EventID": 4, "EventName": "ChampionKill", "EventTime": 90.0, "KillerName": "Benja", "VictimName": "Rival", "Assisters": [] }));
+        let faster = tr.observe(t(150.3), Some(&snap(90.5, Value::Array(events))));
+        assert_eq!(faster[0].at, t(149.8), "zero at 59.8 s");
+    }
+
     #[test]
     fn a_match_with_the_api_gone_is_lost_where_it_went_quiet() {
         let mut tr = Tracker::default();
+        tr.observe(t(9.0), Some(&snap(9.0, json!([]))));
         tr.observe(t(10.0), Some(&snap(10.0, json!([]))));
         assert!(tr.observe(t(20.0), None).is_empty());
         assert!(tr.observe(t(50.0), None).is_empty());
@@ -561,8 +676,12 @@ mod tests {
         tr.observe(t(600.0), Some(&snap(600.0, json!([]))));
         let out = tr.observe(t(700.0), Some(&snap(2.0, json!([]))));
         let kinds: Vec<_> = out.iter().map(|e| e.event.kind()).collect();
-        assert_eq!(kinds, vec!["match_end", "match_start"]);
+        assert_eq!(kinds, vec!["match_end"]);
         assert_eq!(out[0].at, t(600.0));
+        let next = tr.observe(t(701.0), Some(&snap(3.0, json!([]))));
+        let kinds: Vec<_> = next.iter().map(|e| e.event.kind()).collect();
+        assert_eq!(kinds, vec!["match_start"]);
+        assert_eq!(next[0].at, t(698.0));
     }
 
     #[test]

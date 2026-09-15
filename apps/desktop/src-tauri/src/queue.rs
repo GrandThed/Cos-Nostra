@@ -30,7 +30,8 @@ pub const MAX_ATTEMPTS: i32 = 5;
 /// 5: `participants`, JSON array of Discord user ids seen in the owner's voice channel at
 /// capture time. 6: publish on demand: `publish`, `publish_guilds`, `publish_title`, the
 /// `posts` cache, and `captured_at`, which places a clip on the match it was taken in.
-const SCHEMA_VERSION: i32 = 6;
+/// 7: `include_mic`, whether the published copies keep the microphone track.
+const SCHEMA_VERSION: i32 = 7;
 
 /// How often the worker polls when nobody calls `wake`.
 #[cfg(not(test))]
@@ -202,6 +203,10 @@ pub struct ClipRow {
     pub captured_at: Option<String>,
     /// Live Discord posts, from the last `GET /me/posts`. Empty for a clip nobody posted.
     pub posts: Vec<ClipPost>,
+    /// Whether the encoded copies carry the microphone. Only matters for a recording that has
+    /// the microphone on a track of its own (`ffmpeg::MediaInfo::has_mic_track`); every other
+    /// clip encodes its one audio track either way.
+    pub include_mic: bool,
 }
 
 /// Files the processor produced for a clip.
@@ -286,7 +291,8 @@ CREATE TABLE IF NOT EXISTS clips (
     publish_guilds TEXT,
     publish_title TEXT,
     captured_at TEXT,
-    posts TEXT
+    posts TEXT,
+    include_mic INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 ";
@@ -294,7 +300,7 @@ CREATE INDEX IF NOT EXISTS clips_status ON clips(status);
 /// Columns added after version 1, applied with ALTER TABLE to databases that predate them.
 /// Every one is nullable or has a default; `migrate_to_publish_on_demand` backfills the two
 /// whose default would be wrong for an existing row.
-const ADDED_COLUMNS: [(&str, &str); 11] = [
+const ADDED_COLUMNS: [(&str, &str); 12] = [
     ("stage", "TEXT NOT NULL DEFAULT 'encode'"),
     ("remote_id", "TEXT"),
     ("page_url", "TEXT"),
@@ -306,13 +312,14 @@ const ADDED_COLUMNS: [(&str, &str); 11] = [
     ("publish_title", "TEXT"),
     ("captured_at", "TEXT"),
     ("posts", "TEXT"),
+    ("include_mic", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 /// Column list shared by every SELECT so `row_from` stays in sync.
 const COLUMNS: &str = "id, source_path, game, title, recorded_at, duration_ms, width, height, \
     size_source, size_av1, size_h264, av1_path, h264_path, thumb_path, status, error, attempts, \
     stage, remote_id, page_url, fps, cut, updated_at, participants, publish, publish_guilds, \
-    publish_title, captured_at, posts";
+    publish_title, captured_at, posts, include_mic";
 
 /// A new recording for a clip, after the editor widened it past the file it had: the copy
 /// taken out of the match (or out of the encoded copy) that replaces `source_path`.
@@ -620,13 +627,15 @@ impl Queue {
     /// A `saved` row gets encoded then uploaded. An `encoded` one (a clip from before publish
     /// on demand, which encoded but never went up) goes straight to upload, since an edit of a
     /// local clip always throws stale outputs away; unless its outputs have gone missing, in
-    /// which case it encodes again. A failed row starts over at the stage it failed in.
+    /// which case it encodes again, or it was encoded with the other microphone choice. A failed
+    /// row starts over at the stage it failed in.
     pub fn publish(
         &self,
         id: i64,
         title: Option<&str>,
         game: Option<&str>,
         guild_ids: &[String],
+        include_mic: bool,
     ) -> Result<()> {
         let guilds = serde_json::to_string(guild_ids).context("encoding guild ids")?;
         let mut conn = self.lock();
@@ -641,10 +650,11 @@ impl Queue {
         let outputs_here = [&row.av1_path, &row.h264_path, &row.thumb_path]
             .into_iter()
             .all(|p| p.as_deref().is_some_and(|p| Path::new(p).is_file()));
+        let outputs_fit = outputs_here && row.include_mic == include_mic;
         let status = match row.status {
-            ClipStatus::Failed if row.stage == Stage::Upload && outputs_here => "encoded",
+            ClipStatus::Failed if row.stage == Stage::Upload && outputs_fit => "encoded",
             ClipStatus::Failed => "saved",
-            ClipStatus::Encoded if !outputs_here => "saved",
+            ClipStatus::Encoded if !outputs_fit => "saved",
             other => other.as_str(),
         };
         let restart = status != row.status.as_str() || row.status == ClipStatus::Failed;
@@ -654,8 +664,8 @@ impl Queue {
              stage = CASE WHEN ?5 = 'saved' THEN 'encode' ELSE stage END, \
              attempts = CASE WHEN ?6 THEN 0 ELSE attempts END, \
              error = CASE WHEN ?6 THEN NULL ELSE error END, \
-             next_attempt_at = NULL, updated_at = ?7 WHERE id = ?1",
-            params![id, title, game, guilds, status, restart, now_rfc3339()],
+             next_attempt_at = NULL, include_mic = ?8, updated_at = ?7 WHERE id = ?1",
+            params![id, title, game, guilds, status, restart, now_rfc3339(), include_mic],
         )
         .with_context(|| format!("publishing clip {id}"))?;
         tx.commit().context("committing publish")?;
@@ -1193,6 +1203,7 @@ fn row_from(r: &Row<'_>) -> rusqlite::Result<ClipRow> {
         publish_title: r.get(26)?,
         captured_at: r.get(27)?,
         posts,
+        include_mic: r.get::<_, i64>(29)? != 0,
     })
 }
 
@@ -1426,7 +1437,7 @@ mod tests {
     /// A clip the user pressed Publish on, which is the only kind the worker touches.
     fn published(q: &Queue, name: &str) -> i64 {
         let id = q.enqueue(clip(name, "2026-09-10T10:00:00.000Z")).unwrap();
-        q.publish(id, None, None, &[]).unwrap();
+        q.publish(id, None, None, &[], true).unwrap();
         id
     }
 
@@ -2251,7 +2262,7 @@ mod tests {
         assert_eq!(uploads.load(Ordering::SeqCst), 0, "nothing local was uploaded");
 
         // Publishing the old encoded clip goes straight to the upload.
-        q.publish(old, Some("ace"), Some("Valorant"), &["123".to_string()]).unwrap();
+        q.publish(old, Some("ace"), Some("Valorant"), &["123".to_string()], true).unwrap();
         worker.wake();
         let done = wait_until(&q, old, |r| r.status == ClipStatus::Done);
         assert_eq!(encodes.load(Ordering::SeqCst), 0, "its outputs were still good");
@@ -2261,7 +2272,7 @@ mod tests {
         assert_eq!(done.publish_guilds, Some(vec!["123".to_string()]));
 
         // And a fresh one runs the whole way.
-        q.publish(local, None, None, &[]).unwrap();
+        q.publish(local, None, None, &[], true).unwrap();
         worker.wake();
         wait_until(&q, local, |r| r.status == ClipStatus::Done);
         assert_eq!(encodes.load(Ordering::SeqCst), 1);
@@ -2279,20 +2290,40 @@ mod tests {
         q.mark_encoded(up, &outputs()).unwrap();
         q.mark_upload_failed(up, "offline").unwrap();
 
-        q.publish(id, None, None, &[]).unwrap();
+        q.publish(id, None, None, &[], true).unwrap();
         let row = q.get(id).unwrap().unwrap();
         assert!(row.publish);
         assert_eq!(row.status, ClipStatus::Saved);
         assert_eq!((row.attempts, row.error.as_deref()), (0, None));
         assert_eq!(row.publish_guilds, Some(vec![]), "no server is a choice too: web page only");
 
-        q.publish(up, None, None, &[]).unwrap();
+        q.publish(up, None, None, &[], true).unwrap();
         let row = q.get(up).unwrap().unwrap();
         assert_eq!((row.status, row.stage), (ClipStatus::Saved, Stage::Encode));
 
         q.mark_done(id, "r1", "https://x/c/r1").unwrap();
-        assert!(q.publish(id, None, None, &[]).is_err(), "published once is published");
-        assert!(q.publish(9999, None, None, &[]).is_err());
+        assert!(q.publish(id, None, None, &[], true).is_err(), "published once is published");
+        assert!(q.publish(9999, None, None, &[], true).is_err());
+    }
+
+    /// Encoded copies carry one audio track, so copies made with the microphone do not fit a
+    /// publish without it: that one encodes again. The same choice uploads what is there.
+    #[test]
+    fn publishing_without_the_microphone_re_encodes_copies_made_with_it() {
+        let dir = scratch_dir("mic");
+        let q = Queue::open(&temp_db()).unwrap();
+        let with = q.enqueue(clip("with", "2026-09-10T10:00:00.000Z")).unwrap();
+        assert!(q.get(with).unwrap().unwrap().include_mic, "a clip keeps its microphone by default");
+        q.mark_encoded(with, &real_outputs(&dir, "with")).unwrap();
+        q.publish(with, None, None, &[], false).unwrap();
+        let row = q.get(with).unwrap().unwrap();
+        assert_eq!((row.status, row.include_mic), (ClipStatus::Saved, false));
+
+        let same = q.enqueue(clip("same", "2026-09-10T10:00:01.000Z")).unwrap();
+        q.mark_encoded(same, &real_outputs(&dir, "same")).unwrap();
+        q.publish(same, None, None, &[], true).unwrap();
+        assert_eq!(q.get(same).unwrap().unwrap().status, ClipStatus::Encoded);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Unpublish keeps every file and turns the clip back into a local one, resting as
@@ -2430,7 +2461,7 @@ mod tests {
         assert!(!row.publish, "a rebase does not publish anything");
 
         // A published clip is re-encoded instead, and nothing is cut while a job runs.
-        q.publish(id, None, None, &[]).unwrap();
+        q.publish(id, None, None, &[], true).unwrap();
         assert!(q.set_local_cut(id, None, 17_000).is_err());
         q.lock().execute("UPDATE clips SET status = 'encoding' WHERE id = ?1", params![id]).unwrap();
         assert!(q.rebase(id, &rebased).is_err());

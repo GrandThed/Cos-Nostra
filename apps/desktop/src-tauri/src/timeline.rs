@@ -31,9 +31,14 @@ pub enum SessionGame {
     /// No provider: it gets the same whole-session-kept treatment Counter-Strike had before
     /// its GSI provider, by design (see `providers::for_game`).
     TeamfightTactics,
+    /// Any other game the capture hooks, recorded in the background when the player asked for
+    /// it. Found by the hooked executable rather than a table, kept in parts, and only the
+    /// newest few hours of it (`settings::other_games_hours`).
+    Other,
 }
 
 impl SessionGame {
+    /// The games found by their processes. `Other` is found by the hook instead.
     pub const ALL: [SessionGame; 4] =
         [Self::Valorant, Self::League, Self::CounterStrike, Self::TeamfightTactics];
 
@@ -44,6 +49,7 @@ impl SessionGame {
             Self::League => "league",
             Self::CounterStrike => "counter_strike",
             Self::TeamfightTactics => "teamfight_tactics",
+            Self::Other => "other",
         }
     }
 
@@ -56,6 +62,7 @@ impl SessionGame {
             Self::League => &["League of Legends.exe"],
             Self::CounterStrike => &["cs2.exe", "csgo.exe"],
             Self::TeamfightTactics => &["TFTClient-Win64-Shipping.exe"],
+            Self::Other => &[],
         }
     }
 
@@ -64,9 +71,35 @@ impl SessionGame {
     fn client_exes(self) -> &'static [&'static str] {
         match self {
             Self::League => &["LeagueClientUx.exe", "LeagueClient.exe"],
-            Self::Valorant | Self::CounterStrike | Self::TeamfightTactics => &[],
+            Self::Valorant | Self::CounterStrike | Self::TeamfightTactics | Self::Other => &[],
         }
     }
+
+    /// True for an executable one of the process-found games runs as, game or client, so the
+    /// background recording of other games never takes one of them.
+    pub fn is_known_exe(executable: &str) -> bool {
+        Self::ALL.iter().any(|g| {
+            g.game_exes()
+                .iter()
+                .chain(g.client_exes())
+                .any(|e| e.eq_ignore_ascii_case(executable))
+        })
+    }
+}
+
+/// A hooked game that none of the process-found games is, as a sighting of `Other`: the
+/// executable libobs has hooked, as long as its process still runs.
+pub fn sight_other(running: &[String], hooked_executable: Option<&str>) -> Option<Sighting> {
+    let exe = hooked_executable?.trim();
+    if exe.is_empty() || SessionGame::is_known_exe(exe) {
+        return None;
+    }
+    let runs = running.iter().any(|r| r.eq_ignore_ascii_case(exe));
+    runs.then(|| Sighting {
+        game: SessionGame::Other,
+        executable: exe.to_string(),
+        in_game: true,
+    })
 }
 
 /// What the process list says about a supported game right now.
@@ -157,7 +190,11 @@ pub enum EndReason {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     MatchStart {
+        /// An English name written by the provider ("Summoner's Rift", "Ascent"), which the UI
+        /// translates by its spelling (`src/gameTerms.ts`). Renaming one breaks translation of
+        /// new and already stored events alike.
         map: Option<String>,
+        /// Same contract as `map`: "Classic", "ARAM", "Competitive".
         mode: Option<String>,
     },
     /// A round is decided. `round` counts from 1. `won` is `None` when the game reports a
@@ -181,6 +218,8 @@ pub enum Event {
         headshot: bool,
     },
     Death {
+        /// A champion or player name, or a stand-in League writes in English ("a tower",
+        /// "minions") that the UI translates (`src/gameTerms.ts`); keep its spelling.
         killer: Option<String>,
         weapon: Option<String>,
     },
@@ -196,9 +235,15 @@ pub enum Event {
     /// plant. `ours` is true when the player's team got it, false when the other team did, and
     /// `None` when the game does not say.
     Objective {
+        /// An English identifier written by the provider ("Water Dragon", "Voidgrubs", "Tower",
+        /// "Ace"), which the UI translates by its spelling (`src/gameTerms.ts`). Renaming one
+        /// breaks translation of new and already stored events alike.
         name: String,
         ours: Option<bool>,
     },
+    /// The player pressed the marker hotkey: something here is worth coming back to. Placed on
+    /// whichever match file shows that moment, whatever match was open when it was pressed.
+    Marker,
 }
 
 impl Event {
@@ -213,6 +258,7 @@ impl Event {
             Self::Assist { .. } => "assist",
             Self::Multikill { .. } => "multikill",
             Self::Objective { .. } => "objective",
+            Self::Marker => "marker",
         }
     }
 }
@@ -349,6 +395,10 @@ mod tests {
         let json = serde_json::to_value(&end).unwrap();
         assert_eq!(json["result"], "win");
         assert_eq!(json["reason"], "finished");
+
+        let marker = serde_json::to_value(&Event::Marker).unwrap();
+        assert_eq!(marker, serde_json::json!({ "kind": "marker" }));
+        assert_eq!(serde_json::from_value::<Event>(marker).unwrap(), Event::Marker);
     }
 
     #[test]

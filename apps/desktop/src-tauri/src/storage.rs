@@ -474,6 +474,47 @@ pub fn enforce_session_limit(store: &SessionStore, limit: i64) -> Result<CleanRe
     Ok(result)
 }
 
+/// Keeps the newest `keep_ms` of other games' footage and deletes the rest, oldest first: whole
+/// match files, and finished parts of recordings still waiting to be cut. What counts is
+/// footage, not time, so the last two hours played survive however long ago they were played.
+/// A piece is deleted only once the newer ones already fill the budget, so what is kept is at
+/// least `keep_ms` and at most one part more. Sessions in `busy` (being cut right now) are left
+/// alone, since the cutter is reading their files.
+pub fn enforce_other_games_footage(store: &SessionStore, keep_ms: i64, busy: &HashSet<i64>) -> Result<CleanResult> {
+    let mut result = CleanResult::default();
+    let mut kept_ms: i64 = 0;
+    for piece in store.other_games_footage().context("listing other games' footage")? {
+        if kept_ms < keep_ms {
+            kept_ms += piece.duration_ms;
+            continue;
+        }
+        if busy.contains(&piece.session_id) {
+            continue;
+        }
+        let files = match piece.piece {
+            crate::sessions::FootagePiece::Match(id) => {
+                store.delete_match(id).with_context(|| format!("deleting match {id}"))?
+            }
+            crate::sessions::FootagePiece::Recording(id) => {
+                store.delete_recording(id)?;
+                vec![piece.path.clone()]
+            }
+        };
+        let freed: i64 = files.iter().map(|p| remove(p)).sum();
+        result.clips += 1;
+        result.bytes += freed;
+    }
+    if result.clips > 0 {
+        log::info!(
+            "storage: other games keep {} min of footage; deleted {} older piece(s), {} bytes",
+            keep_ms / 60_000,
+            result.clips,
+            result.bytes
+        );
+    }
+    Ok(result)
+}
+
 /// Bytes in a gigabyte, for turning the setting into a limit.
 pub const GB: i64 = 1024 * 1024 * 1024;
 
@@ -882,6 +923,48 @@ mod tests {
 
         assert_eq!(enforce_session_limit(&store, 0).unwrap().clips, 0, "zero means no limit");
         assert_eq!(scan_matches(&store).unwrap().bytes, 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Other games keep the newest footage up to the budget, counted in footage and across
+    /// sessions; supported games' matches, the part being written and a session being cut are
+    /// never touched.
+    #[test]
+    fn other_games_keep_only_their_newest_footage() {
+        let (store, dir) = session_store();
+        // Yesterday's session, cut into two ten-second parts.
+        let yesterday = store.create_session(SessionGame::Other, "Hades II", t(0)).unwrap();
+        let oldest = ready_match(&store, &dir, yesterday, 0, "oldest", 100);
+        let older = ready_match(&store, &dir, yesterday, 10, "older", 100);
+        // Today's, still recording: a finished part and the part being written.
+        let today = store.create_session(SessionGame::Other, "Hades II", t(86_400)).unwrap();
+        let done = dir.join("part-1.mp4");
+        write(&done, 100);
+        let part = store.add_recording(today, &done, t(86_400)).unwrap();
+        store.stop_recording(part, t(86_410)).unwrap();
+        let writing = dir.join("part-2.mp4");
+        write(&writing, 100);
+        store.add_recording_after(today, &writing, t(86_410), Some(part)).unwrap();
+        // A Valorant match older than all of it.
+        let valorant = store.create_session(SessionGame::Valorant, "Valorant", t(-1000)).unwrap();
+        let match_file = ready_match(&store, &dir, valorant, -1000, "valorant", 100);
+
+        // Twenty seconds: today's part and yesterday's newer part fill it; the oldest goes.
+        let freed = enforce_other_games_footage(&store, 20_000, &HashSet::new()).unwrap();
+        assert_eq!(freed.clips, 1);
+        assert!(store.get_match(oldest).unwrap().is_none() && !dir.join("oldest.mp4").exists());
+        assert!(store.get_match(older).unwrap().is_some());
+        assert!(done.exists() && writing.exists());
+        assert!(store.get_match(match_file).unwrap().is_some(), "a supported game is not the budget's");
+
+        // A session being cut keeps its files until it is done.
+        let busy = HashSet::from([yesterday]);
+        assert_eq!(enforce_other_games_footage(&store, 5_000, &busy).unwrap().clips, 0);
+        // With nothing busy, ten seconds keeps today's part alone.
+        assert_eq!(enforce_other_games_footage(&store, 5_000, &HashSet::new()).unwrap().clips, 1);
+        assert!(store.get_match(older).unwrap().is_none());
+        assert!(done.exists(), "the newest finished part fills the budget");
+        assert_eq!(store.recordings(today).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,7 +7,8 @@
  *  decided in Rust (`edit::apply`); the editor only says which range and on which file.
  *
  *  The keys are the ones every clip trimmer shares: I and O set the start and end at the
- *  playhead, [ and ] jump between the edges, Ctrl+Z undoes, Ctrl+Enter applies. */
+ *  playhead, [ and ] jump between the edges, Ctrl+Z undoes, Ctrl+Enter applies. Playback keys
+ *  are the shared ones (`transport.ts`), with play and seek going through the range logic. */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { gameLabel } from "./clips";
@@ -15,9 +16,21 @@ import { confirming, fill, h } from "./dom";
 import { fmtClock, fmtWhen, hueFor } from "./format";
 import { t } from "./i18n";
 import * as ipc from "./ipc";
-import { frameStep, loopToggle, volume } from "./player";
 import { go } from "./router";
 import { data } from "./store";
+import {
+  clickToPlay,
+  flasher,
+  frameStep,
+  fullscreenButton,
+  leaveFullscreen,
+  loopToggle,
+  speedControl,
+  type Transport,
+  transportKey,
+  typing,
+  volume,
+} from "./transport";
 import type { ClipRow, EditSource, Segment } from "./types";
 
 /** Matches `ffmpeg::MIN_SEGMENT_MS`. */
@@ -85,6 +98,7 @@ interface Editor {
   applyButton: HTMLButtonElement;
   cancelButton: HTMLButtonElement;
   message: HTMLElement;
+  tr: Transport;
   onKey: (e: KeyboardEvent) => void;
   resize: ResizeObserver;
 }
@@ -133,6 +147,7 @@ export function unmountEditor(): void {
   live.filmGen++;
   document.removeEventListener("keydown", live.onKey);
   live.resize.disconnect();
+  if (document.fullscreenElement && live.root.contains(document.fullscreenElement)) leaveFullscreen();
   for (const v of [live.video, live.film]) {
     v.pause();
     v.removeAttribute("src");
@@ -251,6 +266,67 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
           ? t("editor.notePublished")
           : t("editor.noteLocal");
 
+  const box = h("div", { class: "video" }, video, bigPlay);
+  const stage = h("div", { class: "stage" });
+  const flash = flasher(box);
+  stage.append(
+    box,
+    h(
+      "div",
+      { class: "transport" },
+      h(
+        "div",
+        { class: "controls" },
+        playButton,
+        time,
+        frameStep(video, source.fps || clip.fps),
+        h("span", { class: "grow" }),
+        loopToggle(video),
+        volume(video),
+        speedControl(video),
+        h(
+          "span",
+          { class: "zoom", title: t("editor.zoomTitle") },
+          h("button", { type: "button", text: "−", onclick: () => zoomBy(-1) }),
+          zoomLabel,
+          h("button", { type: "button", text: "+", onclick: () => zoomBy(1) }),
+        ),
+        fullscreenButton(stage),
+      ),
+      timeline,
+      h(
+        "div",
+        { class: "cut-bar" },
+        h("button", {
+          type: "button",
+          class: "btn small",
+          text: t("editor.setIn"),
+          title: t("editor.setInTitle"),
+          onclick: () => setIn(),
+        }),
+        h("button", {
+          type: "button",
+          class: "btn small",
+          text: t("editor.setOut"),
+          title: t("editor.setOutTitle"),
+          onclick: () => setOut(),
+        }),
+        h("span", { class: "grow" }),
+        h("label", { class: "field-label", text: t("editor.inLabel") }),
+        inField,
+        h("label", { class: "field-label", text: t("editor.outLabel") }),
+        outField,
+      ),
+      h(
+        "div",
+        { class: "keys" },
+        ...(["inOut", "jump", "play", "seek", "frame", "undo", "apply", "back"] as const).map((k) =>
+          h("span", { text: t(`editor.keys.${k}`) }),
+        ),
+      ),
+    ),
+  );
+
   const page = h(
     "div",
     { class: "player editor", style: `--hue:${hueFor(clip.id)}` },
@@ -286,68 +362,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     h(
       "div",
       { class: "player-body" },
-      h(
-        "div",
-        { class: "stage" },
-        h("div", { class: "video" }, video, bigPlay),
-        h(
-          "div",
-          { class: "transport" },
-          h(
-            "div",
-            { class: "controls" },
-            playButton,
-            time,
-            frameStep(video, { fps: source.fps || clip.fps }),
-            h("span", { class: "grow" }),
-            loopToggle(video),
-            volume(video),
-            h(
-              "span",
-              { class: "zoom", title: t("editor.zoomTitle") },
-              h("button", { type: "button", text: "−", onclick: () => zoomBy(-1) }),
-              zoomLabel,
-              h("button", { type: "button", text: "+", onclick: () => zoomBy(1) }),
-            ),
-          ),
-          timeline,
-          h(
-            "div",
-            { class: "cut-bar" },
-            h("button", {
-              type: "button",
-              class: "btn small",
-              text: t("editor.setIn"),
-              title: t("editor.setInTitle"),
-              onclick: () => setIn(),
-            }),
-            h("button", {
-              type: "button",
-              class: "btn small",
-              text: t("editor.setOut"),
-              title: t("editor.setOutTitle"),
-              onclick: () => setOut(),
-            }),
-            h("span", { class: "grow" }),
-            h("label", { class: "field-label", text: t("editor.inLabel") }),
-            inField,
-            h("label", { class: "field-label", text: t("editor.outLabel") }),
-            outField,
-          ),
-          h(
-            "div",
-            { class: "keys" },
-            h("span", { text: t("editor.keys.inOut") }),
-            h("span", { text: t("editor.keys.jump") }),
-            h("span", { text: t("editor.keys.play") }),
-            h("span", { text: t("editor.keys.seek") }),
-            h("span", { text: t("editor.keys.frame") }),
-            h("span", { text: t("editor.keys.undo") }),
-            h("span", { text: t("editor.keys.apply") }),
-            h("span", { text: t("editor.keys.back") }),
-          ),
-        ),
-      ),
+      stage,
       h(
         "aside",
         { class: "rail" },
@@ -366,6 +381,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   fill(root, page);
 
   const maxZoom = clamp(durationMs / 5000, MIN_MAX_ZOOM, MAX_MAX_ZOOM);
+  const fps = source.fps > 0 ? source.fps : clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS;
   const editor: Editor = {
     id: clip.id,
     clip,
@@ -373,7 +389,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     video,
     film,
     durationMs,
-    fps: source.fps > 0 ? source.fps : clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS,
+    fps,
     range,
     initial: { ...range },
     past: [],
@@ -408,6 +424,14 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
     applyButton,
     cancelButton,
     message,
+    tr: {
+      video,
+      fps,
+      flash,
+      fullscreen: stage,
+      toggle: () => togglePlay(editor),
+      seek: (seconds) => seek(editor, seconds * 1000),
+    },
     onKey: (e) => handleKey(e),
     resize: new ResizeObserver(() => {
       if (!live) return;
@@ -420,6 +444,7 @@ function build(root: HTMLElement, clip: ClipRow, source: EditSource): void {
   wireVideo(editor, bigPlay);
   wireTimeline(editor);
   wireFields(editor);
+  clickToPlay(video, editor.tr);
   playButton.addEventListener("click", () => togglePlay(editor));
   bigPlay.addEventListener("click", () => togglePlay(editor));
   document.addEventListener("keydown", editor.onKey);
@@ -488,10 +513,6 @@ function now(ed: Editor): number {
 function seek(ed: Editor, ms: number): void {
   ed.video.currentTime = clamp(ms, 0, ed.durationMs) / 1000;
   paintPlayhead(ed, true);
-}
-
-function nudge(ed: Editor, byMs: number): void {
-  seek(ed, now(ed) + byMs);
 }
 
 function togglePlay(ed: Editor): void {
@@ -953,10 +974,7 @@ async function apply(): Promise<void> {
 function handleKey(e: KeyboardEvent): void {
   const ed = live;
   if (!ed) return;
-  const target = e.target as HTMLElement | null;
-  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) {
-    return;
-  }
+  if (typing(e)) return;
   const ctrl = e.ctrlKey || e.metaKey;
   if (ctrl) {
     switch (e.key) {
@@ -978,37 +996,7 @@ function handleKey(e: KeyboardEvent): void {
     e.preventDefault();
     return;
   }
-  const frame = 1000 / ed.fps;
   switch (e.key) {
-    case " ":
-      togglePlay(ed);
-      break;
-    case "ArrowLeft":
-      nudge(ed, e.shiftKey ? -1000 : -5000);
-      break;
-    case "ArrowRight":
-      nudge(ed, e.shiftKey ? 1000 : 5000);
-      break;
-    case "j":
-    case "J":
-      nudge(ed, -10000);
-      break;
-    case "l":
-    case "L":
-      nudge(ed, 10000);
-      break;
-    case "k":
-    case "K":
-      ed.video.pause();
-      break;
-    case ",":
-      ed.video.pause();
-      nudge(ed, -frame);
-      break;
-    case ".":
-      ed.video.pause();
-      nudge(ed, frame);
-      break;
     case "i":
     case "I":
       setIn();
@@ -1023,16 +1011,6 @@ function handleKey(e: KeyboardEvent): void {
     case "]":
       jumpEdge(ed, 1);
       break;
-    case "Home":
-      seek(ed, 0);
-      break;
-    case "End":
-      seek(ed, ed.durationMs);
-      break;
-    case "m":
-    case "M":
-      ed.video.muted = !ed.video.muted;
-      break;
     case "+":
     case "=":
       zoomBy(1);
@@ -1042,11 +1020,14 @@ function handleKey(e: KeyboardEvent): void {
       zoomBy(-1);
       break;
     case "Escape":
+      // Fullscreen is the webview's to leave.
+      if (document.fullscreenElement) return;
       // Armed Cancel needs a second press when there is something to lose.
       if (isDirty(ed)) ed.cancelButton.click();
       else go({ view: "player", id: ed.id });
       break;
     default:
+      transportKey(e, ed.tr);
       return;
   }
   e.preventDefault();

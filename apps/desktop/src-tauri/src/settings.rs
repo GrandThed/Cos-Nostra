@@ -12,6 +12,30 @@ pub const DEFAULT_BACKEND_URL: &str = "https://cosnostra.benja.ar";
 /// Upper bound for the clip folder budget. Well past any plausible disk, and only here so a
 /// typo cannot ask for a limit that overflows the byte arithmetic.
 pub const MAX_STORAGE_LIMIT_GB: u32 = 100_000;
+/// Loudest the microphone can be turned up, in percent of what the device delivers.
+pub const MAX_MIC_VOLUME: u32 = 200;
+/// Most apps that can be recorded next to the game.
+pub const MAX_AUDIO_APPS: usize = 16;
+/// The device id WASAPI sources read as "whatever Windows uses by default".
+pub const DEFAULT_DEVICE: &str = "default";
+/// How much footage of other games the background recording may keep, in hours.
+pub const MIN_OTHER_GAMES_HOURS: u32 = 1;
+pub const MAX_OTHER_GAMES_HOURS: u32 = 48;
+
+/// Which sound, apart from the microphone, a recording carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioSource {
+    /// Everything the default output device plays: the game, Discord, music, notifications.
+    /// How every build before the audio settings recorded, so it stays the default.
+    #[default]
+    System,
+    /// Only the game the capture has hooked. Needs Windows 10 2004 or newer; older systems
+    /// fall back to `System`.
+    Game,
+    /// The hooked game plus the apps in `audio_apps`, each captured on its own.
+    GameAndApps,
+}
 
 /// How much the encoder is allowed to spend on a clip.
 ///
@@ -69,6 +93,9 @@ pub struct Account {
 pub struct Settings {
     /// Global hotkey that saves the replay buffer, in Tauri shortcut syntax.
     pub hotkey: String,
+    /// Global hotkey that puts a marker on the timeline of the session being recorded. Empty
+    /// turns it off.
+    pub marker_hotkey: String,
     /// Seconds of footage kept in memory.
     pub buffer_seconds: i64,
     /// Upper bound for the in-memory buffer.
@@ -77,6 +104,24 @@ pub struct Settings {
     pub video_bitrate_kbps: u32,
     /// Frames per second captured.
     pub fps: u32,
+    /// Height the recording is scaled down to, keeping the screen's shape; 0 records at the
+    /// screen's own resolution. Never scales up.
+    pub record_height: u32,
+    /// Which sound besides the microphone is recorded.
+    pub audio_source: AudioSource,
+    /// Executable names (`Spotify.exe`, `Discord.exe`) recorded next to the game when
+    /// `audio_source` is `game_and_apps`. Matched against a window of that process, so an app
+    /// with no window cannot be picked up.
+    pub audio_apps: Vec<String>,
+    /// Record the microphone. It lands in the mixed track and on a track of its own, with a
+    /// third track holding everything but it, so a clip can leave the voice out afterwards.
+    pub mic_enabled: bool,
+    /// WASAPI endpoint id of the microphone, or `default` to follow the Windows default.
+    pub mic_device: String,
+    /// Microphone gain in percent, 0 to `MAX_MIC_VOLUME`.
+    pub mic_volume: u32,
+    /// RNNoise noise suppression on the microphone.
+    pub mic_noise_suppression: bool,
     /// Where saved clips land.
     pub clip_dir: PathBuf,
     /// Register the app to launch at Windows login.
@@ -132,6 +177,12 @@ pub struct Settings {
     /// replay buffer's encoder, so it costs disk (about 9 GB an hour at the default bitrate
     /// until the session is cut), not frames.
     pub record_sessions: bool,
+    /// Record every other game too, whatever the capture hooks, in parts of a quarter of an hour,
+    /// keeping only the newest `other_games_hours` of that footage. Off by default: it costs
+    /// disk (about 9 GB an hour at the default bitrate) for every game played.
+    pub record_other_games: bool,
+    /// Hours of other games' footage kept; older parts are deleted as new ones are written.
+    pub other_games_hours: u32,
     /// Bring the window up on the finished session when the player leaves the game.
     pub open_after_session: bool,
     /// Set once the first-run flow (runtime download, encoder probe, Discord link) has been
@@ -151,10 +202,18 @@ impl Default for Settings {
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             hotkey: "Alt+F10".into(),
+            marker_hotkey: "Alt+F11".into(),
             buffer_seconds: 30,
             buffer_max_mb: 1024,
             video_bitrate_kbps: 20_000,
             fps: 60,
+            record_height: 0,
+            audio_source: AudioSource::default(),
+            audio_apps: Vec::new(),
+            mic_enabled: false,
+            mic_device: DEFAULT_DEVICE.into(),
+            mic_volume: 100,
+            mic_noise_suppression: true,
             clip_dir: videos.join("Cos Nostra"),
             start_with_windows: false,
             notify_on_save: true,
@@ -173,6 +232,8 @@ impl Default for Settings {
             storage_limit_gb: 0,
             session_storage_limit_gb: 0,
             record_sessions: true,
+            record_other_games: false,
+            other_games_hours: 2,
             open_after_session: true,
             first_run_done: true,
             tray_hint_shown: false,
@@ -216,8 +277,11 @@ impl Settings {
                 return Self::default();
             }
         };
-        match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
-            Ok(s) => s,
+        match serde_json::from_str::<Settings>(text.trim_start_matches('\u{feff}')) {
+            Ok(mut s) => {
+                s.settle_marker_hotkey();
+                s
+            }
             Err(e) => {
                 log::warn!("{} is not valid, using defaults: {e}", path.display());
                 Self::default()
@@ -247,6 +311,9 @@ impl Settings {
         if self.fps == 0 || self.fps > 240 {
             anyhow::bail!("fps must be between 1 and 240");
         }
+        if self.record_height != 0 && !(360..=4320).contains(&self.record_height) {
+            anyhow::bail!("the recording height must be 0 (the screen's) or between 360 and 4320");
+        }
         if self.buffer_max_mb <= 0 {
             anyhow::bail!("buffer_max_mb must be positive");
         }
@@ -256,11 +323,31 @@ impl Settings {
         if self.hotkey.trim().is_empty() {
             anyhow::bail!("hotkey must not be empty");
         }
+        if self.marker_hotkey.trim().eq_ignore_ascii_case(self.hotkey.trim()) {
+            anyhow::bail!("the marker hotkey must differ from the save-clip hotkey");
+        }
         if self.storage_limit_gb > MAX_STORAGE_LIMIT_GB {
             anyhow::bail!("storage limit must be at most {MAX_STORAGE_LIMIT_GB} GB");
         }
         if self.session_storage_limit_gb > MAX_STORAGE_LIMIT_GB {
             anyhow::bail!("session storage limit must be at most {MAX_STORAGE_LIMIT_GB} GB");
+        }
+        if !(MIN_OTHER_GAMES_HOURS..=MAX_OTHER_GAMES_HOURS).contains(&self.other_games_hours) {
+            anyhow::bail!(
+                "other games' footage must be kept for {MIN_OTHER_GAMES_HOURS} to {MAX_OTHER_GAMES_HOURS} hours"
+            );
+        }
+        if self.mic_volume > MAX_MIC_VOLUME {
+            anyhow::bail!("microphone volume must be at most {MAX_MIC_VOLUME} %");
+        }
+        if self.mic_device.trim().is_empty() || self.mic_device.len() > 512 {
+            anyhow::bail!("microphone device must be a device id or {DEFAULT_DEVICE:?}");
+        }
+        if self.audio_apps.len() > MAX_AUDIO_APPS {
+            anyhow::bail!("at most {MAX_AUDIO_APPS} apps can be recorded next to the game");
+        }
+        for app in &self.audio_apps {
+            validate_audio_app(app)?;
         }
         validate_backend_url(&self.backend_url)?;
         if self.valorant_shard.trim().is_empty()
@@ -270,6 +357,14 @@ impl Settings {
             anyhow::bail!("Valorant shard must be a short lowercase code, like na, eu, ap or kr");
         }
         Ok(())
+    }
+
+    /// A settings file from before the marker hotkey gets the default one, which may be the
+    /// key someone already chose for saving clips. Saving wins; the marker starts off instead.
+    fn settle_marker_hotkey(&mut self) {
+        if self.marker_hotkey.trim().eq_ignore_ascii_case(self.hotkey.trim()) {
+            self.marker_hotkey.clear();
+        }
     }
 
     /// True when a device token is stored (not necessarily still valid).
@@ -283,8 +378,29 @@ impl Settings {
             || self.buffer_max_mb != other.buffer_max_mb
             || self.video_bitrate_kbps != other.video_bitrate_kbps
             || self.fps != other.fps
+            || self.record_height != other.record_height
             || self.clip_dir != other.clip_dir
+            || self.audio_source != other.audio_source
+            || self.audio_apps != other.audio_apps
+            || self.mic_enabled != other.mic_enabled
+            || self.mic_device != other.mic_device
+            || self.mic_volume != other.mic_volume
+            || self.mic_noise_suppression != other.mic_noise_suppression
     }
+}
+
+/// An app recorded next to the game is named by its executable file name alone: OBS matches it
+/// against the process of a window, and the name travels inside a `title:class:exe` setting
+/// where a path or a colon would mean something else.
+pub fn validate_audio_app(app: &str) -> anyhow::Result<()> {
+    let ok = app.len() <= 260
+        && app.len() > 4
+        && app.to_ascii_lowercase().ends_with(".exe")
+        && !app.chars().any(|c| matches!(c, '\\' | '/' | ':' | '#' | '"') || c.is_control());
+    if !ok {
+        anyhow::bail!("{app:?} is not an executable name like Spotify.exe");
+    }
+    Ok(())
 }
 
 /// Accepts `https://host[:port][/path]`; no query, fragment or trailing slash.
@@ -432,6 +548,50 @@ mod tests {
         // A settings file is proof the app has run here, so the first-run flow stays away
         // even though the key that records it was only added with the new window.
         assert!(s.first_run_done);
+    }
+
+    #[test]
+    fn the_marker_hotkey_never_takes_the_save_hotkey() {
+        let mut old: Settings = serde_json::from_str(r#"{"hotkey": "Alt+F11"}"#).unwrap();
+        assert_eq!(old.marker_hotkey, "Alt+F11", "the default, before settling");
+        old.settle_marker_hotkey();
+        assert_eq!(old.marker_hotkey, "", "saving clips keeps its key; the marker starts off");
+        old.validate().unwrap();
+
+        let mut fine: Settings = serde_json::from_str(r#"{"hotkey": "Alt+F10"}"#).unwrap();
+        fine.settle_marker_hotkey();
+        assert_eq!(fine.marker_hotkey, "Alt+F11");
+        assert!(Settings { marker_hotkey: "alt+f10".into(), ..Default::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn audio_settings_default_to_recording_what_builds_before_them_recorded() {
+        // A settings.json from before the audio settings: the desktop, no microphone.
+        let s: Settings = serde_json::from_str(r#"{"hotkey": "Alt+F10"}"#).unwrap();
+        assert_eq!(s.audio_source, AudioSource::System);
+        assert!(s.audio_apps.is_empty());
+        assert!(!s.mic_enabled);
+        assert_eq!(s.mic_device, DEFAULT_DEVICE);
+        assert_eq!(s.mic_volume, 100);
+        assert!(s.mic_noise_suppression);
+        s.validate().unwrap();
+
+        let json = serde_json::to_string(&Settings { audio_source: AudioSource::GameAndApps, ..s.clone() }).unwrap();
+        assert!(json.contains(r#""audio_source":"game_and_apps""#), "{json}");
+        assert!(Settings::default().needs_recorder_restart(&Settings { mic_enabled: true, ..Default::default() }));
+    }
+
+    #[test]
+    fn audio_apps_and_the_microphone_are_checked() {
+        let with = |apps: &[&str]| Settings { audio_apps: apps.iter().map(|a| a.to_string()).collect(), ..Default::default() };
+        with(&["Spotify.exe", "Discord.EXE"]).validate().unwrap();
+        for bad in ["Spotify", ".exe", r"C:\Apps\Spotify.exe", "a:b.exe", "x#3A.exe", ""] {
+            assert!(with(&[bad]).validate().is_err(), "should be refused: {bad:?}");
+        }
+        let many: Vec<String> = (0..=MAX_AUDIO_APPS).map(|i| format!("app{i}.exe")).collect();
+        assert!(Settings { audio_apps: many, ..Default::default() }.validate().is_err());
+        assert!(Settings { mic_volume: MAX_MIC_VOLUME + 1, ..Default::default() }.validate().is_err());
+        assert!(Settings { mic_device: " ".into(), ..Default::default() }.validate().is_err());
     }
 
     #[test]

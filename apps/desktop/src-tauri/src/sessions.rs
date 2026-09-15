@@ -16,14 +16,19 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 use crate::timeline::{Event, GameEvent, Outcome, SessionGame};
 
-const SCHEMA_VERSION: i32 = 1;
+/// Stored in `PRAGMA user_version`. 2 added `matches.event_offset_ms`. 3 added
+/// `recordings.follows`, which chains the parts of a recording split without a gap.
+const SCHEMA_VERSION: i32 = 3;
+
+/// The furthest a match's events can be moved either way by hand.
+pub const MAX_EVENT_OFFSET_MS: i64 = 10 * 60 * 1000;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -44,7 +49,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     requested_at TEXT NOT NULL,
     stopped_at TEXT,
     started_at TEXT,
-    duration_ms INTEGER
+    duration_ms INTEGER,
+    follows INTEGER
 );
 CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY,
@@ -64,7 +70,8 @@ CREATE TABLE IF NOT EXISTS matches (
     size INTEGER,
     status TEXT NOT NULL,
     error TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    event_offset_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
@@ -79,6 +86,13 @@ CREATE INDEX IF NOT EXISTS matches_session ON matches(session_id);
 CREATE INDEX IF NOT EXISTS events_match ON events(match_id, at);
 CREATE INDEX IF NOT EXISTS events_session ON events(session_id, at);
 ";
+
+/// Match columns added after version 1, applied with ALTER TABLE to databases that predate
+/// them. Every one is nullable or has a default.
+const ADDED_MATCH_COLUMNS: [(&str, &str); 1] = [("event_offset_ms", "INTEGER NOT NULL DEFAULT 0")];
+
+/// The same for recordings.
+const ADDED_RECORDING_COLUMNS: [(&str, &str); 1] = [("follows", "INTEGER")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +196,9 @@ pub struct MatchRow {
     pub status: MatchStatus,
     pub error: Option<String>,
     pub updated_at: String,
+    /// Added to every event's time on this match when it is shown, for timelines recorded out
+    /// of step with the video. Events keep their stored times.
+    pub event_offset_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +212,27 @@ pub struct RecordingRow {
     /// Measured once the file is closed: `stopped_at` minus the probed duration.
     pub started_at: Option<String>,
     pub duration_ms: Option<i64>,
+    /// The recording this one carries on from without a gap: the recorder split the file here
+    /// rather than stopping. Its first frame is the frame after that one's last, which times
+    /// every part of a chain from the stop of the last one alone.
+    pub follows: Option<i64>,
+}
+
+/// One file of other games' footage; see `SessionStore::other_games_footage`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Footage {
+    pub piece: FootagePiece,
+    pub session_id: i64,
+    /// RFC 3339 UTC, when the footage starts.
+    pub start: String,
+    pub duration_ms: i64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FootagePiece {
+    Match(i64),
+    Recording(i64),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,13 +261,13 @@ pub struct SessionStore {
 
 const MATCH_COLUMNS: &str = "id, session_id, started_at, ended_at, detected, map, mode, result, \
     ally_score, enemy_score, path, thumb_path, file_start_at, duration_ms, size, status, error, \
-    updated_at";
+    updated_at, event_offset_ms";
 
 const SESSION_COLUMNS: &str =
     "id, game, game_name, started_at, ended_at, status, provider_reached, error";
 
 const RECORDING_COLUMNS: &str =
-    "id, session_id, path, requested_at, stopped_at, started_at, duration_ms";
+    "id, session_id, path, requested_at, stopped_at, started_at, duration_ms, follows";
 
 impl SessionStore {
     pub fn open(path: &Path) -> Result<SessionStore> {
@@ -254,6 +292,9 @@ impl SessionStore {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .context("reading schema version")?;
         if version < SCHEMA_VERSION {
+            // Older tables already exist and the CREATE above did not touch them.
+            add_missing_columns(&conn, "matches", &ADDED_MATCH_COLUMNS)?;
+            add_missing_columns(&conn, "recordings", &ADDED_RECORDING_COLUMNS)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("writing schema version")?;
         }
@@ -280,10 +321,22 @@ impl SessionStore {
     }
 
     pub fn add_recording(&self, session_id: i64, path: &Path, requested_at: DateTime<Utc>) -> Result<i64> {
+        self.add_recording_after(session_id, path, requested_at, None)
+    }
+
+    /// A recording that carries on from `follows` without a gap, where the recorder split its
+    /// file (see `RecordingRow::follows`).
+    pub fn add_recording_after(
+        &self,
+        session_id: i64,
+        path: &Path,
+        requested_at: DateTime<Utc>,
+        follows: Option<i64>,
+    ) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO recordings (session_id, path, requested_at) VALUES (?1, ?2, ?3)",
-            params![session_id, path.display().to_string(), format_time(requested_at)],
+            "INSERT INTO recordings (session_id, path, requested_at, follows) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, path.display().to_string(), format_time(requested_at), follows],
         )
         .with_context(|| format!("adding recording {}", path.display()))?;
         Ok(conn.last_insert_rowid())
@@ -522,6 +575,24 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Sets how far a match's events are moved when shown, clamped to `MAX_EVENT_OFFSET_MS`
+    /// either way. `updated_at` is left alone on purpose: the UI keys its video player and
+    /// thumbnail cache on it, and moving the timeline must not reload the video.
+    pub fn set_match_event_offset(&self, id: i64, offset_ms: i64) -> Result<()> {
+        let offset_ms = offset_ms.clamp(-MAX_EVENT_OFFSET_MS, MAX_EVENT_OFFSET_MS);
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE matches SET event_offset_ms = ?2 WHERE id = ?1",
+                params![id, offset_ms],
+            )
+            .with_context(|| format!("setting the event offset of match {id}"))?;
+        if changed == 0 {
+            bail!("match {id} not found");
+        }
+        Ok(())
+    }
+
     pub fn set_session_status(&self, id: i64, status: SessionStatus, error: Option<&str>) -> Result<()> {
         self.lock()
             .execute(
@@ -584,6 +655,47 @@ impl SessionStore {
         Ok(rows)
     }
 
+    /// Every piece of footage of other games (`SessionGame::Other`) on disk, newest first: match
+    /// files, and the finished parts of recordings not cut yet. The part a recording is writing
+    /// has no stop and is not here. For the background recording's budget, which counts footage
+    /// rather than time, so a game played yesterday is not lost to the clock.
+    pub fn other_games_footage(&self) -> Result<Vec<Footage>> {
+        let conn = self.lock();
+        let mut out: Vec<Footage> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.file_start_at, m.duration_ms, m.path FROM matches m \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE s.game = 'other' AND m.status = 'ready' AND m.path IS NOT NULL \
+             AND m.file_start_at IS NOT NULL AND m.duration_ms IS NOT NULL",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok(Footage {
+                piece: FootagePiece::Match(r.get(0)?),
+                session_id: r.get(1)?,
+                start: r.get(2)?,
+                duration_ms: r.get(3)?,
+                path: r.get(4)?,
+            })
+        })? {
+            out.push(row?);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.session_id, r.requested_at, r.stopped_at, r.path FROM recordings r \
+             JOIN sessions s ON s.id = r.session_id \
+             WHERE s.game = 'other' AND r.stopped_at IS NOT NULL",
+        )?;
+        let parts: Vec<(i64, i64, String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, session_id, requested, stopped, path) in parts {
+            // Not measured until the session is cut; the span it was asked for is near enough.
+            let duration_ms = (parse_time(&stopped)? - parse_time(&requested)?).num_milliseconds().max(0);
+            out.push(Footage { piece: FootagePiece::Recording(id), session_id, start: requested, duration_ms, path });
+        }
+        out.sort_by(|a, b| b.start.cmp(&a.start));
+        Ok(out)
+    }
+
     pub fn get_match(&self, id: i64) -> Result<Option<MatchRow>> {
         self.lock()
             .query_row(
@@ -595,14 +707,25 @@ impl SessionStore {
             .with_context(|| format!("reading match {id}"))
     }
 
-    /// The timeline of one match, oldest first.
+    /// The timeline of one match, oldest first: its own events, plus every marker of its session
+    /// that its file shows. A marker belongs to the moment rather than to a match, so one pressed
+    /// in the menus lands in the pre-roll of the next match, and one pressed in a game nothing
+    /// detects matches in lands on the recording kept whole.
     pub fn events(&self, match_id: i64) -> Result<Vec<EventRow>> {
+        let row = self.get_match(match_id)?;
+        let window = row.as_ref().and_then(|m| {
+            let start = parse_time(m.file_start_at.as_deref()?).ok()?;
+            let end = start + chrono::Duration::milliseconds(m.duration_ms?);
+            Some((m.session_id, format_time(start), format_time(end)))
+        });
+        let (session_id, from, to) = window.unwrap_or((-1, String::new(), String::new()));
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, match_id, at, data FROM events WHERE match_id = ?1 ORDER BY at, id",
+            "SELECT id, match_id, at, data FROM events WHERE match_id = ?1 \
+             OR (session_id = ?2 AND kind = 'marker' AND at >= ?3 AND at <= ?4) ORDER BY at, id",
         )?;
         let rows = stmt
-            .query_map(params![match_id], event_from)?
+            .query_map(params![match_id, session_id, from, to], event_from)?
             .collect::<rusqlite::Result<_>>()
             .with_context(|| format!("reading events of match {match_id}"))?;
         Ok(rows)
@@ -662,6 +785,27 @@ impl SessionStore {
     }
 }
 
+/// Adds whichever of a table's later columns this database does not have yet. Idempotent, so
+/// a half-applied migration finishes on the next open.
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("reading {table} columns"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .with_context(|| format!("listing {table} columns"))?
+        .collect::<rusqlite::Result<_>>()
+        .with_context(|| format!("reading {table} columns"))?;
+    for (name, decl) in columns {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])
+                .with_context(|| format!("adding column {table}.{name}"))?;
+            log::info!("sessions: added column {table}.{name}");
+        }
+    }
+    Ok(())
+}
+
 fn matches_in(conn: &Connection, session_id: i64) -> Result<Vec<MatchRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {MATCH_COLUMNS} FROM matches WHERE session_id = ?1 ORDER BY started_at, id"
@@ -713,6 +857,7 @@ fn match_from(r: &Row<'_>) -> rusqlite::Result<MatchRow> {
         status: MatchStatus::parse(&status).ok_or_else(|| bad(15, format!("unknown match status {status:?}")))?,
         error: r.get(16)?,
         updated_at: r.get(17)?,
+        event_offset_ms: r.get(18)?,
     })
 }
 
@@ -725,6 +870,7 @@ fn recording_from(r: &Row<'_>) -> rusqlite::Result<RecordingRow> {
         stopped_at: r.get(4)?,
         started_at: r.get(5)?,
         duration_ms: r.get(6)?,
+        follows: r.get(7)?,
     })
 }
 
@@ -815,6 +961,39 @@ mod tests {
         assert_eq!(json["kind"], "round_end", "events reach the UI flattened: {json}");
 
         assert_eq!(s.pending().unwrap(), vec![id]);
+    }
+
+    /// A marker shows on every match file that holds its moment, and on a recording kept whole
+    /// for a game nothing detects matches in; not on footage that does not reach it.
+    #[test]
+    fn markers_show_on_the_files_that_hold_them() {
+        let (s, dir) = store();
+        let id = s.create_session(SessionGame::Valorant, "Valorant", t(0)).unwrap();
+        let first = s.open_match(id, t(100), None, None).unwrap();
+        let marker = |at| GameEvent { at, event: Event::Marker };
+        // Pressed during the first match, and in the menus just before the second.
+        s.add_event(id, Some(first), &marker(t(150))).unwrap();
+        s.close_match(first, t(200), None, None, None).unwrap();
+        s.add_event(id, None, &marker(t(295))).unwrap();
+        let second = s.open_match(id, t(300), None, None).unwrap();
+        s.close_match(second, t(400), None, None, None).unwrap();
+        // The second file starts 10 s early, so it shows the menus marker; the first ends at 208 s.
+        s.set_match_file(first, &dir.join("a.mp4"), None, t(90), 118_000, 1).unwrap();
+        s.set_match_file(second, &dir.join("b.mp4"), None, t(290), 118_000, 1).unwrap();
+
+        let at = |m| s.events(m).unwrap().iter().filter(|e| e.event == Event::Marker).map(|e| e.at.clone()).collect::<Vec<_>>();
+        assert_eq!(at(first), vec![format_time(t(150))]);
+        assert_eq!(at(second), vec![format_time(t(295))]);
+
+        // Another session's marker at the same moment is not this session's.
+        let other = s.create_session(SessionGame::League, "League of Legends", t(0)).unwrap();
+        s.add_event(other, None, &marker(t(160))).unwrap();
+        assert_eq!(at(first).len(), 1);
+
+        // A match with no file yet still has its own events.
+        let open = s.open_match(id, t(500), None, None).unwrap();
+        s.add_event(id, Some(open), &marker(t(510))).unwrap();
+        assert_eq!(at(open), vec![format_time(t(510))]);
     }
 
     #[test]
@@ -924,6 +1103,56 @@ mod tests {
 
         let ids: Vec<i64> = s.oldest_matches().unwrap().iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![ready1, ready2], "oldest first, across both sessions");
+    }
+
+    /// Moving a timeline by hand is clamped, and leaves `updated_at` alone so the UI does not
+    /// reload the video under the user.
+    #[test]
+    fn a_match_event_offset_is_clamped_and_keeps_updated_at() {
+        let (s, _dir) = store();
+        let id = s.create_session(SessionGame::League, "League of Legends", t(0)).unwrap();
+        let m = s.add_undetected_match(id, t(0), t(100)).unwrap();
+        let before = s.get_match(m).unwrap().unwrap();
+        assert_eq!(before.event_offset_ms, 0);
+
+        std::thread::sleep(Duration::from_millis(5));
+        s.set_match_event_offset(m, 24_150).unwrap();
+        let row = s.get_match(m).unwrap().unwrap();
+        assert_eq!(row.event_offset_ms, 24_150);
+        assert_eq!(row.updated_at, before.updated_at);
+        assert_eq!(s.session(id).unwrap().unwrap().matches[0].event_offset_ms, 24_150);
+
+        s.set_match_event_offset(m, -MAX_EVENT_OFFSET_MS - 1).unwrap();
+        assert_eq!(s.get_match(m).unwrap().unwrap().event_offset_ms, -MAX_EVENT_OFFSET_MS);
+        s.set_match_event_offset(m, i64::MAX).unwrap();
+        assert_eq!(s.get_match(m).unwrap().unwrap().event_offset_ms, MAX_EVENT_OFFSET_MS);
+        assert!(s.set_match_event_offset(m + 1, 0).is_err());
+    }
+
+    /// A version 1 database gains the offset column on open, with its matches at no offset.
+    #[test]
+    fn v1_database_gains_the_event_offset() {
+        let (s, dir) = store();
+        let id = s.create_session(SessionGame::League, "League of Legends", t(0)).unwrap();
+        let m = s.add_undetected_match(id, t(0), t(100)).unwrap();
+        {
+            // Rewind to a v1 file: drop the column and the version with it.
+            let conn = s.lock();
+            conn.execute("ALTER TABLE matches DROP COLUMN event_offset_ms", []).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        drop(s);
+
+        let s = SessionStore::open(&dir.join("sessions.db")).unwrap();
+        assert_eq!(s.get_match(m).unwrap().unwrap().event_offset_ms, 0);
+        let version: i32 = s.lock().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        s.set_match_event_offset(m, -1_500).unwrap();
+        assert_eq!(s.get_match(m).unwrap().unwrap().event_offset_ms, -1_500);
+        // Opening it again changes nothing.
+        drop(s);
+        let s = SessionStore::open(&dir.join("sessions.db")).unwrap();
+        assert_eq!(s.get_match(m).unwrap().unwrap().event_offset_ms, -1_500);
     }
 
     #[test]

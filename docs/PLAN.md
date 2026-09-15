@@ -1,6 +1,6 @@
 # Cos Nostra implementation plan
 
-Last updated 2026-09-13. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed. Phase 5 (a public per-guild clip site, redefined from the original yearly-recap plan) is built and tested locally; it deploys alongside phase 6's replace route, since both need the same backend push.
+Last updated 2026-09-15. Phases 1 to 4 are done and verified on an AMD RX 9060 XT: the whole loop runs, from the hotkey to a clip in Discord to a counted reaction. The backend and the bot are both live on Railway. Phase 6 (cutting) is done on the desktop and needs the backend's replace route deployed. Phase 5 (a public per-guild clip site, redefined from the original yearly-recap plan) is built and tested locally; it deploys alongside phase 6's replace route, since both need the same backend push.
 
 ## 1. What we are building
 
@@ -793,6 +793,68 @@ against the live Discord and Steam endpoints; `tsc` and `vite build`.
 Not verified: the tiles and header in both themes, a real hotkey clip landing in its game
 folder (and the move not racing libobs), pictures for Valorant, League and a Steam game in the
 running app, rename moving files while the player has the clip open.
+
+### Steam recording parity: audio, markers, background recording, export. Released in desktop 0.3.0 on 2026-09-15.
+
+Not in the original plan. A comparison with Steam Game Recording turned up what it does that
+this app did not; these are the ones picked, in the order they were built. Desktop only; no
+backend, bot or wire change.
+
+- **Microphone and audio sources.** Settings has an Audio card: record everything the default
+  output plays (as before, the default), only the hooked game (the game capture's own
+  application audio), or the game plus chosen apps (one `wasapi_process_output_capture` per
+  executable, matched by the exe of a window). The microphone is optional, with device,
+  volume, mono downmix and RNNoise. With it on every recording carries three AAC tracks: the
+  mix, the mix without the mic, the mic alone (`capture::TRACK_*`, each source routed with
+  `obs_source_set_audio_mixers`, one audio encoder per track shared by the session output). The
+  player plays the mix; publish and export offer to leave the voice out, which encodes the
+  second track. `clips.db` v7 adds `include_mic`; a clip already encoded with the other choice
+  encodes again when published.
+- **Marker hotkey.** `Alt+F11` by default drops `timeline::Event::Marker` on the session being
+  recorded, with a sound unlike a save's, or a toast when nothing is recording. A marker shows on
+  every match file that holds its moment (`SessionStore::events`), and its row selects the 25 s
+  before it.
+- **Background recording of any game.** Off by default (`record_other_games`). Whatever the
+  capture hooks that the game table does not reject opens a `SessionGame::Other` session, which
+  lasts while that process runs. The recording splits every 15 minutes without a gap through
+  `mp4_output`'s own file splitting; OBS names the next file and says so with `file_changed`,
+  which `capture.rs` catches with a raw signal handler. Parts are chained in `sessions.db` v3
+  (`recordings.follows`), so the cutter times each from the stop of the last. With no provider
+  every part becomes its own undetected match, renamed rather than copied, titled by its start
+  time. `storage::enforce_other_games_footage` keeps the newest `other_games_hours` (default 2)
+  of that footage, counted in footage rather than clock time, after every part and every cut.
+  A supported game starting ends the background session so it gets its own.
+- **Export.** A clip exports to a file chosen in a save dialog: as recorded (stream copy from the
+  keyframe before the clip), at most N MB (Discord's 10, 50 and 500 as presets; the bitrate is
+  planned from the length, the picture drops to 720p, then 30 fps, then smaller until the bitrate
+  can draw it, and a result over the target is encoded once more at a proportionally lower
+  bitrate), or custom codec, resolution, frame rate and quality level. H.264 and AV1 follow the
+  encode engine setting; H.265 is hardware only and probed on first use. Settings also gained a
+  recording resolution cap (the libobs output size), a frame rate picker and recording quality
+  presets over the buffer bitrate, and the buffer's memory cap now grows with the bitrate so a
+  high preset does not quietly shorten it.
+
+Verified 2026-09-15: 164 desktop `cargo test`s (new ones for track selection and a real
+three-track encode, the mic publish choice, marker placement across match files, split parts
+timed from the last stop against real ffmpeg, the footage budget, other-game sessions and a
+supported game taking over, size planning and every export mode against real ffmpeg), `tsc`,
+`vite build`, clippy with no new warnings. In `tauri dev` on the RX 9060 XT with the mic on and
+"game and apps" (Discord): the game audio child source, Discord's process capture, the mic with
+noise suppression and three AAC encoders all came up; a hotkey clip had three tracks with the
+game's tone on tracks 1 and 2 and the room on track 3. A fullscreen ffplay opened an `other`
+session whose recording split eleven times (with the part length set to 40 s for the test),
+the parts met with 0 ms gaps in `sessions.db`, the marker landed on the right part in the
+Matches tab, and a 10 MB export of a 29 s 1080p60 clip came out 720p30, one audio track,
+9.2 MB, through the real save dialog.
+
+Not verified, and what would:
+
+- A real game's audio through "only the game", and an anti-cheat game's process capture.
+- A full 15-minute part and the footage budget deleting a part during a live session; the unit
+  tests cover the rule, the 40 s run covered the splitting.
+- H.265 export: the dev sidecar is the minimal build from before `hevc_*` were added. Rebuild it
+  (`npm run build-ffmpeg -w apps/desktop`) and export once.
+- The publish dialog's microphone box against a real publish.
 
 ## 5. Cross-cutting work
 

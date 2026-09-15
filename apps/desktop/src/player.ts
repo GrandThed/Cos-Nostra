@@ -10,14 +10,25 @@ import { fmtBytes, fmtClock, fmtDuration, fmtWhen, fmtWhenLong, hueFor } from ".
 import { t } from "./i18n";
 import * as ipc from "./ipc";
 import { copyLinkButton, selectionLabel, showInMatch, visibleClips } from "./library";
+import { openExportDialog } from "./exporter";
 import { openPublishDialog } from "./publish";
 import { go } from "./router";
 import { data, loadClips, on } from "./store";
+import {
+  clickToPlay,
+  flasher,
+  frameStep,
+  fullscreenButton,
+  leaveFullscreen,
+  loopToggle,
+  speedControl,
+  togglePlay,
+  type Transport,
+  transportKey,
+  typing,
+  volume,
+} from "./transport";
 import type { ClipRow } from "./types";
-
-const SPEEDS = [0.5, 1, 1.5, 2];
-/** Old clips have no recorded frame rate; 60 is what the recorder has always captured. */
-const FALLBACK_FPS = 60;
 
 interface Live {
   id: number;
@@ -128,6 +139,53 @@ function build(root: HTMLElement, clip: ClipRow): void {
     h("span", { text: "▶" }),
   );
 
+  const box = h(
+    "div",
+    { class: "video" },
+    media ? video : null,
+    media?.streaming
+      ? h("span", { class: "source-note", text: t("player.streaming") })
+      : null,
+    media ? bigPlay : h("div", { class: "trouble", text: t("player.noVideo") }),
+  );
+  const stage = h("div", { class: "stage" });
+  const tr: Transport = { video, fps: clip.fps, flash: flasher(box), fullscreen: stage };
+  stage.append(
+    box,
+    h(
+      "div",
+      { class: "transport" },
+      scrubber,
+      h(
+        "div",
+        { class: "controls" },
+        playButton,
+        time,
+        frameStep(video, clip.fps),
+        h("span", { class: "grow" }),
+        volume(video),
+        speedControl(video),
+        loopToggle(video),
+        h("button", {
+          type: "button",
+          class: "theatre",
+          title: t("player.theatre"),
+          text: "▭",
+          onclick: () => toggleTheatre(),
+        }),
+        fullscreenButton(stage),
+      ),
+      h(
+        "div",
+        { class: "keys" },
+        ...(["play", "seek", "frame", "speed", "volume", "screen", "edit"] as const).map((k) =>
+          h("span", { text: t(`player.keys.${k}`) }),
+        ),
+      ),
+    ),
+    strip,
+  );
+
   const player = h(
     "div",
     { class: `player${theatre ? " theatre" : ""}`, style: `--hue:${hueFor(clip.id)}` },
@@ -175,60 +233,14 @@ function build(root: HTMLElement, clip: ClipRow): void {
     h(
       "div",
       { class: "player-body" },
-      h(
-        "div",
-        { class: "stage" },
-        h(
-          "div",
-          { class: "video" },
-          media ? video : null,
-          media?.streaming
-            ? h("span", { class: "source-note", text: t("player.streaming") })
-            : null,
-          media ? bigPlay : h("div", { class: "trouble", text: t("player.noVideo") }),
-        ),
-        h(
-          "div",
-          { class: "transport" },
-          scrubber,
-          h(
-            "div",
-            { class: "controls" },
-            playButton,
-            time,
-            frameStep(video, clip),
-            h("span", { class: "grow" }),
-            volume(video),
-            speed(video),
-            loopToggle(video),
-            h("button", {
-              type: "button",
-              title: t("player.theatre"),
-              text: "⛶",
-              onclick: () => toggleTheatre(),
-            }),
-          ),
-          h(
-            "div",
-            { class: "keys" },
-            h("span", { text: t("player.keys.play") }),
-            h("span", { text: t("player.keys.seek") }),
-            h("span", { text: t("player.keys.jump") }),
-            h("span", { text: t("player.keys.frame") }),
-            h("span", { text: t("player.keys.mute") }),
-            h("span", { text: t("player.keys.theatre") }),
-            h("span", { text: t("player.keys.edit") }),
-          ),
-        ),
-        strip,
-      ),
+      stage,
       h("aside", { class: "rail" }),
     ),
   );
 
   fill(root, player);
 
-  const onKey = (e: KeyboardEvent) => handleKey(e, video, clip);
+  const onKey = (e: KeyboardEvent) => handleKey(e, tr, clip);
   live = {
     id,
     video,
@@ -249,6 +261,7 @@ function build(root: HTMLElement, clip: ClipRow): void {
 
   wireVideo(video, media?.streaming ?? false);
   wireScrubber(scrubber, video, preview, previewBox, previewAt);
+  clickToPlay(video, tr);
   playButton.addEventListener("click", () => togglePlay(video));
   bigPlay.addEventListener("click", () => togglePlay(video));
   document.addEventListener("keydown", onKey);
@@ -262,6 +275,7 @@ export function unmountPlayer(): void {
   wanted = null;
   railKey = "";
   if (!live) return;
+  if (document.fullscreenElement && live.root.contains(document.fullscreenElement)) leaveFullscreen();
   document.removeEventListener("keydown", live.onKey);
   // Both are decoders holding a file open; the scrub preview is easy to forget.
   for (const video of [live.video, live.preview]) {
@@ -281,11 +295,6 @@ function siblings(id: number): ClipRow[] {
 
 // ---------------------------------------------------------------------------
 // Transport
-
-function togglePlay(video: HTMLVideoElement): void {
-  if (video.paused) void video.play().catch(() => undefined);
-  else video.pause();
-}
 
 function wireVideo(video: HTMLVideoElement, streaming: boolean): void {
   for (const event of ["timeupdate", "durationchange", "progress", "seeked", "play", "pause"]) {
@@ -362,131 +371,17 @@ function wireScrubber(
   scrubber.addEventListener("pointerup", (e) => scrubber.releasePointerCapture(e.pointerId));
 }
 
-/** The frame-step, volume and loop widgets are shared with the editor, which has the same
- *  transport under a different timeline. */
-export function frameStep(video: HTMLVideoElement, clip: { fps: number | null }): HTMLElement {
-  const step = 1 / (clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS);
-  const move = (by: number) => {
-    video.pause();
-    video.currentTime = Math.max(0, video.currentTime + by * step);
-  };
-  return h(
-    "span",
-    { class: "frames", title: t("player.frameStep") },
-    h("button", { type: "button", text: "‹", onclick: () => move(-1) }),
-    t("player.frame"),
-    h("button", { type: "button", text: "›", onclick: () => move(1) }),
-  );
-}
-
-export function volume(video: HTMLVideoElement): HTMLElement {
-  const slider = h("input", {
-    type: "range",
-    min: "0",
-    max: "1",
-    step: "0.05",
-    value: "1",
-    title: t("player.volume"),
-    oninput: (e: Event) => {
-      video.volume = Number((e.target as HTMLInputElement).value);
-      video.muted = video.volume === 0;
-    },
-  }) as HTMLInputElement;
-  const icon = h("button", {
-    type: "button",
-    text: "🔊",
-    title: t("player.mute"),
-    onclick: () => {
-      video.muted = !video.muted;
-    },
-  });
-  video.addEventListener("volumechange", () => {
-    slider.value = String(video.muted ? 0 : video.volume);
-    icon.textContent = video.muted || video.volume === 0 ? "🔈" : "🔊";
-  });
-  return h("span", { class: "volume" }, icon, slider);
-}
-
-function speed(video: HTMLVideoElement): HTMLElement {
-  const button = h("button", {
-    type: "button",
-    class: "speed",
-    text: "1.0×",
-    title: t("player.speed"),
-  });
-  button.addEventListener("click", () => {
-    const next = SPEEDS[(SPEEDS.indexOf(video.playbackRate) + 1) % SPEEDS.length];
-    video.playbackRate = next;
-    button.textContent = `${next.toFixed(1)}×`;
-  });
-  return button;
-}
-
-export function loopToggle(video: HTMLVideoElement): HTMLElement {
-  const button = h("button", {
-    type: "button",
-    class: "loop",
-    text: t("player.loop"),
-    "aria-pressed": "false",
-  });
-  button.addEventListener("click", () => {
-    video.loop = !video.loop;
-    button.setAttribute("aria-pressed", String(video.loop));
-  });
-  return button;
-}
-
 function toggleTheatre(): void {
   theatre = !theatre;
   live?.root.classList.toggle("theatre", theatre);
 }
 
-function handleKey(e: KeyboardEvent, video: HTMLVideoElement, clip: ClipRow): void {
-  const target = e.target as HTMLElement | null;
-  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) {
-    return;
-  }
-  const step = 1 / (clip.fps && clip.fps > 0 ? clip.fps : FALLBACK_FPS);
-  const seek = (by: number) => {
-    video.currentTime = Math.max(0, Math.min(video.currentTime + by, video.duration || 0));
-  };
+function handleKey(e: KeyboardEvent, tr: Transport, clip: ClipRow): void {
+  if (typing(e) || e.ctrlKey || e.altKey || e.metaKey) return;
   switch (e.key) {
-    case " ":
-      togglePlay(video);
-      break;
-    case "ArrowLeft":
-      seek(-5);
-      break;
-    case "ArrowRight":
-      seek(5);
-      break;
-    case "j":
-    case "J":
-      seek(-10);
-      break;
-    case "l":
-    case "L":
-      seek(10);
-      break;
-    case "k":
-    case "K":
-      video.pause();
-      break;
-    case ",":
-      video.pause();
-      seek(-step);
-      break;
-    case ".":
-      video.pause();
-      seek(step);
-      break;
-    case "m":
-    case "M":
-      video.muted = !video.muted;
-      break;
-    case "f":
-    case "F":
-      toggleTheatre();
+    case "t":
+    case "T":
+      if (!e.repeat) toggleTheatre();
       break;
     case "e":
     case "E": {
@@ -495,10 +390,13 @@ function handleKey(e: KeyboardEvent, video: HTMLVideoElement, clip: ClipRow): vo
       break;
     }
     case "Escape":
+      // Fullscreen is the webview's to leave.
+      if (document.fullscreenElement) return;
       if (theatre) toggleTheatre();
       else go({ view: "library" });
       break;
     default:
+      transportKey(e, tr);
       return;
   }
   e.preventDefault();
@@ -660,6 +558,14 @@ function renderRail(): void {
       "div",
       { class: "buttons" },
       ...publishButtons(clip),
+      h("button", {
+        type: "button",
+        class: "btn",
+        text: t("player.rail.export"),
+        title: released ? t("player.rail.exportReleased") : t("player.rail.exportTitle"),
+        disabled: released,
+        onclick: () => openExportDialog(clip.id),
+      }),
       h("button", {
         type: "button",
         class: "btn",
